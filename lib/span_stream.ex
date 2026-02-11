@@ -1,0 +1,121 @@
+defmodule SpanStream do
+  @moduledoc """
+  Embedded OpenTelemetry span storage and compression for Elixir applications.
+
+  SpanStream receives spans from the OpenTelemetry Erlang SDK, compresses them
+  into zstd blocks, and indexes them in SQLite for fast querying.
+
+  ## Setup
+
+      # config/config.exs
+      config :span_stream,
+        data_dir: "priv/span_stream"
+
+      # Enable the OTel exporter
+      config :opentelemetry,
+        traces_exporter: {SpanStream.Exporter, []}
+
+  ## Querying
+
+      # Find error spans
+      SpanStream.query(status: :error)
+
+      # Find spans by service and kind
+      SpanStream.query(service: "my_app", kind: :server)
+
+      # Find slow spans (> 100ms)
+      SpanStream.query(min_duration: 100_000_000)
+
+  ## Trace Lookup
+
+      # Get all spans in a trace
+      SpanStream.trace("abc123def456...")
+  """
+
+  @doc """
+  Query stored spans. Returns a `SpanStream.Result` struct.
+
+  ## Filters
+
+    * `:name` - Substring match on span name
+    * `:service` - Match `service.name` attribute or resource
+    * `:kind` - Span kind atom (`:internal`, `:server`, `:client`, `:producer`, `:consumer`)
+    * `:status` - Status atom (`:ok`, `:error`, `:unset`)
+    * `:min_duration` - Minimum duration in nanoseconds
+    * `:max_duration` - Maximum duration in nanoseconds
+    * `:since` - Start time lower bound (DateTime or unix nanos)
+    * `:until` - Start time upper bound (DateTime or unix nanos)
+    * `:trace_id` - Filter to specific trace ID
+    * `:attributes` - Map of attribute key/value pairs to match
+
+  ## Pagination & Ordering
+
+    * `:limit` - Max entries to return (default 100)
+    * `:offset` - Number of entries to skip (default 0)
+    * `:order` - `:desc` (newest first, default) or `:asc` (oldest first)
+  """
+  @spec query(keyword()) :: {:ok, SpanStream.Result.t()} | {:error, term()}
+  def query(filters \\ []) do
+    SpanStream.Index.query(filters)
+  end
+
+  @doc """
+  Retrieve all spans for a given trace ID, sorted by start time.
+
+  ## Examples
+
+      {:ok, spans} = SpanStream.trace("abc123...")
+  """
+  @spec trace(String.t()) :: {:ok, [SpanStream.Span.t()]}
+  def trace(trace_id) do
+    SpanStream.Index.trace(trace_id)
+  end
+
+  @doc """
+  Flush the buffer, writing any pending spans to storage immediately.
+  """
+  @spec flush() :: :ok
+  def flush do
+    SpanStream.Buffer.flush()
+  end
+
+  @doc """
+  Return aggregate statistics about stored span data.
+
+  ## Examples
+
+      {:ok, stats} = SpanStream.stats()
+      stats.total_blocks   #=> 42
+      stats.total_entries   #=> 50000
+  """
+  @spec stats() :: {:ok, SpanStream.Stats.t()}
+  def stats do
+    SpanStream.Index.stats()
+  end
+
+  @doc """
+  Subscribe the calling process to receive new spans as they arrive.
+
+  The subscriber receives messages of the form:
+  `{:span_stream, :span, %SpanStream.Span{}}`.
+
+  ## Options
+
+    * `:name` - Only receive spans with this name
+    * `:kind` - Only receive spans of this kind
+    * `:status` - Only receive spans with this status
+    * `:service` - Only receive spans from this service
+  """
+  @spec subscribe(keyword()) :: {:ok, pid()}
+  def subscribe(opts \\ []) do
+    Registry.register(SpanStream.Registry, :spans, opts)
+  end
+
+  @doc """
+  Unsubscribe the calling process from span notifications.
+  """
+  @spec unsubscribe() :: :ok
+  def unsubscribe do
+    Registry.unregister(SpanStream.Registry, :spans)
+  end
+end
