@@ -48,7 +48,11 @@ defmodule Mix.Tasks.SpanStream.SearchBenchmark do
 
         avg_us = times |> Enum.map(&elem(&1, 0)) |> Enum.sum() |> div(3)
         {_, total} = hd(times)
-        IO.puts("  #{String.pad_trailing(label, 30)} #{fmt_ms(avg_us)} avg (#{fmt_number(total)} matches)")
+
+        IO.puts(
+          "  #{String.pad_trailing(label, 30)} #{fmt_ms(avg_us)} avg (#{fmt_number(total)} matches)"
+        )
+
         {label, avg_us}
       end
 
@@ -62,9 +66,15 @@ defmodule Mix.Tasks.SpanStream.SearchBenchmark do
         {us, length(spans)}
       end
 
-    avg_trace_us = trace_times |> Enum.map(&elem(&1, 0)) |> Enum.sum() |> div(max(length(trace_times), 1))
-    avg_spans = trace_times |> Enum.map(&elem(&1, 1)) |> Enum.sum() |> div(max(length(trace_times), 1))
-    IO.puts("  Trace lookup (#{length(sample_traces)} traces): #{fmt_ms(avg_trace_us)} avg (#{avg_spans} spans/trace avg)")
+    avg_trace_us =
+      trace_times |> Enum.map(&elem(&1, 0)) |> Enum.sum() |> div(max(length(trace_times), 1))
+
+    avg_spans =
+      trace_times |> Enum.map(&elem(&1, 1)) |> Enum.sum() |> div(max(length(trace_times), 1))
+
+    IO.puts(
+      "  Trace lookup (#{length(sample_traces)} traces): #{fmt_ms(avg_trace_us)} avg (#{avg_spans} spans/trace avg)"
+    )
 
     # Summary
     IO.puts("\n=== Summary ===")
