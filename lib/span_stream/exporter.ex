@@ -39,22 +39,25 @@ defmodule SpanStream.Exporter do
   defp span_from_record(record, resource_map) do
     try do
       # The ETS table contains span records as tuples.
-      # Record format: {:span, trace_id, span_id, tracestate, parent_span_id,
-      #                  name, kind, start_time, end_time, attributes,
-      #                  events, links, status, is_recording,
-      #                  instrumentation_scope}
+      # Record format (opentelemetry ~> 1.5):
+      #   {:span, trace_id, span_id, tracestate, parent_span_id,
+      #    parent_span_is_remote, name, kind, start_time, end_time,
+      #    attributes, events, links, status, trace_flags,
+      #    is_recording, instrumentation_scope}
       case record do
-        {:span, trace_id, span_id, _tracestate, parent_span_id, name, kind, start_time, end_time,
-         attributes, events, links, status, _is_recording, instrumentation_scope} ->
+        {:span, trace_id, span_id, _tracestate, parent_span_id, _parent_span_is_remote,
+         name, kind, start_time, end_time,
+         attributes, events, links, status, _trace_flags,
+         _is_recording, instrumentation_scope} ->
           %{
             trace_id: SpanStream.Span.encode_trace_id(trace_id),
             span_id: SpanStream.Span.encode_span_id(span_id),
             parent_span_id: normalize_parent_span_id(parent_span_id),
             name: to_string(name),
             kind: SpanStream.Span.normalize_kind(kind),
-            start_time: start_time,
-            end_time: end_time,
-            duration_ns: end_time - start_time,
+            start_time: :opentelemetry.convert_timestamp(start_time, :nanosecond),
+            end_time: :opentelemetry.convert_timestamp(end_time, :nanosecond),
+            duration_ns: :erlang.convert_time_unit(end_time - start_time, :native, :nanosecond),
             status: extract_status(status),
             status_message: extract_status_message(status),
             attributes: SpanStream.Span.normalize_attributes(extract_attributes(attributes)),
