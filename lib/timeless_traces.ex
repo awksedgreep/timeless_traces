@@ -1,39 +1,39 @@
-defmodule SpanStream do
+defmodule TimelessTraces do
   @moduledoc """
   Embedded OpenTelemetry span storage and compression for Elixir applications.
 
-  SpanStream receives spans from the OpenTelemetry Erlang SDK, compresses them
+  TimelessTraces receives spans from the OpenTelemetry Erlang SDK, compresses them
   into zstd blocks, and indexes them in SQLite for fast querying.
 
   ## Setup
 
       # config/config.exs
-      config :span_stream,
+      config :timeless_traces,
         data_dir: "priv/span_stream"
 
       # Enable the OTel exporter
       config :opentelemetry,
-        traces_exporter: {SpanStream.Exporter, []}
+        traces_exporter: {TimelessTraces.Exporter, []}
 
   ## Querying
 
       # Find error spans
-      SpanStream.query(status: :error)
+      TimelessTraces.query(status: :error)
 
       # Find spans by service and kind
-      SpanStream.query(service: "my_app", kind: :server)
+      TimelessTraces.query(service: "my_app", kind: :server)
 
       # Find slow spans (> 100ms)
-      SpanStream.query(min_duration: 100_000_000)
+      TimelessTraces.query(min_duration: 100_000_000)
 
   ## Trace Lookup
 
       # Get all spans in a trace
-      SpanStream.trace("abc123def456...")
+      TimelessTraces.trace("abc123def456...")
   """
 
   @doc """
-  Query stored spans. Returns a `SpanStream.Result` struct.
+  Query stored spans. Returns a `TimelessTraces.Result` struct.
 
   ## Filters
 
@@ -54,9 +54,9 @@ defmodule SpanStream do
     * `:offset` - Number of entries to skip (default 0)
     * `:order` - `:desc` (newest first, default) or `:asc` (oldest first)
   """
-  @spec query(keyword()) :: {:ok, SpanStream.Result.t()} | {:error, term()}
+  @spec query(keyword()) :: {:ok, TimelessTraces.Result.t()} | {:error, term()}
   def query(filters \\ []) do
-    SpanStream.Index.query(filters)
+    TimelessTraces.Index.query(filters)
   end
 
   @doc """
@@ -64,11 +64,11 @@ defmodule SpanStream do
 
   ## Examples
 
-      {:ok, spans} = SpanStream.trace("abc123...")
+      {:ok, spans} = TimelessTraces.trace("abc123...")
   """
-  @spec trace(String.t()) :: {:ok, [SpanStream.Span.t()]}
+  @spec trace(String.t()) :: {:ok, [TimelessTraces.Span.t()]}
   def trace(trace_id) do
-    SpanStream.Index.trace(trace_id)
+    TimelessTraces.Index.trace(trace_id)
   end
 
   @doc """
@@ -76,12 +76,12 @@ defmodule SpanStream do
 
   ## Examples
 
-      {:ok, services} = SpanStream.services()
+      {:ok, services} = TimelessTraces.services()
       #=> {:ok, ["my_app", "api_gateway", "auth_service"]}
   """
   @spec services() :: {:ok, [String.t()]}
   def services do
-    SpanStream.Index.distinct_services()
+    TimelessTraces.Index.distinct_services()
   end
 
   @doc """
@@ -89,12 +89,12 @@ defmodule SpanStream do
 
   ## Examples
 
-      {:ok, ops} = SpanStream.operations("my_app")
+      {:ok, ops} = TimelessTraces.operations("my_app")
       #=> {:ok, ["GET /users", "DB query", "cache_lookup"]}
   """
   @spec operations(String.t()) :: {:ok, [String.t()]}
   def operations(service) do
-    SpanStream.Index.distinct_operations(service)
+    TimelessTraces.Index.distinct_operations(service)
   end
 
   @doc """
@@ -102,7 +102,7 @@ defmodule SpanStream do
   """
   @spec flush() :: :ok
   def flush do
-    SpanStream.Buffer.flush()
+    TimelessTraces.Buffer.flush()
   end
 
   @doc """
@@ -110,20 +110,20 @@ defmodule SpanStream do
 
   ## Examples
 
-      {:ok, stats} = SpanStream.stats()
+      {:ok, stats} = TimelessTraces.stats()
       stats.total_blocks   #=> 42
       stats.total_entries   #=> 50000
   """
-  @spec stats() :: {:ok, SpanStream.Stats.t()}
+  @spec stats() :: {:ok, TimelessTraces.Stats.t()}
   def stats do
-    SpanStream.Index.stats()
+    TimelessTraces.Index.stats()
   end
 
   @doc """
   Subscribe the calling process to receive new spans as they arrive.
 
   The subscriber receives messages of the form:
-  `{:span_stream, :span, %SpanStream.Span{}}`.
+  `{:timeless_traces, :span, %TimelessTraces.Span{}}`.
 
   ## Options
 
@@ -134,7 +134,7 @@ defmodule SpanStream do
   """
   @spec subscribe(keyword()) :: {:ok, pid()}
   def subscribe(opts \\ []) do
-    Registry.register(SpanStream.Registry, :spans, opts)
+    Registry.register(TimelessTraces.Registry, :spans, opts)
   end
 
   @doc """
@@ -142,7 +142,7 @@ defmodule SpanStream do
   """
   @spec unsubscribe() :: :ok
   def unsubscribe do
-    Registry.unregister(SpanStream.Registry, :spans)
+    Registry.unregister(TimelessTraces.Registry, :spans)
   end
 
   @doc """
@@ -161,7 +161,7 @@ defmodule SpanStream do
 
   ## Examples
 
-      SpanStream.backup("/tmp/span_backup_2024")
+      TimelessTraces.backup("/tmp/span_backup_2024")
   """
   @spec backup(String.t()) :: {:ok, map()} | {:error, term()}
   def backup(target_dir) do
@@ -172,10 +172,10 @@ defmodule SpanStream do
     # Backup index DB via VACUUM INTO
     index_target = Path.join(target_dir, "index.db")
 
-    case SpanStream.Index.backup(index_target) do
+    case TimelessTraces.Index.backup(index_target) do
       :ok ->
         # Copy block files in parallel
-        data_dir = SpanStream.Config.data_dir()
+        data_dir = TimelessTraces.Config.data_dir()
         blocks_src = Path.join(data_dir, "blocks")
         blocks_dst = Path.join(target_dir, "blocks")
 

@@ -1,4 +1,4 @@
-defmodule SpanStream.Compactor do
+defmodule TimelessTraces.Compactor do
   @moduledoc false
 
   use GenServer
@@ -18,8 +18,8 @@ defmodule SpanStream.Compactor do
   @impl true
   def init(opts) do
     storage = Keyword.get(opts, :storage, :disk)
-    data_dir = Keyword.get(opts, :data_dir, SpanStream.Config.data_dir())
-    interval = SpanStream.Config.compaction_interval()
+    data_dir = Keyword.get(opts, :data_dir, TimelessTraces.Config.data_dir())
+    interval = TimelessTraces.Config.compaction_interval()
     schedule(interval)
 
     {:ok, %{storage: storage, data_dir: data_dir, interval: interval}}
@@ -43,9 +43,9 @@ defmodule SpanStream.Compactor do
   end
 
   defp maybe_compact(state) do
-    stats = SpanStream.Index.raw_block_stats()
-    threshold = SpanStream.Config.compaction_threshold()
-    max_age = SpanStream.Config.compaction_max_raw_age()
+    stats = TimelessTraces.Index.raw_block_stats()
+    threshold = TimelessTraces.Config.compaction_threshold()
+    max_age = TimelessTraces.Config.compaction_max_raw_age()
     now = System.system_time(:second)
 
     age_exceeded =
@@ -62,14 +62,14 @@ defmodule SpanStream.Compactor do
 
   defp do_compact(state) do
     start_time = System.monotonic_time()
-    raw_blocks = SpanStream.Index.raw_block_ids()
+    raw_blocks = TimelessTraces.Index.raw_block_ids()
 
     all_entries =
       Enum.flat_map(raw_blocks, fn {block_id, file_path} ->
         read_result =
           case state.storage do
-            :disk -> SpanStream.Writer.read_block(file_path, :raw)
-            :memory -> SpanStream.Index.read_block_data(block_id)
+            :disk -> TimelessTraces.Writer.read_block(file_path, :raw)
+            :memory -> TimelessTraces.Index.read_block_data(block_id)
           end
 
         case read_result do
@@ -85,15 +85,15 @@ defmodule SpanStream.Compactor do
 
       write_target = if state.storage == :memory, do: :memory, else: state.data_dir
 
-      case SpanStream.Writer.write_block(sorted, write_target, :zstd) do
+      case TimelessTraces.Writer.write_block(sorted, write_target, :zstd) do
         {:ok, new_meta} ->
           old_ids = Enum.map(raw_blocks, &elem(&1, 0))
-          SpanStream.Index.compact_blocks(old_ids, new_meta, sorted)
+          TimelessTraces.Index.compact_blocks(old_ids, new_meta, sorted)
 
           duration = System.monotonic_time() - start_time
 
-          SpanStream.Telemetry.event(
-            [:span_stream, :compaction, :stop],
+          TimelessTraces.Telemetry.event(
+            [:timeless_traces, :compaction, :stop],
             %{
               duration: duration,
               raw_blocks: length(raw_blocks),
@@ -106,7 +106,7 @@ defmodule SpanStream.Compactor do
           :ok
 
         {:error, reason} ->
-          Logger.warning("SpanStream: compaction failed: #{inspect(reason)}")
+          Logger.warning("TimelessTraces: compaction failed: #{inspect(reason)}")
           :noop
       end
     end

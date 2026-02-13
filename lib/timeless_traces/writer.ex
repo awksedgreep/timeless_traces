@@ -1,4 +1,4 @@
-defmodule SpanStream.Writer do
+defmodule TimelessTraces.Writer do
   @moduledoc false
 
   require Logger
@@ -28,7 +28,7 @@ defmodule SpanStream.Writer do
         :zstd ->
           :ezstd.compress(
             binary,
-            Keyword.get(opts, :level, SpanStream.Config.compression_level())
+            Keyword.get(opts, :level, TimelessTraces.Config.compression_level())
           )
       end
 
@@ -60,7 +60,7 @@ defmodule SpanStream.Writer do
         :zstd ->
           {:ezstd.compress(
              binary,
-             Keyword.get(opts, :level, SpanStream.Config.compression_level())
+             Keyword.get(opts, :level, TimelessTraces.Config.compression_level())
            ), "zst"}
       end
 
@@ -106,7 +106,7 @@ defmodule SpanStream.Writer do
       {:ok, :erlang.binary_to_term(data)}
     rescue
       e ->
-        Logger.warning("SpanStream: corrupt raw block data: #{inspect(e)}")
+        Logger.warning("TimelessTraces: corrupt raw block data: #{inspect(e)}")
         {:error, :corrupt_block}
     end
   end
@@ -117,7 +117,7 @@ defmodule SpanStream.Writer do
       {:ok, :erlang.binary_to_term(binary)}
     rescue
       e ->
-        Logger.warning("SpanStream: corrupt block data: #{inspect(e)}")
+        Logger.warning("TimelessTraces: corrupt block data: #{inspect(e)}")
         {:error, :corrupt_block}
     end
   end
@@ -129,7 +129,7 @@ defmodule SpanStream.Writer do
         decompress_block(data, format)
 
       {:error, reason} ->
-        Logger.warning("SpanStream: cannot read block #{file_path}: #{inspect(reason)}")
+        Logger.warning("TimelessTraces: cannot read block #{file_path}: #{inspect(reason)}")
         {:error, reason}
     end
   end

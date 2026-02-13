@@ -1,4 +1,4 @@
-defmodule SpanStream.Filter do
+defmodule TimelessTraces.Filter do
   @moduledoc false
 
   @spec filter([map()], keyword()) :: [map()]

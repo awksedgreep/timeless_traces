@@ -1,7 +1,7 @@
-defmodule SpanStream.FilterTest do
+defmodule TimelessTraces.FilterTest do
   use ExUnit.Case, async: true
 
-  alias SpanStream.Filter
+  alias TimelessTraces.Filter
 
   defp make_span(overrides \\ %{}) do
     Map.merge(

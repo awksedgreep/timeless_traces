@@ -1,4 +1,4 @@
-defmodule SpanStream.Span do
+defmodule TimelessTraces.Span do
   @moduledoc """
   A single OpenTelemetry span.
   """

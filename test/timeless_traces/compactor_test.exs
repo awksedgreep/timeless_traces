@@ -1,27 +1,27 @@
-defmodule SpanStream.CompactorTest do
+defmodule TimelessTraces.CompactorTest do
   use ExUnit.Case, async: false
 
   @data_dir "test/tmp/compactor_#{System.unique_integer([:positive])}"
 
   setup do
-    Application.stop(:span_stream)
+    Application.stop(:timeless_traces)
     File.rm_rf!(@data_dir)
-    Application.put_env(:span_stream, :storage, :disk)
-    Application.put_env(:span_stream, :data_dir, @data_dir)
-    Application.put_env(:span_stream, :flush_interval, 60_000)
-    Application.put_env(:span_stream, :max_buffer_size, 10_000)
-    Application.put_env(:span_stream, :retention_max_age, nil)
-    Application.put_env(:span_stream, :retention_max_size, nil)
-    Application.put_env(:span_stream, :compaction_threshold, 10)
-    Application.put_env(:span_stream, :compaction_max_raw_age, 60)
-    Application.ensure_all_started(:span_stream)
+    Application.put_env(:timeless_traces, :storage, :disk)
+    Application.put_env(:timeless_traces, :data_dir, @data_dir)
+    Application.put_env(:timeless_traces, :flush_interval, 60_000)
+    Application.put_env(:timeless_traces, :max_buffer_size, 10_000)
+    Application.put_env(:timeless_traces, :retention_max_age, nil)
+    Application.put_env(:timeless_traces, :retention_max_size, nil)
+    Application.put_env(:timeless_traces, :compaction_threshold, 10)
+    Application.put_env(:timeless_traces, :compaction_max_raw_age, 60)
+    Application.ensure_all_started(:timeless_traces)
 
     on_exit(fn ->
-      Application.stop(:span_stream)
+      Application.stop(:timeless_traces)
       File.rm_rf!(@data_dir)
-      Application.put_env(:span_stream, :storage, :disk)
-      Application.put_env(:span_stream, :compaction_threshold, 500)
-      Application.put_env(:span_stream, :compaction_max_raw_age, 60)
+      Application.put_env(:timeless_traces, :storage, :disk)
+      Application.put_env(:timeless_traces, :compaction_threshold, 500)
+      Application.put_env(:timeless_traces, :compaction_max_raw_age, 60)
     end)
 
     :ok
@@ -54,8 +54,8 @@ defmodule SpanStream.CompactorTest do
       # Flush multiple small batches to create raw blocks
       for _ <- 1..5 do
         spans = for _ <- 1..5, do: make_span()
-        SpanStream.Buffer.ingest(spans)
-        SpanStream.flush()
+        TimelessTraces.Buffer.ingest(spans)
+        TimelessTraces.flush()
       end
 
       blocks_dir = Path.join(@data_dir, "blocks")
@@ -65,12 +65,12 @@ defmodule SpanStream.CompactorTest do
       assert length(raw_before) == 5
 
       # Verify stats before compaction
-      {:ok, stats_before} = SpanStream.stats()
+      {:ok, stats_before} = TimelessTraces.stats()
       assert stats_before.total_entries == 25
       assert stats_before.raw_blocks == 5
 
       # Trigger compaction (threshold is 10, we have 25 entries)
-      assert :ok = SpanStream.Compactor.compact_now()
+      assert :ok = TimelessTraces.Compactor.compact_now()
 
       # Raw files should be deleted, replaced by a single zstd file
       raw_after = Path.wildcard(Path.join(blocks_dir, "*.raw"))
@@ -79,10 +79,10 @@ defmodule SpanStream.CompactorTest do
       assert length(zst_after) == 1
 
       # All entries still queryable
-      {:ok, %SpanStream.Result{total: 25}} = SpanStream.query([])
+      {:ok, %TimelessTraces.Result{total: 25}} = TimelessTraces.query([])
 
       # Stats should show zstd block
-      {:ok, stats_after} = SpanStream.stats()
+      {:ok, stats_after} = TimelessTraces.stats()
       assert stats_after.total_entries == 25
       assert stats_after.raw_blocks == 0
       assert stats_after.zstd_blocks == 1
@@ -94,7 +94,7 @@ defmodule SpanStream.CompactorTest do
       now = System.system_time(:nanosecond)
 
       # Spread trace spans across multiple flushes
-      SpanStream.Buffer.ingest([
+      TimelessTraces.Buffer.ingest([
         make_span(%{
           trace_id: trace_id,
           span_id: "root",
@@ -105,9 +105,9 @@ defmodule SpanStream.CompactorTest do
         })
       ])
 
-      SpanStream.flush()
+      TimelessTraces.flush()
 
-      SpanStream.Buffer.ingest([
+      TimelessTraces.Buffer.ingest([
         make_span(%{
           trace_id: trace_id,
           span_id: "child",
@@ -118,46 +118,46 @@ defmodule SpanStream.CompactorTest do
         })
       ])
 
-      SpanStream.flush()
+      TimelessTraces.flush()
 
       # Pad with more spans to exceed threshold
       for _ <- 1..10 do
-        SpanStream.Buffer.ingest([make_span()])
-        SpanStream.flush()
+        TimelessTraces.Buffer.ingest([make_span()])
+        TimelessTraces.flush()
       end
 
       # Verify trace works before compaction
-      {:ok, pre_spans} = SpanStream.trace(trace_id)
+      {:ok, pre_spans} = TimelessTraces.trace(trace_id)
       assert length(pre_spans) == 2
 
       # Compact
-      assert :ok = SpanStream.Compactor.compact_now()
+      assert :ok = TimelessTraces.Compactor.compact_now()
 
       # Trace should still work after compaction
-      {:ok, post_spans} = SpanStream.trace(trace_id)
+      {:ok, post_spans} = TimelessTraces.trace(trace_id)
       assert length(post_spans) == 2
       assert Enum.all?(post_spans, &(&1.trace_id == trace_id))
     end
 
     test "noop when below threshold" do
-      SpanStream.Buffer.ingest([make_span()])
-      SpanStream.flush()
+      TimelessTraces.Buffer.ingest([make_span()])
+      TimelessTraces.flush()
 
-      assert :noop = SpanStream.Compactor.compact_now()
+      assert :noop = TimelessTraces.Compactor.compact_now()
     end
   end
 
   describe "compaction in memory mode" do
     setup do
-      Application.stop(:span_stream)
-      Application.put_env(:span_stream, :storage, :memory)
-      Application.put_env(:span_stream, :data_dir, "test/tmp/compact_mem_should_not_exist")
-      Application.put_env(:span_stream, :compaction_threshold, 10)
-      Application.ensure_all_started(:span_stream)
+      Application.stop(:timeless_traces)
+      Application.put_env(:timeless_traces, :storage, :memory)
+      Application.put_env(:timeless_traces, :data_dir, "test/tmp/compact_mem_should_not_exist")
+      Application.put_env(:timeless_traces, :compaction_threshold, 10)
+      Application.ensure_all_started(:timeless_traces)
 
       on_exit(fn ->
-        Application.stop(:span_stream)
-        Application.put_env(:span_stream, :storage, :disk)
+        Application.stop(:timeless_traces)
+        Application.put_env(:timeless_traces, :storage, :disk)
       end)
 
       :ok
@@ -166,20 +166,20 @@ defmodule SpanStream.CompactorTest do
     test "compacts in memory mode" do
       for _ <- 1..5 do
         spans = for _ <- 1..5, do: make_span()
-        SpanStream.Buffer.ingest(spans)
-        SpanStream.flush()
+        TimelessTraces.Buffer.ingest(spans)
+        TimelessTraces.flush()
       end
 
-      {:ok, stats_before} = SpanStream.stats()
+      {:ok, stats_before} = TimelessTraces.stats()
       assert stats_before.raw_blocks == 5
 
-      assert :ok = SpanStream.Compactor.compact_now()
+      assert :ok = TimelessTraces.Compactor.compact_now()
 
-      {:ok, stats_after} = SpanStream.stats()
+      {:ok, stats_after} = TimelessTraces.stats()
       assert stats_after.zstd_blocks == 1
       assert stats_after.raw_blocks == 0
 
-      {:ok, %SpanStream.Result{total: 25}} = SpanStream.query([])
+      {:ok, %TimelessTraces.Result{total: 25}} = TimelessTraces.query([])
     end
   end
 end

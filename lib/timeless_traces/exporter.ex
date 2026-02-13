@@ -1,11 +1,11 @@
-defmodule SpanStream.Exporter do
+defmodule TimelessTraces.Exporter do
   @moduledoc """
-  OpenTelemetry traces exporter that stores spans in SpanStream.
+  OpenTelemetry traces exporter that stores spans in TimelessTraces.
 
   ## Configuration
 
       config :opentelemetry,
-        traces_exporter: {SpanStream.Exporter, []}
+        traces_exporter: {TimelessTraces.Exporter, []}
   """
 
   @behaviour :otel_exporter_traces
@@ -25,7 +25,7 @@ defmodule SpanStream.Exporter do
       |> Enum.reject(&is_nil/1)
 
     if spans != [] do
-      SpanStream.Buffer.ingest(spans)
+      TimelessTraces.Buffer.ingest(spans)
     end
 
     {:ok, state}
@@ -49,17 +49,17 @@ defmodule SpanStream.Exporter do
          kind, start_time, end_time, attributes, events, links, status, _trace_flags,
          _is_recording, instrumentation_scope} ->
           %{
-            trace_id: SpanStream.Span.encode_trace_id(trace_id),
-            span_id: SpanStream.Span.encode_span_id(span_id),
+            trace_id: TimelessTraces.Span.encode_trace_id(trace_id),
+            span_id: TimelessTraces.Span.encode_span_id(span_id),
             parent_span_id: normalize_parent_span_id(parent_span_id),
             name: to_string(name),
-            kind: SpanStream.Span.normalize_kind(kind),
+            kind: TimelessTraces.Span.normalize_kind(kind),
             start_time: :opentelemetry.convert_timestamp(start_time, :nanosecond),
             end_time: :opentelemetry.convert_timestamp(end_time, :nanosecond),
             duration_ns: :erlang.convert_time_unit(end_time - start_time, :native, :nanosecond),
             status: extract_status(status),
             status_message: extract_status_message(status),
-            attributes: SpanStream.Span.normalize_attributes(extract_attributes(attributes)),
+            attributes: TimelessTraces.Span.normalize_attributes(extract_attributes(attributes)),
             events: normalize_events(events),
             links: normalize_links(links),
             resource: resource_map,
@@ -76,7 +76,7 @@ defmodule SpanStream.Exporter do
 
   defp normalize_parent_span_id(:undefined), do: nil
   defp normalize_parent_span_id(0), do: nil
-  defp normalize_parent_span_id(id) when is_integer(id), do: SpanStream.Span.encode_span_id(id)
+  defp normalize_parent_span_id(id) when is_integer(id), do: TimelessTraces.Span.encode_span_id(id)
   defp normalize_parent_span_id(id), do: id
 
   defp extract_status({:status, code, message}) do

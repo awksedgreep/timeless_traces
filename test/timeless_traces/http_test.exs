@@ -1,28 +1,28 @@
-defmodule SpanStream.HTTPTest do
+defmodule TimelessTraces.HTTPTest do
   use ExUnit.Case, async: false
 
   import Plug.Test
   import Plug.Conn
 
   setup do
-    Application.stop(:span_stream)
-    Application.put_env(:span_stream, :storage, :memory)
-    Application.put_env(:span_stream, :data_dir, "test/tmp/http_should_not_exist")
-    Application.put_env(:span_stream, :flush_interval, 60_000)
-    Application.put_env(:span_stream, :max_buffer_size, 10_000)
-    Application.put_env(:span_stream, :http, false)
-    Application.ensure_all_started(:span_stream)
+    Application.stop(:timeless_traces)
+    Application.put_env(:timeless_traces, :storage, :memory)
+    Application.put_env(:timeless_traces, :data_dir, "test/tmp/http_should_not_exist")
+    Application.put_env(:timeless_traces, :flush_interval, 60_000)
+    Application.put_env(:timeless_traces, :max_buffer_size, 10_000)
+    Application.put_env(:timeless_traces, :http, false)
+    Application.ensure_all_started(:timeless_traces)
 
     on_exit(fn ->
-      Application.stop(:span_stream)
-      Application.put_env(:span_stream, :storage, :disk)
+      Application.stop(:timeless_traces)
+      Application.put_env(:timeless_traces, :storage, :disk)
     end)
 
     :ok
   end
 
   defp call(conn, opts \\ []) do
-    SpanStream.HTTP.call(conn, SpanStream.HTTP.init(opts))
+    TimelessTraces.HTTP.call(conn, TimelessTraces.HTTP.init(opts))
   end
 
   defp json_body(conn) do
@@ -54,8 +54,8 @@ defmodule SpanStream.HTTPTest do
   end
 
   defp ingest_and_flush(spans) do
-    SpanStream.Buffer.ingest(spans)
-    SpanStream.flush()
+    TimelessTraces.Buffer.ingest(spans)
+    TimelessTraces.flush()
   end
 
   # --- Health ---
@@ -132,9 +132,9 @@ defmodule SpanStream.HTTPTest do
 
       assert conn.status == 200
 
-      SpanStream.flush()
+      TimelessTraces.flush()
 
-      {:ok, %{entries: spans}} = SpanStream.query([])
+      {:ok, %{entries: spans}} = TimelessTraces.query([])
       assert length(spans) == 2
 
       names = Enum.map(spans, & &1.name) |> Enum.sort()
@@ -143,8 +143,8 @@ defmodule SpanStream.HTTPTest do
 
     test "parses OTLP kind integers correctly" do
       for {kind_int, expected_kind} <- [{1, :internal}, {2, :server}, {3, :client}, {4, :producer}, {5, :consumer}] do
-        Application.stop(:span_stream)
-        Application.ensure_all_started(:span_stream)
+        Application.stop(:timeless_traces)
+        Application.ensure_all_started(:timeless_traces)
 
         otlp_body = Jason.encode!(%{
           resourceSpans: [%{
@@ -167,17 +167,17 @@ defmodule SpanStream.HTTPTest do
         |> put_req_header("content-type", "application/json")
         |> call()
 
-        SpanStream.flush()
+        TimelessTraces.flush()
 
-        {:ok, %{entries: [span]}} = SpanStream.query([])
+        {:ok, %{entries: [span]}} = TimelessTraces.query([])
         assert span.kind == expected_kind, "Expected kind #{expected_kind} for OTLP kind #{kind_int}, got #{span.kind}"
       end
     end
 
     test "parses OTLP status codes correctly" do
       for {code, expected} <- [{0, :unset}, {1, :ok}, {2, :error}] do
-        Application.stop(:span_stream)
-        Application.ensure_all_started(:span_stream)
+        Application.stop(:timeless_traces)
+        Application.ensure_all_started(:timeless_traces)
 
         otlp_body = Jason.encode!(%{
           resourceSpans: [%{
@@ -201,9 +201,9 @@ defmodule SpanStream.HTTPTest do
         |> put_req_header("content-type", "application/json")
         |> call()
 
-        SpanStream.flush()
+        TimelessTraces.flush()
 
-        {:ok, %{entries: [span]}} = SpanStream.query([])
+        {:ok, %{entries: [span]}} = TimelessTraces.query([])
         assert span.status == expected, "Expected status #{expected} for OTLP code #{code}, got #{span.status}"
       end
     end
@@ -235,9 +235,9 @@ defmodule SpanStream.HTTPTest do
       |> put_req_header("content-type", "application/json")
       |> call()
 
-      SpanStream.flush()
+      TimelessTraces.flush()
 
-      {:ok, %{entries: [span]}} = SpanStream.query([])
+      {:ok, %{entries: [span]}} = TimelessTraces.query([])
       assert span.attributes["str_attr"] == "hello"
       assert span.attributes["int_attr"] == 42
       assert span.attributes["float_attr"] == 3.14

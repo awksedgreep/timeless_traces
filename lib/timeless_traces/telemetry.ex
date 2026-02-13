@@ -1,22 +1,22 @@
-defmodule SpanStream.Telemetry do
+defmodule TimelessTraces.Telemetry do
   @moduledoc """
-  Telemetry events emitted by SpanStream.
+  Telemetry events emitted by TimelessTraces.
 
   ## Events
 
-    * `[:span_stream, :flush, :stop]` - A buffer flush completed.
+    * `[:timeless_traces, :flush, :stop]` - A buffer flush completed.
       * Measurements: `%{duration: native_time, entry_count: integer, byte_size: integer}`
       * Metadata: `%{block_id: integer}`
 
-    * `[:span_stream, :query, :stop]` - A query completed.
+    * `[:timeless_traces, :query, :stop]` - A query completed.
       * Measurements: `%{duration: native_time, total: integer, blocks_read: integer}`
       * Metadata: `%{filters: keyword}`
 
-    * `[:span_stream, :retention, :stop]` - A retention cleanup completed.
+    * `[:timeless_traces, :retention, :stop]` - A retention cleanup completed.
       * Measurements: `%{duration: native_time, blocks_deleted: integer}`
       * Metadata: `%{}`
 
-    * `[:span_stream, :block, :error]` - A block read failed (corrupt or missing).
+    * `[:timeless_traces, :block, :error]` - A block read failed (corrupt or missing).
       * Measurements: `%{}`
       * Metadata: `%{file_path: string, reason: atom}`
   """

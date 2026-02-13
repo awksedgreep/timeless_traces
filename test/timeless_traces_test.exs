@@ -1,19 +1,19 @@
-defmodule SpanStreamTest do
+defmodule TimelessTracesTest do
   use ExUnit.Case, async: false
 
   setup do
-    Application.stop(:span_stream)
-    Application.put_env(:span_stream, :storage, :memory)
-    Application.put_env(:span_stream, :data_dir, "test/tmp/e2e_should_not_exist")
-    Application.put_env(:span_stream, :flush_interval, 60_000)
-    Application.put_env(:span_stream, :max_buffer_size, 10_000)
-    Application.put_env(:span_stream, :retention_max_age, nil)
-    Application.put_env(:span_stream, :retention_max_size, nil)
-    Application.ensure_all_started(:span_stream)
+    Application.stop(:timeless_traces)
+    Application.put_env(:timeless_traces, :storage, :memory)
+    Application.put_env(:timeless_traces, :data_dir, "test/tmp/e2e_should_not_exist")
+    Application.put_env(:timeless_traces, :flush_interval, 60_000)
+    Application.put_env(:timeless_traces, :max_buffer_size, 10_000)
+    Application.put_env(:timeless_traces, :retention_max_age, nil)
+    Application.put_env(:timeless_traces, :retention_max_size, nil)
+    Application.ensure_all_started(:timeless_traces)
 
     on_exit(fn ->
-      Application.stop(:span_stream)
-      Application.put_env(:span_stream, :storage, :disk)
+      Application.stop(:timeless_traces)
+      Application.put_env(:timeless_traces, :storage, :disk)
     end)
 
     :ok
@@ -49,12 +49,12 @@ defmodule SpanStreamTest do
         make_span(%{name: "GET /health", status: :ok})
       ]
 
-      SpanStream.Buffer.ingest(spans)
-      SpanStream.flush()
+      TimelessTraces.Buffer.ingest(spans)
+      TimelessTraces.flush()
 
-      {:ok, %SpanStream.Result{entries: all, total: 3}} = SpanStream.query([])
+      {:ok, %TimelessTraces.Result{entries: all, total: 3}} = TimelessTraces.query([])
       assert length(all) == 3
-      assert Enum.all?(all, &match?(%SpanStream.Span{}, &1))
+      assert Enum.all?(all, &match?(%TimelessTraces.Span{}, &1))
     end
 
     test "query by status filter" do
@@ -64,11 +64,11 @@ defmodule SpanStreamTest do
         make_span(%{status: :ok})
       ]
 
-      SpanStream.Buffer.ingest(spans)
-      SpanStream.flush()
+      TimelessTraces.Buffer.ingest(spans)
+      TimelessTraces.flush()
 
-      {:ok, %SpanStream.Result{entries: errors, total: 1}} =
-        SpanStream.query(status: :error)
+      {:ok, %TimelessTraces.Result{entries: errors, total: 1}} =
+        TimelessTraces.query(status: :error)
 
       assert length(errors) == 1
       assert hd(errors).status == :error
@@ -81,10 +81,10 @@ defmodule SpanStreamTest do
         make_span(%{kind: :internal})
       ]
 
-      SpanStream.Buffer.ingest(spans)
-      SpanStream.flush()
+      TimelessTraces.Buffer.ingest(spans)
+      TimelessTraces.flush()
 
-      {:ok, %SpanStream.Result{entries: servers}} = SpanStream.query(kind: :server)
+      {:ok, %TimelessTraces.Result{entries: servers}} = TimelessTraces.query(kind: :server)
       assert length(servers) == 1
       assert hd(servers).kind == :server
     end
@@ -107,11 +107,11 @@ defmodule SpanStreamTest do
         })
       ]
 
-      SpanStream.Buffer.ingest(spans)
-      SpanStream.flush()
+      TimelessTraces.Buffer.ingest(spans)
+      TimelessTraces.flush()
 
-      {:ok, %SpanStream.Result{entries: slow}} =
-        SpanStream.query(min_duration: 100_000_000)
+      {:ok, %TimelessTraces.Result{entries: slow}} =
+        TimelessTraces.query(min_duration: 100_000_000)
 
       assert length(slow) == 1
       assert hd(slow).name == "slow"
@@ -149,10 +149,10 @@ defmodule SpanStreamTest do
         make_span(%{name: "unrelated"})
       ]
 
-      SpanStream.Buffer.ingest(spans)
-      SpanStream.flush()
+      TimelessTraces.Buffer.ingest(spans)
+      TimelessTraces.flush()
 
-      {:ok, trace_spans} = SpanStream.trace(trace_id)
+      {:ok, trace_spans} = TimelessTraces.trace(trace_id)
       assert length(trace_spans) == 3
       assert Enum.all?(trace_spans, &(&1.trace_id == trace_id))
 
@@ -163,61 +163,61 @@ defmodule SpanStreamTest do
 
     test "pagination works" do
       spans = for i <- 1..20, do: make_span(%{name: "span-#{i}"})
-      SpanStream.Buffer.ingest(spans)
-      SpanStream.flush()
+      TimelessTraces.Buffer.ingest(spans)
+      TimelessTraces.flush()
 
-      {:ok, %SpanStream.Result{entries: page1, total: 20, limit: 5}} =
-        SpanStream.query(limit: 5)
+      {:ok, %TimelessTraces.Result{entries: page1, total: 20, limit: 5}} =
+        TimelessTraces.query(limit: 5)
 
       assert length(page1) == 5
 
-      {:ok, %SpanStream.Result{entries: page2, offset: 5}} =
-        SpanStream.query(limit: 5, offset: 5)
+      {:ok, %TimelessTraces.Result{entries: page2, offset: 5}} =
+        TimelessTraces.query(limit: 5, offset: 5)
 
       assert length(page2) == 5
       assert hd(page1).span_id != hd(page2).span_id
     end
 
     test "stats/0 returns aggregate data" do
-      {:ok, stats} = SpanStream.stats()
+      {:ok, stats} = TimelessTraces.stats()
       assert stats.total_blocks == 0
 
-      SpanStream.Buffer.ingest([make_span()])
-      SpanStream.flush()
+      TimelessTraces.Buffer.ingest([make_span()])
+      TimelessTraces.flush()
 
-      {:ok, stats} = SpanStream.stats()
+      {:ok, stats} = TimelessTraces.stats()
       assert stats.total_blocks == 1
       assert stats.total_entries == 1
       assert stats.total_bytes > 0
     end
 
     test "subscribe/unsubscribe for live spans" do
-      SpanStream.subscribe()
+      TimelessTraces.subscribe()
 
       span = make_span(%{name: "live-span"})
-      SpanStream.Buffer.ingest([span])
+      TimelessTraces.Buffer.ingest([span])
 
-      assert_receive {:span_stream, :span, %SpanStream.Span{name: "live-span"}}, 1000
+      assert_receive {:timeless_traces, :span, %TimelessTraces.Span{name: "live-span"}}, 1000
 
-      SpanStream.unsubscribe()
+      TimelessTraces.unsubscribe()
     end
 
     test "multiple flushes accumulate" do
-      SpanStream.Buffer.ingest([make_span()])
-      SpanStream.flush()
+      TimelessTraces.Buffer.ingest([make_span()])
+      TimelessTraces.flush()
 
-      SpanStream.Buffer.ingest([make_span()])
-      SpanStream.flush()
+      TimelessTraces.Buffer.ingest([make_span()])
+      TimelessTraces.flush()
 
-      SpanStream.Buffer.ingest([make_span()])
-      SpanStream.flush()
+      TimelessTraces.Buffer.ingest([make_span()])
+      TimelessTraces.flush()
 
-      {:ok, %SpanStream.Result{total: 3}} = SpanStream.query([])
+      {:ok, %TimelessTraces.Result{total: 3}} = TimelessTraces.query([])
     end
 
     test "no files created in memory mode" do
-      SpanStream.Buffer.ingest([make_span()])
-      SpanStream.flush()
+      TimelessTraces.Buffer.ingest([make_span()])
+      TimelessTraces.flush()
 
       refute File.exists?("test/tmp/e2e_should_not_exist")
     end

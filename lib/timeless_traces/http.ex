@@ -1,4 +1,4 @@
-defmodule SpanStream.HTTP do
+defmodule TimelessTraces.HTTP do
   require Logger
 
   @moduledoc """
@@ -8,13 +8,13 @@ defmodule SpanStream.HTTP do
 
   Add to your config:
 
-      config :span_stream, http: true                          # port 10428, no auth
-      config :span_stream, http: [port: 10500, bearer_token: "secret"]
+      config :timeless_traces, http: true                          # port 10428, no auth
+      config :timeless_traces, http: [port: 10500, bearer_token: "secret"]
 
   Or add to your supervision tree directly:
 
       children = [
-        {SpanStream.HTTP, port: 10428}
+        {TimelessTraces.HTTP, port: 10428}
       ]
 
   ## Endpoints
@@ -60,14 +60,14 @@ defmodule SpanStream.HTTP do
   @impl Plug
   def call(conn, opts) do
     conn
-    |> Plug.Conn.put_private(:span_stream_token, Keyword.get(opts, :bearer_token))
+    |> Plug.Conn.put_private(:timeless_traces_token, Keyword.get(opts, :bearer_token))
     |> super(opts)
   end
 
   defp authenticate(%{request_path: "/health"} = conn, _opts), do: conn
 
   defp authenticate(conn, _opts) do
-    case conn.private[:span_stream_token] do
+    case conn.private[:timeless_traces_token] do
       nil -> conn
       expected -> check_token(conn, expected)
     end
@@ -104,7 +104,7 @@ defmodule SpanStream.HTTP do
 
   # Health check
   get "/health" do
-    {:ok, stats} = SpanStream.stats()
+    {:ok, stats} = TimelessTraces.stats()
 
     body =
       Jason.encode!(%{
@@ -128,7 +128,7 @@ defmodule SpanStream.HTTP do
             spans = parse_otlp_resource_spans(resource_spans)
 
             if spans != [] do
-              SpanStream.Buffer.ingest(spans)
+              TimelessTraces.Buffer.ingest(spans)
             end
 
             send_resp(conn, 200, ~s({"partialSuccess":{}}))
@@ -152,7 +152,7 @@ defmodule SpanStream.HTTP do
 
   # List service names (Jaeger-compatible)
   get "/select/jaeger/api/services" do
-    {:ok, services} = SpanStream.services()
+    {:ok, services} = TimelessTraces.services()
 
     conn
     |> put_resp_content_type("application/json")
@@ -162,7 +162,7 @@ defmodule SpanStream.HTTP do
   # Operations for a service (Jaeger-compatible)
   get "/select/jaeger/api/services/:service/operations" do
     service = conn.path_params["service"]
-    {:ok, operations} = SpanStream.operations(service)
+    {:ok, operations} = TimelessTraces.operations(service)
 
     conn
     |> put_resp_content_type("application/json")
@@ -176,7 +176,7 @@ defmodule SpanStream.HTTP do
 
     filters = build_trace_search_filters(params)
 
-    case SpanStream.query(filters) do
+    case TimelessTraces.query(filters) do
       {:ok, %{entries: spans}} ->
         traces = group_spans_to_jaeger_traces(spans)
 
@@ -193,7 +193,7 @@ defmodule SpanStream.HTTP do
   get "/select/jaeger/api/traces/:trace_id" do
     trace_id = conn.path_params["trace_id"]
 
-    case SpanStream.trace(trace_id) do
+    case TimelessTraces.trace(trace_id) do
       {:ok, spans} ->
         trace = spans_to_jaeger_trace(trace_id, spans)
 
@@ -221,7 +221,7 @@ defmodule SpanStream.HTTP do
 
     target_dir = parsed_path || default_backup_dir()
 
-    case SpanStream.backup(target_dir) do
+    case TimelessTraces.backup(target_dir) do
       {:ok, result} ->
         conn
         |> put_resp_content_type("application/json")
@@ -239,7 +239,7 @@ defmodule SpanStream.HTTP do
 
   # Force buffer flush
   get "/api/v1/flush" do
-    SpanStream.flush()
+    TimelessTraces.flush()
 
     conn
     |> put_resp_content_type("application/json")
@@ -571,7 +571,7 @@ defmodule SpanStream.HTTP do
   end
 
   defp default_backup_dir do
-    data_dir = SpanStream.Config.data_dir()
+    data_dir = TimelessTraces.Config.data_dir()
     Path.join([data_dir, "backups", to_string(System.os_time(:second))])
   end
 

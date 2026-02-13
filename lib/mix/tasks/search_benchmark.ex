@@ -1,4 +1,4 @@
-defmodule Mix.Tasks.SpanStream.SearchBenchmark do
+defmodule Mix.Tasks.TimelessTraces.SearchBenchmark do
   @moduledoc "Benchmark query throughput across different filter patterns"
   use Mix.Task
 
@@ -10,12 +10,12 @@ defmodule Mix.Tasks.SpanStream.SearchBenchmark do
     blocks_dir = Path.join(data_dir, "blocks")
     File.mkdir_p!(blocks_dir)
 
-    Application.put_env(:span_stream, :data_dir, data_dir)
-    Application.put_env(:span_stream, :storage, :disk)
-    Application.put_env(:span_stream, :compaction_interval, 600_000)
+    Application.put_env(:timeless_traces, :data_dir, data_dir)
+    Application.put_env(:timeless_traces, :storage, :disk)
+    Application.put_env(:timeless_traces, :compaction_interval, 600_000)
     Mix.Task.run("app.start")
 
-    IO.puts("=== SpanStream Search Benchmark ===\n")
+    IO.puts("=== TimelessTraces Search Benchmark ===\n")
 
     # Generate and index data
     span_count = 200_000
@@ -23,7 +23,7 @@ defmodule Mix.Tasks.SpanStream.SearchBenchmark do
     {setup_us, trace_ids} = :timer.tc(fn -> seed_data(data_dir, span_count) end)
     IO.puts("Setup: #{fmt_ms(setup_us)}\n")
 
-    {:ok, stats} = SpanStream.Index.stats()
+    {:ok, stats} = TimelessTraces.Index.stats()
     IO.puts("Indexed: #{stats.total_blocks} blocks, #{fmt_number(stats.total_entries)} spans\n")
 
     # Benchmark queries
@@ -42,7 +42,7 @@ defmodule Mix.Tasks.SpanStream.SearchBenchmark do
       for {label, filters} <- queries do
         times =
           for _ <- 1..3 do
-            {us, {:ok, result}} = :timer.tc(fn -> SpanStream.Index.query(filters) end)
+            {us, {:ok, result}} = :timer.tc(fn -> TimelessTraces.Index.query(filters) end)
             {us, result.total}
           end
 
@@ -62,7 +62,7 @@ defmodule Mix.Tasks.SpanStream.SearchBenchmark do
 
     trace_times =
       for trace_id <- sample_traces do
-        {us, {:ok, spans}} = :timer.tc(fn -> SpanStream.Index.trace(trace_id) end)
+        {us, {:ok, spans}} = :timer.tc(fn -> TimelessTraces.Index.trace(trace_id) end)
         {us, length(spans)}
       end
 
@@ -85,7 +85,7 @@ defmodule Mix.Tasks.SpanStream.SearchBenchmark do
 
     IO.puts("  #{String.pad_trailing("trace lookup", 30)} #{fmt_ms(avg_trace_us)}")
 
-    Application.stop(:span_stream)
+    Application.stop(:timeless_traces)
     File.rm_rf!(data_dir)
   end
 
@@ -140,8 +140,8 @@ defmodule Mix.Tasks.SpanStream.SearchBenchmark do
     |> Enum.reverse()
     |> Enum.chunk_every(1000)
     |> Enum.each(fn chunk ->
-      case SpanStream.Writer.write_block(chunk, data_dir, :raw) do
-        {:ok, meta} -> SpanStream.Index.index_block(meta, chunk)
+      case TimelessTraces.Writer.write_block(chunk, data_dir, :raw) do
+        {:ok, meta} -> TimelessTraces.Index.index_block(meta, chunk)
         _ -> :ok
       end
     end)

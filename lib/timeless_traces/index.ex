@@ -1,4 +1,4 @@
-defmodule SpanStream.Index do
+defmodule TimelessTraces.Index do
   @moduledoc false
 
   use GenServer
@@ -20,31 +20,31 @@ defmodule SpanStream.Index do
     GenServer.start_link(__MODULE__, opts, name: __MODULE__)
   end
 
-  @spec index_block(SpanStream.Writer.block_meta(), [map()]) :: :ok
+  @spec index_block(TimelessTraces.Writer.block_meta(), [map()]) :: :ok
   def index_block(block_meta, entries) do
     GenServer.call(__MODULE__, {:index_block, block_meta, entries})
   end
 
-  @spec index_block_async(SpanStream.Writer.block_meta(), [map()]) :: :ok
+  @spec index_block_async(TimelessTraces.Writer.block_meta(), [map()]) :: :ok
   def index_block_async(block_meta, entries) do
     GenServer.cast(__MODULE__, {:index_block, block_meta, entries})
   end
 
-  @spec query(keyword()) :: {:ok, SpanStream.Result.t()}
+  @spec query(keyword()) :: {:ok, TimelessTraces.Result.t()}
   def query(filters) do
     # Phase 1: GenServer does the cheap SQLite lookup only
     {block_ids, storage, pagination, search_filters} =
-      GenServer.call(__MODULE__, {:query_plan, filters}, SpanStream.Config.query_timeout())
+      GenServer.call(__MODULE__, {:query_plan, filters}, TimelessTraces.Config.query_timeout())
 
     # Phase 2: Parallel decompression + filtering in the caller's process
     do_query_parallel(block_ids, storage, pagination, search_filters)
   end
 
-  @spec trace(String.t()) :: {:ok, [SpanStream.Span.t()]}
+  @spec trace(String.t()) :: {:ok, [TimelessTraces.Span.t()]}
   def trace(trace_id) do
     # Phase 1: GenServer does the cheap SQLite lookup only
     {block_info, storage} =
-      GenServer.call(__MODULE__, {:trace_plan, trace_id}, SpanStream.Config.query_timeout())
+      GenServer.call(__MODULE__, {:trace_plan, trace_id}, TimelessTraces.Config.query_timeout())
 
     # Phase 2: Parallel decompression in the caller's process
     do_trace_parallel(block_info, storage, trace_id)
@@ -60,19 +60,19 @@ defmodule SpanStream.Index do
     GenServer.call(__MODULE__, {:delete_over_size, max_bytes}, 60_000)
   end
 
-  @spec stats() :: {:ok, SpanStream.Stats.t()}
+  @spec stats() :: {:ok, TimelessTraces.Stats.t()}
   def stats do
-    GenServer.call(__MODULE__, :stats, SpanStream.Config.query_timeout())
+    GenServer.call(__MODULE__, :stats, TimelessTraces.Config.query_timeout())
   end
 
   @spec matching_block_ids(keyword()) :: [{integer(), String.t() | nil, :raw | :zstd}]
   def matching_block_ids(filters) do
-    GenServer.call(__MODULE__, {:matching_block_ids, filters}, SpanStream.Config.query_timeout())
+    GenServer.call(__MODULE__, {:matching_block_ids, filters}, TimelessTraces.Config.query_timeout())
   end
 
   @spec read_block_data(integer()) :: {:ok, [map()]} | {:error, term()}
   def read_block_data(block_id) do
-    GenServer.call(__MODULE__, {:read_block_data, block_id}, SpanStream.Config.query_timeout())
+    GenServer.call(__MODULE__, {:read_block_data, block_id}, TimelessTraces.Config.query_timeout())
   end
 
   @spec raw_block_stats() :: %{
@@ -81,15 +81,15 @@ defmodule SpanStream.Index do
           oldest_created_at: integer() | nil
         }
   def raw_block_stats do
-    GenServer.call(__MODULE__, :raw_block_stats, SpanStream.Config.query_timeout())
+    GenServer.call(__MODULE__, :raw_block_stats, TimelessTraces.Config.query_timeout())
   end
 
   @spec raw_block_ids() :: [{integer(), String.t() | nil}]
   def raw_block_ids do
-    GenServer.call(__MODULE__, :raw_block_ids, SpanStream.Config.query_timeout())
+    GenServer.call(__MODULE__, :raw_block_ids, TimelessTraces.Config.query_timeout())
   end
 
-  @spec compact_blocks([integer()], SpanStream.Writer.block_meta(), [map()]) :: :ok
+  @spec compact_blocks([integer()], TimelessTraces.Writer.block_meta(), [map()]) :: :ok
   def compact_blocks(old_block_ids, new_meta, new_entries) do
     GenServer.call(__MODULE__, {:compact_blocks, old_block_ids, new_meta, new_entries}, 60_000)
   end
@@ -101,12 +101,12 @@ defmodule SpanStream.Index do
 
   @spec distinct_services() :: {:ok, [String.t()]}
   def distinct_services do
-    GenServer.call(__MODULE__, :distinct_services, SpanStream.Config.query_timeout())
+    GenServer.call(__MODULE__, :distinct_services, TimelessTraces.Config.query_timeout())
   end
 
   @spec distinct_operations(String.t()) :: {:ok, [String.t()]}
   def distinct_operations(service) do
-    GenServer.call(__MODULE__, {:distinct_operations, service}, SpanStream.Config.query_timeout())
+    GenServer.call(__MODULE__, {:distinct_operations, service}, TimelessTraces.Config.query_timeout())
   end
 
   # --- GenServer callbacks ---
@@ -496,15 +496,15 @@ defmodule SpanStream.Index do
           fn {_block_id, file_path, format} ->
             format_atom = to_format_atom(format)
 
-            case SpanStream.Writer.read_block(file_path, format_atom) do
+            case TimelessTraces.Writer.read_block(file_path, format_atom) do
               {:ok, entries} ->
                 entries
-                |> SpanStream.Filter.filter(search_filters)
-                |> Enum.map(&SpanStream.Span.from_map/1)
+                |> TimelessTraces.Filter.filter(search_filters)
+                |> Enum.map(&TimelessTraces.Span.from_map/1)
 
               {:error, reason} ->
-                SpanStream.Telemetry.event(
-                  [:span_stream, :block, :error],
+                TimelessTraces.Telemetry.event(
+                  [:timeless_traces, :block, :error],
                   %{},
                   %{file_path: file_path, reason: reason}
                 )
@@ -522,19 +522,19 @@ defmodule SpanStream.Index do
 
           read_result =
             case storage do
-              :disk -> SpanStream.Writer.read_block(file_path, format_atom)
+              :disk -> TimelessTraces.Writer.read_block(file_path, format_atom)
               :memory -> read_block_data(block_id)
             end
 
           case read_result do
             {:ok, entries} ->
               entries
-              |> SpanStream.Filter.filter(search_filters)
-              |> Enum.map(&SpanStream.Span.from_map/1)
+              |> TimelessTraces.Filter.filter(search_filters)
+              |> Enum.map(&TimelessTraces.Span.from_map/1)
 
             {:error, reason} ->
-              SpanStream.Telemetry.event(
-                [:span_stream, :block, :error],
+              TimelessTraces.Telemetry.event(
+                [:timeless_traces, :block, :error],
                 %{},
                 %{file_path: file_path, reason: reason}
               )
@@ -554,14 +554,14 @@ defmodule SpanStream.Index do
     page = sorted |> Enum.drop(offset) |> Enum.take(limit)
     duration = System.monotonic_time() - start_time
 
-    SpanStream.Telemetry.event(
-      [:span_stream, :query, :stop],
+    TimelessTraces.Telemetry.event(
+      [:timeless_traces, :query, :stop],
       %{duration: duration, total: total, blocks_read: blocks_read},
       %{filters: search_filters}
     )
 
     {:ok,
-     %SpanStream.Result{
+     %TimelessTraces.Result{
        entries: page,
        total: total,
        limit: limit,
@@ -592,11 +592,11 @@ defmodule SpanStream.Index do
           fn {_block_id, file_path, format} ->
             format_atom = to_format_atom(format)
 
-            case SpanStream.Writer.read_block(file_path, format_atom) do
+            case TimelessTraces.Writer.read_block(file_path, format_atom) do
               {:ok, entries} ->
                 entries
                 |> Enum.filter(fn e -> e.trace_id == trace_id end)
-                |> Enum.map(&SpanStream.Span.from_map/1)
+                |> Enum.map(&TimelessTraces.Span.from_map/1)
 
               {:error, _} ->
                 []
@@ -612,7 +612,7 @@ defmodule SpanStream.Index do
 
           read_result =
             case storage do
-              :disk -> SpanStream.Writer.read_block(file_path, format_atom)
+              :disk -> TimelessTraces.Writer.read_block(file_path, format_atom)
               :memory -> read_block_data(block_id)
             end
 
@@ -620,7 +620,7 @@ defmodule SpanStream.Index do
             {:ok, entries} ->
               entries
               |> Enum.filter(fn e -> e.trace_id == trace_id end)
-              |> Enum.map(&SpanStream.Span.from_map/1)
+              |> Enum.map(&TimelessTraces.Span.from_map/1)
 
             {:error, _} ->
               []
@@ -672,7 +672,7 @@ defmodule SpanStream.Index do
       end
 
     {:ok,
-     %SpanStream.Stats{
+     %TimelessTraces.Stats{
        total_blocks: total_blocks,
        total_entries: total_entries,
        total_bytes: total_bytes,
@@ -714,7 +714,7 @@ defmodule SpanStream.Index do
     result =
       case Exqlite.Sqlite3.step(db, stmt) do
         {:row, [data, format]} when is_binary(data) ->
-          SpanStream.Writer.decompress_block(data, to_format_atom(format))
+          TimelessTraces.Writer.decompress_block(data, to_format_atom(format))
 
         {:row, [nil, _format]} ->
           {:error, :no_data}

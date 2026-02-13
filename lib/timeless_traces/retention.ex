@@ -1,4 +1,4 @@
-defmodule SpanStream.Retention do
+defmodule TimelessTraces.Retention do
   @moduledoc false
 
   use GenServer
@@ -17,7 +17,7 @@ defmodule SpanStream.Retention do
 
   @impl true
   def init(_opts) do
-    schedule(SpanStream.Config.retention_check_interval())
+    schedule(TimelessTraces.Config.retention_check_interval())
     {:ok, %{}}
   end
 
@@ -30,7 +30,7 @@ defmodule SpanStream.Retention do
   @impl true
   def handle_info(:retention_check, state) do
     do_cleanup()
-    schedule(SpanStream.Config.retention_check_interval())
+    schedule(TimelessTraces.Config.retention_check_interval())
     {:noreply, state}
   end
 
@@ -39,8 +39,8 @@ defmodule SpanStream.Retention do
   end
 
   defp do_cleanup do
-    max_age = SpanStream.Config.retention_max_age()
-    max_size = SpanStream.Config.retention_max_size()
+    max_age = TimelessTraces.Config.retention_max_age()
+    max_size = TimelessTraces.Config.retention_max_size()
 
     if is_nil(max_age) and is_nil(max_size) do
       :noop
@@ -51,8 +51,8 @@ defmodule SpanStream.Retention do
       total_deleted = deleted_age + deleted_size
       duration = System.monotonic_time() - start_time
 
-      SpanStream.Telemetry.event(
-        [:span_stream, :retention, :stop],
+      TimelessTraces.Telemetry.event(
+        [:timeless_traces, :retention, :stop],
         %{duration: duration, blocks_deleted: total_deleted},
         %{}
       )
@@ -63,10 +63,10 @@ defmodule SpanStream.Retention do
 
   defp cleanup_by_age(max_age_seconds) do
     cutoff = System.system_time(:second) - max_age_seconds
-    SpanStream.Index.delete_blocks_before(cutoff)
+    TimelessTraces.Index.delete_blocks_before(cutoff)
   end
 
   defp cleanup_by_size(max_bytes) do
-    SpanStream.Index.delete_blocks_over_size(max_bytes)
+    TimelessTraces.Index.delete_blocks_over_size(max_bytes)
   end
 end

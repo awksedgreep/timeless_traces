@@ -1,4 +1,4 @@
-defmodule Mix.Tasks.SpanStream.IngestBenchmark do
+defmodule Mix.Tasks.TimelessTraces.IngestBenchmark do
   @moduledoc "Benchmark ingestion throughput through the full pipeline"
   use Mix.Task
 
@@ -10,13 +10,13 @@ defmodule Mix.Tasks.SpanStream.IngestBenchmark do
     blocks_dir = Path.join(data_dir, "blocks")
     File.mkdir_p!(blocks_dir)
 
-    Application.put_env(:span_stream, :data_dir, data_dir)
-    Application.put_env(:span_stream, :storage, :disk)
+    Application.put_env(:timeless_traces, :data_dir, data_dir)
+    Application.put_env(:timeless_traces, :storage, :disk)
     # Disable compaction during benchmark
-    Application.put_env(:span_stream, :compaction_interval, 600_000)
+    Application.put_env(:timeless_traces, :compaction_interval, 600_000)
     Mix.Task.run("app.start")
 
-    IO.puts("=== SpanStream Ingestion Benchmark ===\n")
+    IO.puts("=== TimelessTraces Ingestion Benchmark ===\n")
 
     # Pre-generate spans to exclude generation time
     span_count = 500_000
@@ -34,7 +34,7 @@ defmodule Mix.Tasks.SpanStream.IngestBenchmark do
         spans
         |> Enum.chunk_every(1000)
         |> Enum.reduce(0, fn chunk, count ->
-          case SpanStream.Writer.write_block(chunk, writer_dir, :raw) do
+          case TimelessTraces.Writer.write_block(chunk, writer_dir, :raw) do
             {:ok, _} -> count + 1
             _ -> count
           end
@@ -49,18 +49,18 @@ defmodule Mix.Tasks.SpanStream.IngestBenchmark do
     IO.puts("--- Phase 2: Writer + Index (sync) ---")
     idx_dir = Path.join(data_dir, "idx_bench")
     File.mkdir_p!(Path.join(idx_dir, "blocks"))
-    Application.stop(:span_stream)
-    Application.put_env(:span_stream, :data_dir, idx_dir)
-    Application.ensure_all_started(:span_stream)
+    Application.stop(:timeless_traces)
+    Application.put_env(:timeless_traces, :data_dir, idx_dir)
+    Application.ensure_all_started(:timeless_traces)
 
     {idx_us, idx_blocks} =
       :timer.tc(fn ->
         spans
         |> Enum.chunk_every(1000)
         |> Enum.reduce(0, fn chunk, count ->
-          case SpanStream.Writer.write_block(chunk, idx_dir, :raw) do
+          case TimelessTraces.Writer.write_block(chunk, idx_dir, :raw) do
             {:ok, meta} ->
-              SpanStream.Index.index_block(meta, chunk)
+              TimelessTraces.Index.index_block(meta, chunk)
               count + 1
 
             _ ->
@@ -79,26 +79,26 @@ defmodule Mix.Tasks.SpanStream.IngestBenchmark do
     IO.puts("--- Phase 3: Full pipeline (Buffer.ingest → Writer → Index) ---")
     pipe_dir = Path.join(data_dir, "pipe_bench")
     File.mkdir_p!(Path.join(pipe_dir, "blocks"))
-    Application.stop(:span_stream)
-    Application.put_env(:span_stream, :data_dir, pipe_dir)
-    Application.ensure_all_started(:span_stream)
+    Application.stop(:timeless_traces)
+    Application.put_env(:timeless_traces, :data_dir, pipe_dir)
+    Application.ensure_all_started(:timeless_traces)
 
     {pipe_us, _} =
       :timer.tc(fn ->
         spans
         |> Enum.chunk_every(100)
         |> Enum.each(fn batch ->
-          SpanStream.Buffer.ingest(batch)
+          TimelessTraces.Buffer.ingest(batch)
         end)
 
         # Flush remaining buffer
-        SpanStream.Buffer.flush()
+        TimelessTraces.Buffer.flush()
         # Drain Index mailbox — stats call waits behind pending casts
-        SpanStream.Index.stats()
+        TimelessTraces.Index.stats()
       end)
 
     pipe_eps = span_count / (pipe_us / 1_000_000)
-    {:ok, stats} = SpanStream.Index.stats()
+    {:ok, stats} = TimelessTraces.Index.stats()
 
     IO.puts("  #{stats.total_blocks} blocks, #{fmt_number(stats.total_entries)} spans indexed")
     IO.puts("  Wall time: #{fmt_ms(pipe_us)}")
@@ -110,7 +110,7 @@ defmodule Mix.Tasks.SpanStream.IngestBenchmark do
     IO.puts("  Writer + Index:   #{fmt_number(round(idx_eps))} spans/sec")
     IO.puts("  Full pipeline:    #{fmt_number(round(pipe_eps))} spans/sec")
 
-    Application.stop(:span_stream)
+    Application.stop(:timeless_traces)
     File.rm_rf!(data_dir)
   end
 

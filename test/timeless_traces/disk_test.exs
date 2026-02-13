@@ -1,23 +1,23 @@
-defmodule SpanStream.DiskTest do
+defmodule TimelessTraces.DiskTest do
   use ExUnit.Case, async: false
 
   @data_dir "test/tmp/disk_#{System.unique_integer([:positive])}"
 
   setup do
-    Application.stop(:span_stream)
+    Application.stop(:timeless_traces)
     File.rm_rf!(@data_dir)
-    Application.put_env(:span_stream, :storage, :disk)
-    Application.put_env(:span_stream, :data_dir, @data_dir)
-    Application.put_env(:span_stream, :flush_interval, 60_000)
-    Application.put_env(:span_stream, :max_buffer_size, 10_000)
-    Application.put_env(:span_stream, :retention_max_age, nil)
-    Application.put_env(:span_stream, :retention_max_size, nil)
-    Application.ensure_all_started(:span_stream)
+    Application.put_env(:timeless_traces, :storage, :disk)
+    Application.put_env(:timeless_traces, :data_dir, @data_dir)
+    Application.put_env(:timeless_traces, :flush_interval, 60_000)
+    Application.put_env(:timeless_traces, :max_buffer_size, 10_000)
+    Application.put_env(:timeless_traces, :retention_max_age, nil)
+    Application.put_env(:timeless_traces, :retention_max_size, nil)
+    Application.ensure_all_started(:timeless_traces)
 
     on_exit(fn ->
-      Application.stop(:span_stream)
+      Application.stop(:timeless_traces)
       File.rm_rf!(@data_dir)
-      Application.put_env(:span_stream, :storage, :disk)
+      Application.put_env(:timeless_traces, :storage, :disk)
     end)
 
     :ok
@@ -61,24 +61,24 @@ defmodule SpanStream.DiskTest do
         make_span(%{name: "GET /health"})
       ]
 
-      SpanStream.Buffer.ingest(spans)
-      SpanStream.flush()
+      TimelessTraces.Buffer.ingest(spans)
+      TimelessTraces.flush()
 
-      {:ok, %SpanStream.Result{entries: all, total: 3}} = SpanStream.query([])
+      {:ok, %TimelessTraces.Result{entries: all, total: 3}} = TimelessTraces.query([])
       assert length(all) == 3
-      assert Enum.all?(all, &match?(%SpanStream.Span{}, &1))
+      assert Enum.all?(all, &match?(%TimelessTraces.Span{}, &1))
     end
 
     test "writes raw block files to disk" do
-      SpanStream.Buffer.ingest([make_span()])
-      SpanStream.flush()
+      TimelessTraces.Buffer.ingest([make_span()])
+      TimelessTraces.flush()
 
       blocks_dir = Path.join(@data_dir, "blocks")
       raw_files = Path.wildcard(Path.join(blocks_dir, "*.raw"))
       assert length(raw_files) == 1
 
       data = File.read!(hd(raw_files))
-      assert {:ok, entries} = SpanStream.Writer.decompress_block(data, :raw)
+      assert {:ok, entries} = TimelessTraces.Writer.decompress_block(data, :raw)
       assert length(entries) == 1
     end
 
@@ -90,18 +90,18 @@ defmodule SpanStream.DiskTest do
         make_span(%{trace_id: trace_id, span_id: "child", parent_span_id: "root", name: "child"})
       ]
 
-      SpanStream.Buffer.ingest(spans)
-      SpanStream.flush()
+      TimelessTraces.Buffer.ingest(spans)
+      TimelessTraces.flush()
 
-      {:ok, trace_spans} = SpanStream.trace(trace_id)
+      {:ok, trace_spans} = TimelessTraces.trace(trace_id)
       assert length(trace_spans) == 2
     end
 
     test "stats reflect disk usage" do
-      SpanStream.Buffer.ingest([make_span()])
-      SpanStream.flush()
+      TimelessTraces.Buffer.ingest([make_span()])
+      TimelessTraces.flush()
 
-      {:ok, stats} = SpanStream.stats()
+      {:ok, stats} = TimelessTraces.stats()
       assert stats.total_blocks == 1
       assert stats.total_entries == 1
       assert stats.index_size > 0
@@ -109,16 +109,16 @@ defmodule SpanStream.DiskTest do
     end
 
     test "multiple flushes create multiple block files" do
-      SpanStream.Buffer.ingest([make_span()])
-      SpanStream.flush()
-      SpanStream.Buffer.ingest([make_span()])
-      SpanStream.flush()
+      TimelessTraces.Buffer.ingest([make_span()])
+      TimelessTraces.flush()
+      TimelessTraces.Buffer.ingest([make_span()])
+      TimelessTraces.flush()
 
       blocks_dir = Path.join(@data_dir, "blocks")
       raw_files = Path.wildcard(Path.join(blocks_dir, "*.raw"))
       assert length(raw_files) == 2
 
-      {:ok, %SpanStream.Result{total: 2}} = SpanStream.query([])
+      {:ok, %TimelessTraces.Result{total: 2}} = TimelessTraces.query([])
     end
 
     test "filtering works on disk" do
@@ -127,10 +127,10 @@ defmodule SpanStream.DiskTest do
         make_span(%{status: :error})
       ]
 
-      SpanStream.Buffer.ingest(spans)
-      SpanStream.flush()
+      TimelessTraces.Buffer.ingest(spans)
+      TimelessTraces.flush()
 
-      {:ok, %SpanStream.Result{entries: errors}} = SpanStream.query(status: :error)
+      {:ok, %TimelessTraces.Result{entries: errors}} = TimelessTraces.query(status: :error)
       assert length(errors) == 1
       assert hd(errors).status == :error
     end

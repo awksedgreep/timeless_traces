@@ -1,7 +1,7 @@
-defmodule SpanStream.SpanTest do
+defmodule TimelessTraces.SpanTest do
   use ExUnit.Case, async: true
 
-  alias SpanStream.Span
+  alias TimelessTraces.Span
 
   describe "from_map/1" do
     test "creates span from atom-keyed map" do

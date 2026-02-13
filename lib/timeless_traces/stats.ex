@@ -1,4 +1,4 @@
-defmodule SpanStream.Stats do
+defmodule TimelessTraces.Stats do
   @moduledoc """
   Aggregate statistics about stored span data.
   """

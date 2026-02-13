@@ -1,16 +1,16 @@
-defmodule SpanStream.MixProject do
+defmodule TimelessTraces.MixProject do
   use Mix.Project
 
   def project do
     [
-      app: :span_stream,
+      app: :timeless_traces,
       version: "0.2.0",
       elixir: "~> 1.18",
       start_permanent: Mix.env() == :prod,
       deps: deps(),
       description: "Embedded OpenTelemetry span storage and compression for Elixir applications.",
-      source_url: "https://github.com/awksedgreep/span_stream",
-      homepage_url: "https://github.com/awksedgreep/span_stream",
+      source_url: "https://github.com/awksedgreep/timeless_traces",
+      homepage_url: "https://github.com/awksedgreep/timeless_traces",
       package: package(),
       docs: docs()
     ]
@@ -19,7 +19,7 @@ defmodule SpanStream.MixProject do
   def application do
     [
       extra_applications: [:logger],
-      mod: {SpanStream.Application, []}
+      mod: {TimelessTraces.Application, []}
     ]
   end
 
@@ -40,7 +40,7 @@ defmodule SpanStream.MixProject do
     [
       maintainers: ["Matt Cotner"],
       licenses: ["MIT"],
-      links: %{"GitHub" => "https://github.com/awksedgreep/span_stream"},
+      links: %{"GitHub" => "https://github.com/awksedgreep/timeless_traces"},
       files: ~w(lib .formatter.exs mix.exs README.md LICENSE)
     ]
   end

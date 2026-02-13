@@ -1,4 +1,4 @@
-defmodule SpanStream.Buffer do
+defmodule TimelessTraces.Buffer do
   @moduledoc false
 
   use GenServer
@@ -15,13 +15,13 @@ defmodule SpanStream.Buffer do
 
   @spec flush() :: :ok
   def flush do
-    GenServer.call(__MODULE__, :flush, SpanStream.Config.query_timeout())
+    GenServer.call(__MODULE__, :flush, TimelessTraces.Config.query_timeout())
   end
 
   @impl true
   def init(opts) do
     data_dir = Keyword.fetch!(opts, :data_dir)
-    interval = SpanStream.Config.flush_interval()
+    interval = TimelessTraces.Config.flush_interval()
     schedule_flush(interval)
 
     {:ok, %{buffer: [], buffer_size: 0, data_dir: data_dir, flush_interval: interval}}
@@ -33,7 +33,7 @@ defmodule SpanStream.Buffer do
     buffer = Enum.reverse(spans) ++ state.buffer
     size = state.buffer_size + length(spans)
 
-    if size >= SpanStream.Config.max_buffer_size() do
+    if size >= TimelessTraces.Config.max_buffer_size() do
       do_flush(buffer, state.data_dir)
       {:noreply, %{state | buffer: [], buffer_size: 0}}
     else
@@ -64,20 +64,20 @@ defmodule SpanStream.Buffer do
     entries = Enum.reverse(buffer)
     start_time = System.monotonic_time()
 
-    write_target = if SpanStream.Config.storage() == :memory, do: :memory, else: data_dir
+    write_target = if TimelessTraces.Config.storage() == :memory, do: :memory, else: data_dir
 
-    case SpanStream.Writer.write_block(entries, write_target, :raw) do
+    case TimelessTraces.Writer.write_block(entries, write_target, :raw) do
       {:ok, block_meta} ->
         if Keyword.get(opts, :sync, false) do
-          SpanStream.Index.index_block(block_meta, entries)
+          TimelessTraces.Index.index_block(block_meta, entries)
         else
-          SpanStream.Index.index_block_async(block_meta, entries)
+          TimelessTraces.Index.index_block_async(block_meta, entries)
         end
 
         duration = System.monotonic_time() - start_time
 
-        SpanStream.Telemetry.event(
-          [:span_stream, :flush, :stop],
+        TimelessTraces.Telemetry.event(
+          [:timeless_traces, :flush, :stop],
           %{
             duration: duration,
             entry_count: block_meta.entry_count,
@@ -87,7 +87,7 @@ defmodule SpanStream.Buffer do
         )
 
       {:error, reason} ->
-        IO.warn("SpanStream: failed to write block: #{inspect(reason)}")
+        IO.warn("TimelessTraces: failed to write block: #{inspect(reason)}")
     end
   end
 
@@ -96,18 +96,18 @@ defmodule SpanStream.Buffer do
   end
 
   defp broadcast_to_subscribers(spans) do
-    case Registry.count_match(SpanStream.Registry, :spans, :_) do
+    case Registry.count_match(TimelessTraces.Registry, :spans, :_) do
       0 ->
         :ok
 
       _n ->
         for span <- spans do
-          span_struct = SpanStream.Span.from_map(span)
+          span_struct = TimelessTraces.Span.from_map(span)
 
-          Registry.dispatch(SpanStream.Registry, :spans, fn subscribers ->
+          Registry.dispatch(TimelessTraces.Registry, :spans, fn subscribers ->
             for {pid, opts} <- subscribers do
               if matches_subscription?(span, opts) do
-                send(pid, {:span_stream, :span, span_struct})
+                send(pid, {:timeless_traces, :span, span_struct})
               end
             end
           end)
