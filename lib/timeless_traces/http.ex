@@ -38,9 +38,9 @@ defmodule TimelessTraces.HTTP do
 
   @max_body_bytes 10 * 1024 * 1024
 
-  plug :match
-  plug :authenticate
-  plug :dispatch
+  plug(:match)
+  plug(:authenticate)
+  plug(:dispatch)
 
   def child_spec(opts) do
     port = Keyword.get(opts, :port, 10428)
@@ -95,7 +95,9 @@ defmodule TimelessTraces.HTTP do
 
   defp extract_token(conn) do
     case Plug.Conn.get_req_header(conn, "authorization") do
-      ["Bearer " <> token] -> String.trim(token)
+      ["Bearer " <> token] ->
+        String.trim(token)
+
       _ ->
         conn = Plug.Conn.fetch_query_params(conn)
         conn.query_params["token"]
@@ -210,13 +212,17 @@ defmodule TimelessTraces.HTTP do
   post "/api/v1/backup" do
     parsed_path =
       case Plug.Conn.read_body(conn, length: 64_000) do
-        {:ok, "", _} -> nil
+        {:ok, "", _} ->
+          nil
+
         {:ok, body, _} ->
           case Jason.decode(body) do
             {:ok, %{"path" => path}} when is_binary(path) and path != "" -> path
             _ -> nil
           end
-        _ -> nil
+
+        _ ->
+          nil
       end
 
     target_dir = parsed_path || default_backup_dir()
@@ -225,12 +231,15 @@ defmodule TimelessTraces.HTTP do
       {:ok, result} ->
         conn
         |> put_resp_content_type("application/json")
-        |> send_resp(200, Jason.encode!(%{
-          status: "ok",
-          path: result.path,
-          files: result.files,
-          total_bytes: result.total_bytes
-        }))
+        |> send_resp(
+          200,
+          Jason.encode!(%{
+            status: "ok",
+            path: result.path,
+            files: result.files,
+            total_bytes: result.total_bytes
+          })
+        )
 
       {:error, reason} ->
         json_error(conn, 500, inspect(reason))
@@ -294,6 +303,7 @@ defmodule TimelessTraces.HTTP do
 
   defp parse_otlp_time(nil), do: 0
   defp parse_otlp_time(val) when is_integer(val), do: val
+
   defp parse_otlp_time(val) when is_binary(val) do
     case Integer.parse(val) do
       {n, _} -> n
@@ -348,6 +358,7 @@ defmodule TimelessTraces.HTTP do
   defp parse_otlp_events(_), do: []
 
   defp parse_otlp_scope(nil), do: nil
+
   defp parse_otlp_scope(scope) do
     %{
       name: scope["name"] || "",
@@ -378,7 +389,9 @@ defmodule TimelessTraces.HTTP do
 
     filters =
       case params["start"] do
-        nil -> filters
+        nil ->
+          filters
+
         start ->
           # Jaeger sends microseconds
           case Integer.parse(start) do
@@ -389,7 +402,9 @@ defmodule TimelessTraces.HTTP do
 
     filters =
       case params["end"] do
-        nil -> filters
+        nil ->
+          filters
+
         end_time ->
           case Integer.parse(end_time) do
             {n, _} -> [{:until, n * 1000} | filters]
@@ -399,7 +414,9 @@ defmodule TimelessTraces.HTTP do
 
     filters =
       case params["limit"] do
-        nil -> filters
+        nil ->
+          filters
+
         limit ->
           case Integer.parse(limit) do
             {n, _} -> [{:limit, n} | filters]
@@ -458,8 +475,10 @@ defmodule TimelessTraces.HTTP do
     processes =
       spans
       |> Enum.map(fn span ->
-        service = Map.get(span.attributes, "service.name") ||
-                  Map.get(span.resource || %{}, "service.name") || "unknown"
+        service =
+          Map.get(span.attributes, "service.name") ||
+            Map.get(span.resource || %{}, "service.name") || "unknown"
+
         {span.span_id, service}
       end)
       |> Enum.uniq_by(fn {_, svc} -> svc end)
@@ -477,8 +496,10 @@ defmodule TimelessTraces.HTTP do
 
     jaeger_spans =
       Enum.map(spans, fn span ->
-        service = Map.get(span.attributes, "service.name") ||
-                  Map.get(span.resource || %{}, "service.name") || "unknown"
+        service =
+          Map.get(span.attributes, "service.name") ||
+            Map.get(span.resource || %{}, "service.name") || "unknown"
+
         process_id = Map.get(processes, service, "p1")
 
         references =
@@ -549,13 +570,17 @@ defmodule TimelessTraces.HTTP do
   end
 
   defp span_events_to_jaeger_logs(nil), do: []
+
   defp span_events_to_jaeger_logs(events) when is_list(events) do
     Enum.map(events, fn event ->
       fields =
         case event do
           %{attributes: attrs} when is_map(attrs) ->
-            [%{key: "event", type: "string", value: event[:name] || ""} |
-             Enum.map(attrs, fn {k, v} -> attribute_to_jaeger_tag(k, v) end)]
+            [
+              %{key: "event", type: "string", value: event[:name] || ""}
+              | Enum.map(attrs, fn {k, v} -> attribute_to_jaeger_tag(k, v) end)
+            ]
+
           _ ->
             [%{key: "event", type: "string", value: event[:name] || ""}]
         end

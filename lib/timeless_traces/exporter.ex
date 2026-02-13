@@ -76,7 +76,10 @@ defmodule TimelessTraces.Exporter do
 
   defp normalize_parent_span_id(:undefined), do: nil
   defp normalize_parent_span_id(0), do: nil
-  defp normalize_parent_span_id(id) when is_integer(id), do: TimelessTraces.Span.encode_span_id(id)
+
+  defp normalize_parent_span_id(id) when is_integer(id),
+    do: TimelessTraces.Span.encode_span_id(id)
+
   defp normalize_parent_span_id(id), do: id
 
   defp extract_status({:status, code, message}) do

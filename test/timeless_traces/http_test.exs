@@ -77,53 +77,54 @@ defmodule TimelessTraces.HTTPTest do
 
   describe "POST /insert/opentelemetry/v1/traces" do
     test "ingests OTLP JSON with resourceSpans" do
-      otlp_body = Jason.encode!(%{
-        resourceSpans: [
-          %{
-            resource: %{
-              attributes: [
-                %{key: "service.name", value: %{stringValue: "test-svc"}}
-              ]
-            },
-            scopeSpans: [
-              %{
-                scope: %{name: "my-lib", version: "1.0"},
-                spans: [
-                  %{
-                    traceId: "aaaabbbbccccdddd1111222233334444",
-                    spanId: "1111222233334444",
-                    parentSpanId: "",
-                    name: "GET /users",
-                    kind: 2,
-                    startTimeUnixNano: "1700000000000000000",
-                    endTimeUnixNano: "1700000050000000",
-                    status: %{code: 1},
-                    attributes: [
-                      %{key: "http.method", value: %{stringValue: "GET"}},
-                      %{key: "http.status_code", value: %{intValue: 200}}
-                    ],
-                    events: []
-                  },
-                  %{
-                    traceId: "aaaabbbbccccdddd1111222233334444",
-                    spanId: "5555666677778888",
-                    parentSpanId: "1111222233334444",
-                    name: "DB query",
-                    kind: 3,
-                    startTimeUnixNano: "1700000010000000000",
-                    endTimeUnixNano: "1700000040000000000",
-                    status: %{code: 0},
-                    attributes: [
-                      %{key: "db.system", value: %{stringValue: "postgresql"}}
-                    ],
-                    events: []
-                  }
+      otlp_body =
+        Jason.encode!(%{
+          resourceSpans: [
+            %{
+              resource: %{
+                attributes: [
+                  %{key: "service.name", value: %{stringValue: "test-svc"}}
                 ]
-              }
-            ]
-          }
-        ]
-      })
+              },
+              scopeSpans: [
+                %{
+                  scope: %{name: "my-lib", version: "1.0"},
+                  spans: [
+                    %{
+                      traceId: "aaaabbbbccccdddd1111222233334444",
+                      spanId: "1111222233334444",
+                      parentSpanId: "",
+                      name: "GET /users",
+                      kind: 2,
+                      startTimeUnixNano: "1700000000000000000",
+                      endTimeUnixNano: "1700000050000000",
+                      status: %{code: 1},
+                      attributes: [
+                        %{key: "http.method", value: %{stringValue: "GET"}},
+                        %{key: "http.status_code", value: %{intValue: 200}}
+                      ],
+                      events: []
+                    },
+                    %{
+                      traceId: "aaaabbbbccccdddd1111222233334444",
+                      spanId: "5555666677778888",
+                      parentSpanId: "1111222233334444",
+                      name: "DB query",
+                      kind: 3,
+                      startTimeUnixNano: "1700000010000000000",
+                      endTimeUnixNano: "1700000040000000000",
+                      status: %{code: 0},
+                      attributes: [
+                        %{key: "db.system", value: %{stringValue: "postgresql"}}
+                      ],
+                      events: []
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        })
 
       conn =
         conn(:post, "/insert/opentelemetry/v1/traces", otlp_body)
@@ -142,26 +143,39 @@ defmodule TimelessTraces.HTTPTest do
     end
 
     test "parses OTLP kind integers correctly" do
-      for {kind_int, expected_kind} <- [{1, :internal}, {2, :server}, {3, :client}, {4, :producer}, {5, :consumer}] do
+      for {kind_int, expected_kind} <- [
+            {1, :internal},
+            {2, :server},
+            {3, :client},
+            {4, :producer},
+            {5, :consumer}
+          ] do
         Application.stop(:timeless_traces)
         Application.ensure_all_started(:timeless_traces)
 
-        otlp_body = Jason.encode!(%{
-          resourceSpans: [%{
-            resource: %{attributes: []},
-            scopeSpans: [%{
-              spans: [%{
-                traceId: "trace#{kind_int}00000000000000000000",
-                spanId: "span#{kind_int}0000000000",
-                name: "kind-test",
-                kind: kind_int,
-                startTimeUnixNano: 1_700_000_000_000_000_000,
-                endTimeUnixNano: 1_700_000_001_000_000_000,
-                attributes: []
-              }]
-            }]
-          }]
-        })
+        otlp_body =
+          Jason.encode!(%{
+            resourceSpans: [
+              %{
+                resource: %{attributes: []},
+                scopeSpans: [
+                  %{
+                    spans: [
+                      %{
+                        traceId: "trace#{kind_int}00000000000000000000",
+                        spanId: "span#{kind_int}0000000000",
+                        name: "kind-test",
+                        kind: kind_int,
+                        startTimeUnixNano: 1_700_000_000_000_000_000,
+                        endTimeUnixNano: 1_700_000_001_000_000_000,
+                        attributes: []
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          })
 
         conn(:post, "/insert/opentelemetry/v1/traces", otlp_body)
         |> put_req_header("content-type", "application/json")
@@ -170,7 +184,9 @@ defmodule TimelessTraces.HTTPTest do
         TimelessTraces.flush()
 
         {:ok, %{entries: [span]}} = TimelessTraces.query([])
-        assert span.kind == expected_kind, "Expected kind #{expected_kind} for OTLP kind #{kind_int}, got #{span.kind}"
+
+        assert span.kind == expected_kind,
+               "Expected kind #{expected_kind} for OTLP kind #{kind_int}, got #{span.kind}"
       end
     end
 
@@ -179,23 +195,30 @@ defmodule TimelessTraces.HTTPTest do
         Application.stop(:timeless_traces)
         Application.ensure_all_started(:timeless_traces)
 
-        otlp_body = Jason.encode!(%{
-          resourceSpans: [%{
-            resource: %{attributes: []},
-            scopeSpans: [%{
-              spans: [%{
-                traceId: "status#{code}000000000000000000000",
-                spanId: "statspan#{code}00000000",
-                name: "status-test",
-                kind: 1,
-                startTimeUnixNano: 1_700_000_000_000_000_000,
-                endTimeUnixNano: 1_700_000_001_000_000_000,
-                status: %{code: code},
-                attributes: []
-              }]
-            }]
-          }]
-        })
+        otlp_body =
+          Jason.encode!(%{
+            resourceSpans: [
+              %{
+                resource: %{attributes: []},
+                scopeSpans: [
+                  %{
+                    spans: [
+                      %{
+                        traceId: "status#{code}000000000000000000000",
+                        spanId: "statspan#{code}00000000",
+                        name: "status-test",
+                        kind: 1,
+                        startTimeUnixNano: 1_700_000_000_000_000_000,
+                        endTimeUnixNano: 1_700_000_001_000_000_000,
+                        status: %{code: code},
+                        attributes: []
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          })
 
         conn(:post, "/insert/opentelemetry/v1/traces", otlp_body)
         |> put_req_header("content-type", "application/json")
@@ -204,32 +227,41 @@ defmodule TimelessTraces.HTTPTest do
         TimelessTraces.flush()
 
         {:ok, %{entries: [span]}} = TimelessTraces.query([])
-        assert span.status == expected, "Expected status #{expected} for OTLP code #{code}, got #{span.status}"
+
+        assert span.status == expected,
+               "Expected status #{expected} for OTLP code #{code}, got #{span.status}"
       end
     end
 
     test "parses OTLP attributes with different value types" do
-      otlp_body = Jason.encode!(%{
-        resourceSpans: [%{
-          resource: %{attributes: []},
-          scopeSpans: [%{
-            spans: [%{
-              traceId: "attrtest00000000000000000000000",
-              spanId: "attrspan00000000",
-              name: "attr-test",
-              kind: 1,
-              startTimeUnixNano: 1_700_000_000_000_000_000,
-              endTimeUnixNano: 1_700_000_001_000_000_000,
-              attributes: [
-                %{key: "str_attr", value: %{stringValue: "hello"}},
-                %{key: "int_attr", value: %{intValue: 42}},
-                %{key: "float_attr", value: %{doubleValue: 3.14}},
-                %{key: "bool_attr", value: %{boolValue: true}}
+      otlp_body =
+        Jason.encode!(%{
+          resourceSpans: [
+            %{
+              resource: %{attributes: []},
+              scopeSpans: [
+                %{
+                  spans: [
+                    %{
+                      traceId: "attrtest00000000000000000000000",
+                      spanId: "attrspan00000000",
+                      name: "attr-test",
+                      kind: 1,
+                      startTimeUnixNano: 1_700_000_000_000_000_000,
+                      endTimeUnixNano: 1_700_000_001_000_000_000,
+                      attributes: [
+                        %{key: "str_attr", value: %{stringValue: "hello"}},
+                        %{key: "int_attr", value: %{intValue: 42}},
+                        %{key: "float_attr", value: %{doubleValue: 3.14}},
+                        %{key: "bool_attr", value: %{boolValue: true}}
+                      ]
+                    }
+                  ]
+                }
               ]
-            }]
-          }]
-        }]
-      })
+            }
+          ]
+        })
 
       conn(:post, "/insert/opentelemetry/v1/traces", otlp_body)
       |> put_req_header("content-type", "application/json")
@@ -277,9 +309,18 @@ defmodule TimelessTraces.HTTPTest do
 
     test "returns distinct service names" do
       spans = [
-        make_span(%{attributes: %{"service.name" => "alpha"}, resource: %{"service.name" => "alpha"}}),
-        make_span(%{attributes: %{"service.name" => "beta"}, resource: %{"service.name" => "beta"}}),
-        make_span(%{attributes: %{"service.name" => "alpha"}, resource: %{"service.name" => "alpha"}})
+        make_span(%{
+          attributes: %{"service.name" => "alpha"},
+          resource: %{"service.name" => "alpha"}
+        }),
+        make_span(%{
+          attributes: %{"service.name" => "beta"},
+          resource: %{"service.name" => "beta"}
+        }),
+        make_span(%{
+          attributes: %{"service.name" => "alpha"},
+          resource: %{"service.name" => "alpha"}
+        })
       ]
 
       ingest_and_flush(spans)
@@ -299,14 +340,26 @@ defmodule TimelessTraces.HTTPTest do
       # Flush separately so spans end up in different blocks
       # (operations query uses block-level term co-occurrence)
       api_spans = [
-        make_span(%{name: "GET /users", attributes: %{"service.name" => "api"}, resource: %{"service.name" => "api"}}),
-        make_span(%{name: "POST /users", attributes: %{"service.name" => "api"}, resource: %{"service.name" => "api"}})
+        make_span(%{
+          name: "GET /users",
+          attributes: %{"service.name" => "api"},
+          resource: %{"service.name" => "api"}
+        }),
+        make_span(%{
+          name: "POST /users",
+          attributes: %{"service.name" => "api"},
+          resource: %{"service.name" => "api"}
+        })
       ]
 
       ingest_and_flush(api_spans)
 
       monitor_spans = [
-        make_span(%{name: "GET /health", attributes: %{"service.name" => "monitor"}, resource: %{"service.name" => "monitor"}})
+        make_span(%{
+          name: "GET /health",
+          attributes: %{"service.name" => "monitor"},
+          resource: %{"service.name" => "monitor"}
+        })
       ]
 
       ingest_and_flush(monitor_spans)

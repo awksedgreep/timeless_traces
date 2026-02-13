@@ -67,12 +67,20 @@ defmodule TimelessTraces.Index do
 
   @spec matching_block_ids(keyword()) :: [{integer(), String.t() | nil, :raw | :zstd}]
   def matching_block_ids(filters) do
-    GenServer.call(__MODULE__, {:matching_block_ids, filters}, TimelessTraces.Config.query_timeout())
+    GenServer.call(
+      __MODULE__,
+      {:matching_block_ids, filters},
+      TimelessTraces.Config.query_timeout()
+    )
   end
 
   @spec read_block_data(integer()) :: {:ok, [map()]} | {:error, term()}
   def read_block_data(block_id) do
-    GenServer.call(__MODULE__, {:read_block_data, block_id}, TimelessTraces.Config.query_timeout())
+    GenServer.call(
+      __MODULE__,
+      {:read_block_data, block_id},
+      TimelessTraces.Config.query_timeout()
+    )
   end
 
   @spec raw_block_stats() :: %{
@@ -106,7 +114,11 @@ defmodule TimelessTraces.Index do
 
   @spec distinct_operations(String.t()) :: {:ok, [String.t()]}
   def distinct_operations(service) do
-    GenServer.call(__MODULE__, {:distinct_operations, service}, TimelessTraces.Config.query_timeout())
+    GenServer.call(
+      __MODULE__,
+      {:distinct_operations, service},
+      TimelessTraces.Config.query_timeout()
+    )
   end
 
   # --- GenServer callbacks ---
