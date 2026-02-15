@@ -64,6 +64,6 @@ defmodule TimelessTraces.Config do
 
   @spec compression_level() :: 1..22
   def compression_level do
-    Application.get_env(:timeless_traces, :compression_level, 9)
+    Application.get_env(:timeless_traces, :compression_level, 6)
   end
 end

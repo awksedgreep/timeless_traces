@@ -22,12 +22,14 @@ defmodule TimelessTraces.Index do
 
   @spec index_block(TimelessTraces.Writer.block_meta(), [map()]) :: :ok
   def index_block(block_meta, entries) do
-    GenServer.call(__MODULE__, {:index_block, block_meta, entries})
+    {terms, trace_rows} = precompute(entries)
+    GenServer.call(__MODULE__, {:index_block, block_meta, terms, trace_rows})
   end
 
   @spec index_block_async(TimelessTraces.Writer.block_meta(), [map()]) :: :ok
   def index_block_async(block_meta, entries) do
-    GenServer.cast(__MODULE__, {:index_block, block_meta, entries})
+    {terms, trace_rows} = precompute(entries)
+    GenServer.cast(__MODULE__, {:index_block, block_meta, terms, trace_rows})
   end
 
   @spec query(keyword()) :: {:ok, TimelessTraces.Result.t()}
@@ -99,7 +101,13 @@ defmodule TimelessTraces.Index do
 
   @spec compact_blocks([integer()], TimelessTraces.Writer.block_meta(), [map()]) :: :ok
   def compact_blocks(old_block_ids, new_meta, new_entries) do
-    GenServer.call(__MODULE__, {:compact_blocks, old_block_ids, new_meta, new_entries}, 60_000)
+    {terms, trace_rows} = precompute(new_entries)
+
+    GenServer.call(
+      __MODULE__,
+      {:compact_blocks, old_block_ids, new_meta, terms, trace_rows},
+      60_000
+    )
   end
 
   @spec backup(String.t()) :: :ok | {:error, term()}
@@ -119,6 +127,14 @@ defmodule TimelessTraces.Index do
       {:distinct_operations, service},
       TimelessTraces.Config.query_timeout()
     )
+  end
+
+  @doc false
+  @spec precompute([map()]) :: {[String.t()], [tuple()]}
+  def precompute(entries) do
+    terms = extract_terms(entries)
+    trace_rows = compute_trace_rows(entries)
+    {terms, trace_rows}
   end
 
   # --- GenServer callbacks ---
@@ -142,21 +158,44 @@ defmodule TimelessTraces.Index do
 
     create_tables(db)
 
-    {:ok, %{db: db, db_path: db_path, storage: storage, pending: [], flush_timer: nil}}
+    # Cache prepared statements for hot-path inserts
+    {:ok, block_insert_stmt} =
+      Exqlite.Sqlite3.prepare(db, """
+      INSERT INTO blocks (block_id, file_path, byte_size, entry_count, ts_min, ts_max, data, format)
+      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+      """)
+
+    {:ok, terms_insert_stmt} = Exqlite.Sqlite3.prepare(db, build_terms_sql(@terms_batch_size))
+    {:ok, trace_insert_stmt} = Exqlite.Sqlite3.prepare(db, build_trace_sql(@trace_batch_size))
+
+    {:ok,
+     %{
+       db: db,
+       db_path: db_path,
+       storage: storage,
+       pending: [],
+       flush_timer: nil,
+       block_insert_stmt: block_insert_stmt,
+       terms_insert_stmt: terms_insert_stmt,
+       trace_insert_stmt: trace_insert_stmt
+     }}
   end
 
   @impl true
   def terminate(_reason, state) do
     flush_pending(state)
+    Exqlite.Sqlite3.release(state.db, state.block_insert_stmt)
+    Exqlite.Sqlite3.release(state.db, state.terms_insert_stmt)
+    Exqlite.Sqlite3.release(state.db, state.trace_insert_stmt)
     Exqlite.Sqlite3.close(state.db)
   end
 
   # --- handle_call (grouped) ---
 
   @impl true
-  def handle_call({:index_block, meta, entries}, _from, state) do
+  def handle_call({:index_block, meta, terms, trace_rows}, _from, state) do
     state = flush_pending(state)
-    result = do_index_block(state.db, meta, entries)
+    result = do_index_block(state, meta, terms, trace_rows)
     {:reply, result, state}
   end
 
@@ -220,9 +259,9 @@ defmodule TimelessTraces.Index do
     {:reply, result, state}
   end
 
-  def handle_call({:compact_blocks, old_ids, new_meta, new_entries}, _from, state) do
+  def handle_call({:compact_blocks, old_ids, new_meta, terms, trace_rows}, _from, state) do
     state = flush_pending(state)
-    result = do_compact_blocks(state.db, old_ids, new_meta, new_entries, state.storage)
+    result = do_compact_blocks(state, old_ids, new_meta, terms, trace_rows)
     {:reply, result, state}
   end
 
@@ -254,8 +293,8 @@ defmodule TimelessTraces.Index do
   # --- handle_cast ---
 
   @impl true
-  def handle_cast({:index_block, meta, entries}, state) do
-    pending = [{meta, entries} | state.pending]
+  def handle_cast({:index_block, meta, terms, trace_rows}, state) do
+    pending = [{meta, terms, trace_rows} | state.pending]
     state = schedule_index_flush(%{state | pending: pending})
     {:noreply, state}
   end
@@ -273,14 +312,14 @@ defmodule TimelessTraces.Index do
 
   defp flush_pending(%{pending: []} = state), do: state
 
-  defp flush_pending(%{pending: pending, db: db} = state) do
-    Exqlite.Sqlite3.execute(db, "BEGIN")
+  defp flush_pending(%{pending: pending} = state) do
+    Exqlite.Sqlite3.execute(state.db, "BEGIN")
 
-    for {meta, entries} <- Enum.reverse(pending) do
-      index_block_inner(db, meta, entries)
+    for {meta, terms, trace_rows} <- Enum.reverse(pending) do
+      insert_block_data(state, meta, terms, trace_rows)
     end
 
-    Exqlite.Sqlite3.execute(db, "COMMIT")
+    Exqlite.Sqlite3.execute(state.db, "COMMIT")
 
     if state.flush_timer do
       Process.cancel_timer(state.flush_timer)
@@ -301,6 +340,9 @@ defmodule TimelessTraces.Index do
   defp create_tables(db) do
     Exqlite.Sqlite3.execute(db, "PRAGMA journal_mode=WAL")
     Exqlite.Sqlite3.execute(db, "PRAGMA synchronous=NORMAL")
+    Exqlite.Sqlite3.execute(db, "PRAGMA cache_size = -16000")
+    Exqlite.Sqlite3.execute(db, "PRAGMA mmap_size = 134217728")
+    Exqlite.Sqlite3.execute(db, "PRAGMA temp_store = memory")
 
     Exqlite.Sqlite3.execute(db, """
     CREATE TABLE IF NOT EXISTS blocks (
@@ -347,25 +389,20 @@ defmodule TimelessTraces.Index do
 
   # --- Indexing ---
 
-  defp do_index_block(db, meta, entries) do
-    Exqlite.Sqlite3.execute(db, "BEGIN")
-    index_block_inner(db, meta, entries)
-    Exqlite.Sqlite3.execute(db, "COMMIT")
+  defp do_index_block(state, meta, terms, trace_rows) do
+    Exqlite.Sqlite3.execute(state.db, "BEGIN")
+    insert_block_data(state, meta, terms, trace_rows)
+    Exqlite.Sqlite3.execute(state.db, "COMMIT")
     :ok
   end
 
-  # Index a single block's metadata + terms + traces (caller manages transaction)
-  defp index_block_inner(db, meta, entries) do
+  # Insert pre-computed block data (caller manages transaction)
+  defp insert_block_data(state, meta, terms, trace_rows) do
     format = Map.get(meta, :format, :zstd)
     format_str = Atom.to_string(format)
+    db = state.db
 
-    {:ok, block_stmt} =
-      Exqlite.Sqlite3.prepare(db, """
-      INSERT INTO blocks (block_id, file_path, byte_size, entry_count, ts_min, ts_max, data, format)
-      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
-      """)
-
-    Exqlite.Sqlite3.bind(block_stmt, [
+    Exqlite.Sqlite3.bind(state.block_insert_stmt, [
       meta.block_id,
       meta[:file_path],
       meta.byte_size,
@@ -376,85 +413,64 @@ defmodule TimelessTraces.Index do
       format_str
     ])
 
-    Exqlite.Sqlite3.step(db, block_stmt)
-    Exqlite.Sqlite3.release(db, block_stmt)
+    Exqlite.Sqlite3.step(db, state.block_insert_stmt)
+    Exqlite.Sqlite3.reset(state.block_insert_stmt)
 
-    # Index terms (batched multi-value INSERT)
-    terms = extract_terms(entries)
-    insert_terms_batch(db, terms, meta.block_id)
-
-    # Index trace data (batched multi-value INSERT)
-    index_trace_data_batch(db, meta.block_id, entries)
+    insert_terms_batch(state, terms, meta.block_id)
+    insert_trace_batch(state, meta.block_id, trace_rows)
   end
 
-  defp insert_terms_batch(_db, [], _block_id), do: :ok
+  defp insert_terms_batch(_state, [], _block_id), do: :ok
 
-  defp insert_terms_batch(db, terms, block_id) do
+  defp insert_terms_batch(state, terms, block_id) do
+    db = state.db
+
     terms
     |> Enum.chunk_every(@terms_batch_size)
     |> Enum.each(fn batch ->
       n = length(batch)
-
-      placeholders =
-        Enum.map_join(1..n, ", ", fn i ->
-          "(?#{i * 2 - 1}, ?#{i * 2})"
-        end)
-
-      sql = "INSERT OR IGNORE INTO block_terms (term, block_id) VALUES #{placeholders}"
-      {:ok, stmt} = Exqlite.Sqlite3.prepare(db, sql)
       params = Enum.flat_map(batch, fn term -> [term, block_id] end)
-      Exqlite.Sqlite3.bind(stmt, params)
-      Exqlite.Sqlite3.step(db, stmt)
-      Exqlite.Sqlite3.release(db, stmt)
+
+      if n == @terms_batch_size do
+        Exqlite.Sqlite3.bind(state.terms_insert_stmt, params)
+        Exqlite.Sqlite3.step(db, state.terms_insert_stmt)
+        Exqlite.Sqlite3.reset(state.terms_insert_stmt)
+      else
+        sql = build_terms_sql(n)
+        {:ok, stmt} = Exqlite.Sqlite3.prepare(db, sql)
+        Exqlite.Sqlite3.bind(stmt, params)
+        Exqlite.Sqlite3.step(db, stmt)
+        Exqlite.Sqlite3.release(db, stmt)
+      end
     end)
   end
 
-  defp index_trace_data_batch(db, block_id, entries) do
-    by_trace = Enum.group_by(entries, & &1.trace_id)
+  defp insert_trace_batch(_state, _block_id, []), do: :ok
 
-    trace_rows =
-      Enum.map(by_trace, fn {trace_id, spans} ->
-        root = Enum.find(spans, fn s -> s.parent_span_id == nil end) || hd(spans)
-        has_error = if Enum.any?(spans, fn s -> s.status == :error end), do: 1, else: 0
-
-        # Single-pass min start / max end / count
-        {min_start, max_end, count} =
-          Enum.reduce(spans, {nil, nil, 0}, fn s, {mn, mx, c} ->
-            {
-              if(mn == nil or s.start_time < mn, do: s.start_time, else: mn),
-              if(mx == nil or s.end_time > mx, do: s.end_time, else: mx),
-              c + 1
-            }
-          end)
-
-        duration_ns = max_end - min_start
-        {trace_id, count, to_string(root.name), duration_ns, has_error}
-      end)
+  defp insert_trace_batch(state, block_id, trace_rows) do
+    db = state.db
 
     trace_rows
     |> Enum.chunk_every(@trace_batch_size)
     |> Enum.each(fn batch ->
       n = length(batch)
 
-      placeholders =
-        Enum.map_join(1..n, ", ", fn i ->
-          base = (i - 1) * 6
-          "(?#{base + 1}, ?#{base + 2}, ?#{base + 3}, ?#{base + 4}, ?#{base + 5}, ?#{base + 6})"
-        end)
-
-      sql =
-        "INSERT OR REPLACE INTO trace_index (trace_id, block_id, span_count, root_span_name, duration_ns, has_error) VALUES #{placeholders}"
-
-      {:ok, stmt} = Exqlite.Sqlite3.prepare(db, sql)
-
       params =
         Enum.flat_map(batch, fn {trace_id, count, root_name, dur, err} ->
           [trace_id, block_id, count, root_name, dur, err]
         end)
 
-      Exqlite.Sqlite3.bind(stmt, params)
-      Exqlite.Sqlite3.step(db, stmt)
-      Exqlite.Sqlite3.release(db, stmt)
+      if n == @trace_batch_size do
+        Exqlite.Sqlite3.bind(state.trace_insert_stmt, params)
+        Exqlite.Sqlite3.step(db, state.trace_insert_stmt)
+        Exqlite.Sqlite3.reset(state.trace_insert_stmt)
+      else
+        sql = build_trace_sql(n)
+        {:ok, stmt} = Exqlite.Sqlite3.prepare(db, sql)
+        Exqlite.Sqlite3.bind(stmt, params)
+        Exqlite.Sqlite3.step(db, stmt)
+        Exqlite.Sqlite3.release(db, stmt)
+      end
     end)
   end
 
@@ -489,6 +505,46 @@ defmodule TimelessTraces.Index do
       base_terms ++ service_term ++ attr_terms
     end)
     |> Enum.uniq()
+  end
+
+  defp compute_trace_rows(entries) do
+    by_trace = Enum.group_by(entries, & &1.trace_id)
+
+    Enum.map(by_trace, fn {trace_id, spans} ->
+      root = Enum.find(spans, fn s -> s.parent_span_id == nil end) || hd(spans)
+      has_error = if Enum.any?(spans, fn s -> s.status == :error end), do: 1, else: 0
+
+      {min_start, max_end, count} =
+        Enum.reduce(spans, {nil, nil, 0}, fn s, {mn, mx, c} ->
+          {
+            if(mn == nil or s.start_time < mn, do: s.start_time, else: mn),
+            if(mx == nil or s.end_time > mx, do: s.end_time, else: mx),
+            c + 1
+          }
+        end)
+
+      duration_ns = max_end - min_start
+      {trace_id, count, to_string(root.name), duration_ns, has_error}
+    end)
+  end
+
+  defp build_terms_sql(n) do
+    placeholders =
+      Enum.map_join(1..n, ", ", fn i ->
+        "(?#{i * 2 - 1}, ?#{i * 2})"
+      end)
+
+    "INSERT OR IGNORE INTO block_terms (term, block_id) VALUES #{placeholders}"
+  end
+
+  defp build_trace_sql(n) do
+    placeholders =
+      Enum.map_join(1..n, ", ", fn i ->
+        base = (i - 1) * 6
+        "(?#{base + 1}, ?#{base + 2}, ?#{base + 3}, ?#{base + 4}, ?#{base + 5}, ?#{base + 6})"
+      end)
+
+    "INSERT OR REPLACE INTO trace_index (trace_id, block_id, span_count, root_span_name, duration_ns, has_error) VALUES #{placeholders}"
   end
 
   # --- Querying (parallel, runs in caller's process) ---
@@ -770,7 +826,10 @@ defmodule TimelessTraces.Index do
 
   # --- Compaction ---
 
-  defp do_compact_blocks(db, old_ids, new_meta, new_entries, storage) do
+  defp do_compact_blocks(state, old_ids, new_meta, terms, trace_rows) do
+    db = state.db
+    storage = state.storage
+
     old_file_paths =
       if storage == :disk do
         Enum.flat_map(old_ids, fn id ->
@@ -792,8 +851,6 @@ defmodule TimelessTraces.Index do
         []
       end
 
-    format_str = Atom.to_string(Map.get(new_meta, :format, :zstd))
-
     Exqlite.Sqlite3.execute(db, "BEGIN")
 
     for id <- old_ids do
@@ -813,30 +870,7 @@ defmodule TimelessTraces.Index do
       Exqlite.Sqlite3.release(db, stmt)
     end
 
-    {:ok, block_stmt} =
-      Exqlite.Sqlite3.prepare(db, """
-      INSERT INTO blocks (block_id, file_path, byte_size, entry_count, ts_min, ts_max, data, format)
-      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
-      """)
-
-    Exqlite.Sqlite3.bind(block_stmt, [
-      new_meta.block_id,
-      new_meta[:file_path],
-      new_meta.byte_size,
-      new_meta.entry_count,
-      new_meta.ts_min,
-      new_meta.ts_max,
-      new_meta[:data],
-      format_str
-    ])
-
-    Exqlite.Sqlite3.step(db, block_stmt)
-    Exqlite.Sqlite3.release(db, block_stmt)
-
-    # Batched term + trace indexing for new block
-    terms = extract_terms(new_entries)
-    insert_terms_batch(db, terms, new_meta.block_id)
-    index_trace_data_batch(db, new_meta.block_id, new_entries)
+    insert_block_data(state, new_meta, terms, trace_rows)
 
     Exqlite.Sqlite3.execute(db, "COMMIT")
 

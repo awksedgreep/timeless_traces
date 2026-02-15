@@ -1,20 +1,20 @@
-# SpanStream
+# TimelessTraces
 
 Embedded OpenTelemetry span storage and compression for Elixir applications.
 
-SpanStream receives spans directly from the OpenTelemetry Erlang SDK (no HTTP, no protobuf), compresses them with two-tier raw/zstd block storage (~8.8x compression), and indexes them in SQLite for fast trace-level and span-level queries. Zero external infrastructure required.
+TimelessTraces receives spans directly from the OpenTelemetry Erlang SDK (no HTTP, no protobuf), compresses them with two-tier raw/zstd block storage (~9.9x compression), and indexes them in SQLite for fast trace-level and span-level queries. Zero external infrastructure required.
 
 Part of the embedded observability stack:
-- [gorilla_stream](https://github.com/awksedgreep/gorilla_stream) - numeric time series compression
-- [log_stream](https://github.com/awksedgreep/log_stream) - log ingestion/compression/indexing
-- **span_stream** - OTel span storage/compression (this library)
+- [timeless_metrics](https://github.com/awksedgreep/timeless_metrics) - numeric time series compression
+- [timeless_logs](https://github.com/awksedgreep/timeless_logs) - log ingestion/compression/indexing
+- **timeless_traces** - OTel span storage/compression (this library)
 
 ## Installation
 
 ```elixir
 def deps do
   [
-    {:span_stream, "~> 0.1.0"}
+    {:timeless_traces, "~> 0.2.0"}
   ]
 end
 ```
@@ -23,18 +23,19 @@ end
 
 ```elixir
 # config/config.exs
-config :span_stream,
+config :timeless_traces,
   storage: :disk,              # :disk or :memory
   data_dir: "priv/span_stream",
   flush_interval: 1_000,       # ms between auto-flushes
   max_buffer_size: 1_000,      # spans before forced flush
   compaction_threshold: 500,   # raw entries before zstd compaction
+  compression_level: 6,        # zstd level 1-22 (default 6)
   retention_max_age: nil,      # seconds, nil = no age limit
   retention_max_size: nil      # bytes, nil = no size limit
 
 # Wire up the OTel exporter
 config :opentelemetry,
-  traces_exporter: {SpanStream.Exporter, []}
+  traces_exporter: {TimelessTraces.Exporter, []}
 ```
 
 ## Usage
@@ -43,33 +44,33 @@ config :opentelemetry,
 
 ```elixir
 # All error spans
-SpanStream.query(status: :error)
+TimelessTraces.query(status: :error)
 
 # Server spans from a specific service
-SpanStream.query(kind: :server, service: "api-gateway")
+TimelessTraces.query(kind: :server, service: "api-gateway")
 
 # Slow spans (> 100ms)
-SpanStream.query(min_duration: 100_000_000)
+TimelessTraces.query(min_duration: 100_000_000)
 
 # Combined filters with pagination
-SpanStream.query(status: :error, kind: :server, limit: 50, order: :desc)
+TimelessTraces.query(status: :error, kind: :server, limit: 50, order: :desc)
 ```
 
 ### Trace lookup
 
 ```elixir
 # Get all spans in a trace, sorted by start time
-{:ok, spans} = SpanStream.trace("abc123def456...")
+{:ok, spans} = TimelessTraces.trace("abc123def456...")
 ```
 
 ### Live tail
 
 ```elixir
 # Subscribe to new spans as they arrive
-SpanStream.subscribe(status: :error)
+TimelessTraces.subscribe(status: :error)
 
 receive do
-  {:span_stream, :span, %SpanStream.Span{} = span} ->
+  {:timeless_traces, :span, %TimelessTraces.Span{} = span} ->
     IO.inspect(span.name)
 end
 ```
@@ -77,7 +78,7 @@ end
 ### Statistics
 
 ```elixir
-{:ok, stats} = SpanStream.stats()
+{:ok, stats} = TimelessTraces.stats()
 stats.total_blocks   #=> 42
 stats.total_entries   #=> 50_000
 stats.disk_size       #=> 24_000_000
@@ -112,7 +113,7 @@ OTel SDK → Exporter → Buffer → Writer (raw) → SQLite Index
 - **Buffer** accumulates spans, flushes every 1s or 1000 spans
 - **Writer** serializes blocks as raw Erlang terms initially
 - **Index** stores block metadata + inverted term index + trace index in SQLite
-- **Compactor** merges raw blocks into zstd-compressed blocks (~8.8x ratio at 500 spans)
+- **Compactor** merges raw blocks into zstd-compressed blocks (~9.9x ratio at 500 spans)
 - **Retention** enforces age and size limits
 
 ### Storage Modes
@@ -122,15 +123,25 @@ OTel SDK → Exporter → Buffer → Writer (raw) → SQLite Index
 
 ## Compression
 
-Spans compress well with zstd. Sweet spot is 200-500 spans per block:
+Spans compress well with zstd (level 6). Sweet spot is 200-500 spans per block:
 
 | Spans | Raw | Compressed | Ratio |
 |---|---|---|---|
-| 1 | 670 B | 470 B | 1.4x |
-| 10 | 6.0 KB | 1.2 KB | 4.9x |
-| 100 | 60.1 KB | 7.4 KB | 8.1x |
-| 500 | 301.6 KB | 34.4 KB | 8.8x |
-| 5000 | 3.0 MB | 338.0 KB | 8.9x |
+| 1 | 610 B | 421 B | 1.4x |
+| 10 | 6.0 KB | 1.2 KB | 5.2x |
+| 100 | 60.3 KB | 6.6 KB | 9.1x |
+| 500 | 302.1 KB | 30.4 KB | 9.9x |
+| 5000 | 3.0 MB | 297.1 KB | 10.2x |
+
+## Performance
+
+Ingestion throughput on 500K spans (1000 spans/block):
+
+| Phase | Throughput |
+|---|---|
+| Writer only (serialization + disk I/O) | ~260K spans/sec |
+| Writer + Index (sync SQLite indexing) | ~19K spans/sec |
+| Full pipeline (Buffer → Writer → async Index) | ~66K spans/sec |
 
 ## License
 
