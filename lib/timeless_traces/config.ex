@@ -66,4 +66,9 @@ defmodule TimelessTraces.Config do
   def compression_level do
     Application.get_env(:timeless_traces, :compression_level, 6)
   end
+
+  @spec index_publish_interval() :: pos_integer()
+  def index_publish_interval do
+    Application.get_env(:timeless_traces, :index_publish_interval, 2_000)
+  end
 end

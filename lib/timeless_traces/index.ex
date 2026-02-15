@@ -15,6 +15,9 @@ defmodule TimelessTraces.Index do
   # Batch INSERT OR REPLACE up to 100 traces per statement (6 params each = 600)
   @trace_batch_size 100
 
+  @blocks_table :timeless_traces_blocks
+  @overflow_table :timeless_traces_index_overflow
+
   @spec start_link(keyword()) :: GenServer.on_start()
   def start_link(opts) do
     GenServer.start_link(__MODULE__, opts, name: __MODULE__)
@@ -32,24 +35,218 @@ defmodule TimelessTraces.Index do
     GenServer.cast(__MODULE__, {:index_block, block_meta, terms, trace_rows})
   end
 
+  # --- Lock-free read functions (run in caller's process) ---
+
   @spec query(keyword()) :: {:ok, TimelessTraces.Result.t()}
   def query(filters) do
-    # Phase 1: GenServer does the cheap SQLite lookup only
-    {block_ids, storage, pagination, search_filters} =
-      GenServer.call(__MODULE__, {:query_plan, filters}, TimelessTraces.Config.query_timeout())
+    {search_filters, pagination} = split_pagination(filters)
+    {term_filters, time_filters} = split_filters(search_filters)
+    order = Keyword.get(pagination, :order, :desc)
+    block_ids = find_matching_blocks_ets(term_filters, time_filters, order)
+    storage = :persistent_term.get({__MODULE__, :storage})
 
-    # Phase 2: Parallel decompression + filtering in the caller's process
     do_query_parallel(block_ids, storage, pagination, search_filters)
   end
 
   @spec trace(String.t()) :: {:ok, [TimelessTraces.Span.t()]}
   def trace(trace_id) do
-    # Phase 1: GenServer does the cheap SQLite lookup only
-    {block_info, storage} =
-      GenServer.call(__MODULE__, {:trace_plan, trace_id}, TimelessTraces.Config.query_timeout())
+    block_ids = trace_block_ids(trace_id)
+    storage = :persistent_term.get({__MODULE__, :storage})
 
-    # Phase 2: Parallel decompression in the caller's process
+    block_info =
+      block_ids
+      |> MapSet.to_list()
+      |> Enum.flat_map(fn bid ->
+        case :ets.lookup(@blocks_table, bid) do
+          [{^bid, file_path, _byte_size, _entry_count, _ts_min, _ts_max, format, _created_at}] ->
+            [{bid, file_path, format}]
+
+          [] ->
+            []
+        end
+      end)
+
     do_trace_parallel(block_info, storage, trace_id)
+  end
+
+  @spec stats() :: {:ok, TimelessTraces.Stats.t()}
+  def stats do
+    db_path = :persistent_term.get({__MODULE__, :db_path})
+
+    rows = :ets.tab2list(@blocks_table)
+
+    {total_blocks, total_entries, total_bytes, oldest, newest, format_stats} =
+      Enum.reduce(
+        rows,
+        {0, 0, 0, nil, nil, %{}},
+        fn {_bid, _fp, byte_size, entry_count, ts_min, ts_max, format, _created_at},
+           {blocks, entries, bytes, old, new, fstats} ->
+          new_old = if old == nil or ts_min < old, do: ts_min, else: old
+          new_new = if new == nil or ts_max > new, do: ts_max, else: new
+
+          fmt_key = Atom.to_string(format)
+          cur = Map.get(fstats, fmt_key, %{blocks: 0, bytes: 0, entries: 0})
+
+          updated = %{
+            blocks: cur.blocks + 1,
+            bytes: cur.bytes + byte_size,
+            entries: cur.entries + entry_count
+          }
+
+          {blocks + 1, entries + entry_count, bytes + byte_size, new_old, new_new,
+           Map.put(fstats, fmt_key, updated)}
+        end
+      )
+
+    index_size =
+      case db_path do
+        nil ->
+          0
+
+        path ->
+          case File.stat(path) do
+            {:ok, %{size: size}} -> size
+            _ -> 0
+          end
+      end
+
+    {:ok,
+     %TimelessTraces.Stats{
+       total_blocks: total_blocks,
+       total_entries: total_entries,
+       total_bytes: total_bytes,
+       oldest_timestamp: oldest,
+       newest_timestamp: newest,
+       disk_size: total_bytes,
+       index_size: index_size,
+       raw_blocks: format_stats["raw"][:blocks] || 0,
+       raw_bytes: format_stats["raw"][:bytes] || 0,
+       raw_entries: format_stats["raw"][:entries] || 0,
+       zstd_blocks: format_stats["zstd"][:blocks] || 0,
+       zstd_bytes: format_stats["zstd"][:bytes] || 0,
+       zstd_entries: format_stats["zstd"][:entries] || 0
+     }}
+  end
+
+  @spec matching_block_ids(keyword()) :: [{integer(), String.t() | nil, :raw | :zstd}]
+  def matching_block_ids(filters) do
+    {search_filters, pagination} = split_pagination(filters)
+    {term_filters, time_filters} = split_filters(search_filters)
+    order = Keyword.get(pagination, :order, :asc)
+    find_matching_blocks_ets(term_filters, time_filters, order)
+  end
+
+  @spec raw_block_stats() :: %{
+          entry_count: integer(),
+          block_count: integer(),
+          oldest_created_at: integer() | nil
+        }
+  def raw_block_stats do
+    rows = :ets.tab2list(@blocks_table)
+
+    Enum.reduce(
+      rows,
+      %{entry_count: 0, block_count: 0, oldest_created_at: nil},
+      fn {_bid, _fp, _bs, entry_count, _tsmin, _tsmax, format, created_at}, acc ->
+        if format == :raw do
+          oldest =
+            if acc.oldest_created_at == nil or created_at < acc.oldest_created_at,
+              do: created_at,
+              else: acc.oldest_created_at
+
+          %{
+            entry_count: acc.entry_count + entry_count,
+            block_count: acc.block_count + 1,
+            oldest_created_at: oldest
+          }
+        else
+          acc
+        end
+      end
+    )
+  end
+
+  @spec raw_block_ids() :: [{integer(), String.t() | nil}]
+  def raw_block_ids do
+    @blocks_table
+    |> :ets.tab2list()
+    |> Enum.filter(fn {_bid, _fp, _bs, _ec, _tsmin, _tsmax, format, _ca} -> format == :raw end)
+    |> Enum.sort_by(fn {_bid, _fp, _bs, _ec, ts_min, _tsmax, _fmt, _ca} -> ts_min end)
+    |> Enum.map(fn {bid, fp, _bs, _ec, _tsmin, _tsmax, _fmt, _ca} -> {bid, fp} end)
+  end
+
+  @spec distinct_services() :: {:ok, [String.t()]}
+  def distinct_services do
+    term_index = :persistent_term.get({__MODULE__, :term_index})
+
+    pt_services =
+      term_index
+      |> Map.keys()
+      |> Enum.flat_map(fn
+        "service.name:" <> svc -> [svc]
+        _ -> []
+      end)
+
+    overflow_services =
+      @overflow_table
+      |> :ets.match({:term, :"$1", :_})
+      |> List.flatten()
+      |> Enum.flat_map(fn
+        "service.name:" <> svc -> [svc]
+        _ -> []
+      end)
+
+    services =
+      (pt_services ++ overflow_services)
+      |> Enum.uniq()
+      |> Enum.sort()
+
+    {:ok, services}
+  end
+
+  @spec distinct_operations(String.t()) :: {:ok, [String.t()]}
+  def distinct_operations(service) do
+    service_bids = term_block_ids("service.name:#{service}")
+
+    term_index = :persistent_term.get({__MODULE__, :term_index})
+
+    pt_ops =
+      term_index
+      |> Enum.flat_map(fn
+        {"name:" <> name, bids} ->
+          if MapSet.size(MapSet.intersection(bids, service_bids)) > 0, do: [name], else: []
+
+        _ ->
+          []
+      end)
+
+    overflow_name_entries =
+      @overflow_table
+      |> :ets.match({:term, :"$1", :"$2"})
+      |> Enum.flat_map(fn
+        ["name:" <> name, bid] ->
+          if MapSet.member?(service_bids, bid), do: [name], else: []
+
+        _ ->
+          []
+      end)
+
+    operations =
+      (pt_ops ++ overflow_name_entries)
+      |> Enum.uniq()
+      |> Enum.sort()
+
+    {:ok, operations}
+  end
+
+  # read_block_data stays as GenServer.call — reads BLOB from SQLite (memory mode only)
+  @spec read_block_data(integer()) :: {:ok, [map()]} | {:error, term()}
+  def read_block_data(block_id) do
+    GenServer.call(
+      __MODULE__,
+      {:read_block_data, block_id},
+      TimelessTraces.Config.query_timeout()
+    )
   end
 
   @spec delete_blocks_before(integer()) :: non_neg_integer()
@@ -60,43 +257,6 @@ defmodule TimelessTraces.Index do
   @spec delete_blocks_over_size(non_neg_integer()) :: non_neg_integer()
   def delete_blocks_over_size(max_bytes) do
     GenServer.call(__MODULE__, {:delete_over_size, max_bytes}, 60_000)
-  end
-
-  @spec stats() :: {:ok, TimelessTraces.Stats.t()}
-  def stats do
-    GenServer.call(__MODULE__, :stats, TimelessTraces.Config.query_timeout())
-  end
-
-  @spec matching_block_ids(keyword()) :: [{integer(), String.t() | nil, :raw | :zstd}]
-  def matching_block_ids(filters) do
-    GenServer.call(
-      __MODULE__,
-      {:matching_block_ids, filters},
-      TimelessTraces.Config.query_timeout()
-    )
-  end
-
-  @spec read_block_data(integer()) :: {:ok, [map()]} | {:error, term()}
-  def read_block_data(block_id) do
-    GenServer.call(
-      __MODULE__,
-      {:read_block_data, block_id},
-      TimelessTraces.Config.query_timeout()
-    )
-  end
-
-  @spec raw_block_stats() :: %{
-          entry_count: integer(),
-          block_count: integer(),
-          oldest_created_at: integer() | nil
-        }
-  def raw_block_stats do
-    GenServer.call(__MODULE__, :raw_block_stats, TimelessTraces.Config.query_timeout())
-  end
-
-  @spec raw_block_ids() :: [{integer(), String.t() | nil}]
-  def raw_block_ids do
-    GenServer.call(__MODULE__, :raw_block_ids, TimelessTraces.Config.query_timeout())
   end
 
   @spec compact_blocks([integer()], TimelessTraces.Writer.block_meta(), [map()]) :: :ok
@@ -115,19 +275,8 @@ defmodule TimelessTraces.Index do
     GenServer.call(__MODULE__, {:backup, target_path}, :infinity)
   end
 
-  @spec distinct_services() :: {:ok, [String.t()]}
-  def distinct_services do
-    GenServer.call(__MODULE__, :distinct_services, TimelessTraces.Config.query_timeout())
-  end
-
-  @spec distinct_operations(String.t()) :: {:ok, [String.t()]}
-  def distinct_operations(service) do
-    GenServer.call(
-      __MODULE__,
-      {:distinct_operations, service},
-      TimelessTraces.Config.query_timeout()
-    )
-  end
+  @spec sync() :: :ok
+  def sync, do: GenServer.call(__MODULE__, :sync, TimelessTraces.Config.query_timeout())
 
   @doc false
   @spec precompute([map()]) :: {[String.t()], [tuple()]}
@@ -168,6 +317,22 @@ defmodule TimelessTraces.Index do
     {:ok, terms_insert_stmt} = Exqlite.Sqlite3.prepare(db, build_terms_sql(@terms_batch_size))
     {:ok, trace_insert_stmt} = Exqlite.Sqlite3.prepare(db, build_trace_sql(@trace_batch_size))
 
+    # Initialize ETS tables
+    init_ets_tables()
+
+    # Store storage mode + db_path in persistent_term
+    :persistent_term.put({__MODULE__, :storage}, storage)
+    :persistent_term.put({__MODULE__, :db_path}, db_path)
+
+    # Bulk-load from SQLite into ETS/persistent_term
+    bulk_load_blocks(db)
+    bulk_load_term_index(db)
+    bulk_load_trace_index(db)
+
+    # Schedule publish timer
+    publish_interval = TimelessTraces.Config.index_publish_interval()
+    publish_ref = Process.send_after(self(), :publish, publish_interval)
+
     {:ok,
      %{
        db: db,
@@ -177,17 +342,31 @@ defmodule TimelessTraces.Index do
        flush_timer: nil,
        block_insert_stmt: block_insert_stmt,
        terms_insert_stmt: terms_insert_stmt,
-       trace_insert_stmt: trace_insert_stmt
+       trace_insert_stmt: trace_insert_stmt,
+       publish_timer: publish_ref,
+       publish_interval: publish_interval,
+       dirty: false
      }}
   end
 
   @impl true
   def terminate(_reason, state) do
     flush_pending(state)
+
     Exqlite.Sqlite3.release(state.db, state.block_insert_stmt)
     Exqlite.Sqlite3.release(state.db, state.terms_insert_stmt)
     Exqlite.Sqlite3.release(state.db, state.trace_insert_stmt)
     Exqlite.Sqlite3.close(state.db)
+
+    # Clean up persistent_term keys
+    :persistent_term.erase({__MODULE__, :storage})
+    :persistent_term.erase({__MODULE__, :db_path})
+    :persistent_term.erase({__MODULE__, :term_index})
+    :persistent_term.erase({__MODULE__, :trace_index})
+
+    # Clean up ETS tables
+    safe_delete_ets(@blocks_table)
+    safe_delete_ets(@overflow_table)
   end
 
   # --- handle_call (grouped) ---
@@ -196,49 +375,30 @@ defmodule TimelessTraces.Index do
   def handle_call({:index_block, meta, terms, trace_rows}, _from, state) do
     state = flush_pending(state)
     result = do_index_block(state, meta, terms, trace_rows)
-    {:reply, result, state}
-  end
-
-  def handle_call({:query_plan, filters}, _from, state) do
-    state = flush_pending(state)
-    {search_filters, pagination} = split_pagination(filters)
-    {term_filters, time_filters} = split_filters(search_filters)
-    order = Keyword.get(pagination, :order, :desc)
-    block_ids = find_matching_blocks(state.db, term_filters, time_filters, order)
-    {:reply, {block_ids, state.storage, pagination, search_filters}, state}
-  end
-
-  def handle_call({:trace_plan, trace_id}, _from, state) do
-    state = flush_pending(state)
-    block_info = find_trace_blocks(state.db, trace_id)
-    {:reply, {block_info, state.storage}, state}
+    # Update cache after SQLite commit
+    insert_block_ets(meta)
+    insert_overflow(terms, trace_rows, meta.block_id)
+    {:reply, result, %{state | dirty: true}}
   end
 
   def handle_call({:delete_before, cutoff}, _from, state) do
     state = flush_pending(state)
-    count = do_delete_before(state.db, cutoff, state.storage)
-    {:reply, count, state}
+
+    {count, deleted_ids, old_terms, old_traces} =
+      do_delete_before(state.db, cutoff, state.storage)
+
+    remove_blocks_from_cache(deleted_ids, old_terms, old_traces)
+    {:reply, count, %{state | dirty: false}}
   end
 
   def handle_call({:delete_over_size, max_bytes}, _from, state) do
     state = flush_pending(state)
-    count = do_delete_over_size(state.db, max_bytes, state.storage)
-    {:reply, count, state}
-  end
 
-  def handle_call({:matching_block_ids, filters}, _from, state) do
-    state = flush_pending(state)
-    {search_filters, pagination} = split_pagination(filters)
-    {term_filters, time_filters} = split_filters(search_filters)
-    order = Keyword.get(pagination, :order, :asc)
-    block_ids = find_matching_blocks(state.db, term_filters, time_filters, order)
-    {:reply, block_ids, state}
-  end
+    {count, deleted_ids, old_terms, old_traces} =
+      do_delete_over_size(state.db, max_bytes, state.storage)
 
-  def handle_call(:stats, _from, state) do
-    state = flush_pending(state)
-    result = do_stats(state.db, state.db_path)
-    {:reply, result, state}
+    remove_blocks_from_cache(deleted_ids, old_terms, old_traces)
+    {:reply, count, %{state | dirty: false}}
   end
 
   def handle_call({:read_block_data, block_id}, _from, state) do
@@ -247,22 +407,27 @@ defmodule TimelessTraces.Index do
     {:reply, result, state}
   end
 
-  def handle_call(:raw_block_stats, _from, state) do
-    state = flush_pending(state)
-    result = do_raw_block_stats(state.db)
-    {:reply, result, state}
-  end
-
-  def handle_call(:raw_block_ids, _from, state) do
-    state = flush_pending(state)
-    result = do_raw_block_ids(state.db)
-    {:reply, result, state}
-  end
-
   def handle_call({:compact_blocks, old_ids, new_meta, terms, trace_rows}, _from, state) do
     state = flush_pending(state)
+
+    # Collect old terms/traces for cache cleanup
+    old_terms = collect_terms_for_blocks(state.db, old_ids)
+    old_traces = collect_traces_for_blocks(state.db, old_ids)
+
     result = do_compact_blocks(state, old_ids, new_meta, terms, trace_rows)
-    {:reply, result, state}
+
+    # Update cache: remove old, add new
+    for id <- old_ids, do: :ets.delete(@blocks_table, id)
+    remove_block_ids_from_persistent_term(old_ids, old_terms, old_traces)
+    clear_overflow_for_blocks(old_ids)
+
+    insert_block_ets(new_meta)
+    insert_overflow(terms, trace_rows, new_meta.block_id)
+
+    # Force immediate publish since compaction changes are significant
+    publish_overflow(state)
+
+    {:reply, result, %{state | dirty: false}}
   end
 
   def handle_call({:backup, target_path}, _from, state) do
@@ -278,16 +443,10 @@ defmodule TimelessTraces.Index do
     end
   end
 
-  def handle_call(:distinct_services, _from, state) do
+  def handle_call(:sync, _from, state) do
     state = flush_pending(state)
-    result = do_distinct_services(state.db)
-    {:reply, result, state}
-  end
-
-  def handle_call({:distinct_operations, service}, _from, state) do
-    state = flush_pending(state)
-    result = do_distinct_operations(state.db, service)
-    {:reply, result, state}
+    publish_overflow(state)
+    {:reply, :ok, %{state | dirty: false}}
   end
 
   # --- handle_cast ---
@@ -308,6 +467,346 @@ defmodule TimelessTraces.Index do
     {:noreply, state}
   end
 
+  def handle_info(:publish, state) do
+    if state.dirty do
+      publish_overflow(state)
+    end
+
+    ref = Process.send_after(self(), :publish, state.publish_interval)
+    {:noreply, %{state | publish_timer: ref, dirty: false}}
+  end
+
+  # --- ETS/persistent_term initialization ---
+
+  defp init_ets_tables do
+    safe_delete_ets(@blocks_table)
+    safe_delete_ets(@overflow_table)
+
+    :ets.new(@blocks_table, [
+      :named_table,
+      :ordered_set,
+      :public,
+      read_concurrency: true
+    ])
+
+    :ets.new(@overflow_table, [
+      :named_table,
+      :duplicate_bag,
+      :public,
+      read_concurrency: true
+    ])
+
+    :persistent_term.put({__MODULE__, :term_index}, %{})
+    :persistent_term.put({__MODULE__, :trace_index}, %{})
+  end
+
+  defp safe_delete_ets(table) do
+    try do
+      :ets.delete(table)
+    rescue
+      ArgumentError -> :ok
+    end
+  end
+
+  # --- Bulk loading from SQLite ---
+
+  defp bulk_load_blocks(db) do
+    {:ok, stmt} =
+      Exqlite.Sqlite3.prepare(db, """
+      SELECT block_id, file_path, byte_size, entry_count, ts_min, ts_max, format, created_at
+      FROM blocks
+      """)
+
+    bulk_load_blocks_rows(db, stmt)
+    Exqlite.Sqlite3.release(db, stmt)
+  end
+
+  defp bulk_load_blocks_rows(db, stmt) do
+    case Exqlite.Sqlite3.step(db, stmt) do
+      {:row, [block_id, file_path, byte_size, entry_count, ts_min, ts_max, format, created_at]} ->
+        :ets.insert(@blocks_table, {
+          block_id,
+          file_path,
+          byte_size,
+          entry_count,
+          ts_min,
+          ts_max,
+          to_format_atom(format),
+          created_at
+        })
+
+        bulk_load_blocks_rows(db, stmt)
+
+      :done ->
+        :ok
+    end
+  end
+
+  defp bulk_load_term_index(db) do
+    {:ok, stmt} =
+      Exqlite.Sqlite3.prepare(db, "SELECT term, block_id FROM block_terms")
+
+    term_map = bulk_load_term_rows(db, stmt, %{})
+    Exqlite.Sqlite3.release(db, stmt)
+    :persistent_term.put({__MODULE__, :term_index}, term_map)
+  end
+
+  defp bulk_load_term_rows(db, stmt, acc) do
+    case Exqlite.Sqlite3.step(db, stmt) do
+      {:row, [term, block_id]} ->
+        updated =
+          Map.update(acc, term, MapSet.new([block_id]), &MapSet.put(&1, block_id))
+
+        bulk_load_term_rows(db, stmt, updated)
+
+      :done ->
+        acc
+    end
+  end
+
+  defp bulk_load_trace_index(db) do
+    {:ok, stmt} =
+      Exqlite.Sqlite3.prepare(db, "SELECT trace_id, block_id FROM trace_index")
+
+    trace_map = bulk_load_trace_rows(db, stmt, %{})
+    Exqlite.Sqlite3.release(db, stmt)
+    :persistent_term.put({__MODULE__, :trace_index}, trace_map)
+  end
+
+  defp bulk_load_trace_rows(db, stmt, acc) do
+    case Exqlite.Sqlite3.step(db, stmt) do
+      {:row, [trace_id, block_id]} ->
+        updated =
+          Map.update(acc, trace_id, MapSet.new([block_id]), &MapSet.put(&1, block_id))
+
+        bulk_load_trace_rows(db, stmt, updated)
+
+      :done ->
+        acc
+    end
+  end
+
+  # --- Cache update helpers ---
+
+  defp insert_block_ets(meta) do
+    format = Map.get(meta, :format, :zstd)
+    created_at = System.system_time(:second)
+
+    :ets.insert(@blocks_table, {
+      meta.block_id,
+      meta[:file_path],
+      meta.byte_size,
+      meta.entry_count,
+      meta.ts_min,
+      meta.ts_max,
+      format,
+      created_at
+    })
+  end
+
+  defp insert_overflow(terms, trace_rows, block_id) do
+    for term <- terms do
+      :ets.insert(@overflow_table, {:term, term, block_id})
+    end
+
+    for {trace_id, _count, _root_name, _dur, _err} <- trace_rows do
+      :ets.insert(@overflow_table, {:trace, trace_id, block_id})
+    end
+  end
+
+  # --- Lock-free read helpers ---
+
+  defp term_block_ids(term) do
+    pt_set = Map.get(:persistent_term.get({__MODULE__, :term_index}), term, MapSet.new())
+
+    overflow_ids =
+      @overflow_table
+      |> :ets.match({:term, term, :"$1"})
+      |> List.flatten()
+      |> MapSet.new()
+
+    MapSet.union(pt_set, overflow_ids)
+  end
+
+  defp trace_block_ids(trace_id) do
+    pt_set = Map.get(:persistent_term.get({__MODULE__, :trace_index}), trace_id, MapSet.new())
+
+    overflow_ids =
+      @overflow_table
+      |> :ets.match({:trace, trace_id, :"$1"})
+      |> List.flatten()
+      |> MapSet.new()
+
+    MapSet.union(pt_set, overflow_ids)
+  end
+
+  defp find_matching_blocks_ets(term_filters, time_filters, order) do
+    terms = build_query_terms(term_filters)
+
+    candidate_bids =
+      case terms do
+        [] ->
+          nil
+
+        _ ->
+          terms
+          |> Enum.map(&term_block_ids/1)
+          |> Enum.reduce(&MapSet.intersection/2)
+      end
+
+    # Collect all blocks from ETS, apply filters
+    all_blocks = :ets.tab2list(@blocks_table)
+
+    filtered =
+      all_blocks
+      |> Enum.filter(fn {bid, _fp, _bs, _ec, ts_min, ts_max, _fmt, _ca} ->
+        term_match =
+          case candidate_bids do
+            nil -> true
+            bids -> MapSet.member?(bids, bid)
+          end
+
+        time_match =
+          Enum.all?(time_filters, fn
+            {:since, ts} -> ts_max >= to_nanos(ts)
+            {:until, ts} -> ts_min <= to_nanos(ts)
+          end)
+
+        term_match and time_match
+      end)
+      |> Enum.sort_by(
+        fn {_bid, _fp, _bs, _ec, ts_min, _tsmax, _fmt, _ca} -> ts_min end,
+        if(order == :asc, do: :asc, else: :desc)
+      )
+      |> Enum.map(fn {bid, fp, _bs, _ec, _tsmin, _tsmax, fmt, _ca} -> {bid, fp, fmt} end)
+
+    filtered
+  end
+
+  # --- Publish: merge overflow into persistent_term ---
+
+  defp publish_overflow(_state) do
+    overflow_entries = :ets.tab2list(@overflow_table)
+
+    if overflow_entries != [] do
+      term_index = :persistent_term.get({__MODULE__, :term_index})
+      trace_index = :persistent_term.get({__MODULE__, :trace_index})
+
+      {new_term_index, new_trace_index} =
+        Enum.reduce(overflow_entries, {term_index, trace_index}, fn
+          {:term, term, block_id}, {ti, tri} ->
+            {Map.update(ti, term, MapSet.new([block_id]), &MapSet.put(&1, block_id)), tri}
+
+          {:trace, trace_id, block_id}, {ti, tri} ->
+            {ti, Map.update(tri, trace_id, MapSet.new([block_id]), &MapSet.put(&1, block_id))}
+        end)
+
+      :persistent_term.put({__MODULE__, :term_index}, new_term_index)
+      :persistent_term.put({__MODULE__, :trace_index}, new_trace_index)
+      :ets.delete_all_objects(@overflow_table)
+    end
+  end
+
+  # --- Cache cleanup helpers ---
+
+  defp collect_terms_for_blocks(db, block_ids) do
+    Enum.flat_map(block_ids, fn id ->
+      {:ok, stmt} =
+        Exqlite.Sqlite3.prepare(db, "SELECT term FROM block_terms WHERE block_id = ?1")
+
+      Exqlite.Sqlite3.bind(stmt, [id])
+      terms = collect_single_column(db, stmt)
+      Exqlite.Sqlite3.release(db, stmt)
+      Enum.map(terms, fn term -> {term, id} end)
+    end)
+  end
+
+  defp collect_traces_for_blocks(db, block_ids) do
+    Enum.flat_map(block_ids, fn id ->
+      {:ok, stmt} =
+        Exqlite.Sqlite3.prepare(db, "SELECT trace_id FROM trace_index WHERE block_id = ?1")
+
+      Exqlite.Sqlite3.bind(stmt, [id])
+      traces = collect_single_column(db, stmt)
+      Exqlite.Sqlite3.release(db, stmt)
+      Enum.map(traces, fn trace_id -> {trace_id, id} end)
+    end)
+  end
+
+  defp remove_block_ids_from_persistent_term(old_ids, old_terms, old_traces) do
+    old_id_set = MapSet.new(old_ids)
+
+    # Update term index
+    term_index = :persistent_term.get({__MODULE__, :term_index})
+
+    new_term_index =
+      old_terms
+      |> Enum.map(fn {term, _id} -> term end)
+      |> Enum.uniq()
+      |> Enum.reduce(term_index, fn term, acc ->
+        case Map.get(acc, term) do
+          nil ->
+            acc
+
+          bids ->
+            cleaned = MapSet.difference(bids, old_id_set)
+
+            if MapSet.size(cleaned) == 0 do
+              Map.delete(acc, term)
+            else
+              Map.put(acc, term, cleaned)
+            end
+        end
+      end)
+
+    :persistent_term.put({__MODULE__, :term_index}, new_term_index)
+
+    # Update trace index
+    trace_index = :persistent_term.get({__MODULE__, :trace_index})
+
+    new_trace_index =
+      old_traces
+      |> Enum.map(fn {trace_id, _id} -> trace_id end)
+      |> Enum.uniq()
+      |> Enum.reduce(trace_index, fn trace_id, acc ->
+        case Map.get(acc, trace_id) do
+          nil ->
+            acc
+
+          bids ->
+            cleaned = MapSet.difference(bids, old_id_set)
+
+            if MapSet.size(cleaned) == 0 do
+              Map.delete(acc, trace_id)
+            else
+              Map.put(acc, trace_id, cleaned)
+            end
+        end
+      end)
+
+    :persistent_term.put({__MODULE__, :trace_index}, new_trace_index)
+  end
+
+  defp clear_overflow_for_blocks(old_ids) do
+    old_id_set = MapSet.new(old_ids)
+
+    @overflow_table
+    |> :ets.tab2list()
+    |> Enum.each(fn {_type, _key, bid} = entry ->
+      if MapSet.member?(old_id_set, bid) do
+        :ets.delete_object(@overflow_table, entry)
+      end
+    end)
+  end
+
+  defp remove_blocks_from_cache(deleted_ids, old_terms, old_traces) do
+    if deleted_ids != [] do
+      for id <- deleted_ids, do: :ets.delete(@blocks_table, id)
+      remove_block_ids_from_persistent_term(deleted_ids, old_terms, old_traces)
+      clear_overflow_for_blocks(deleted_ids)
+    end
+  end
+
   # --- Pending flush helpers ---
 
   defp flush_pending(%{pending: []} = state), do: state
@@ -321,11 +820,17 @@ defmodule TimelessTraces.Index do
 
     Exqlite.Sqlite3.execute(state.db, "COMMIT")
 
+    # Update ETS + overflow for all flushed entries
+    for {meta, terms, trace_rows} <- Enum.reverse(pending) do
+      insert_block_ets(meta)
+      insert_overflow(terms, trace_rows, meta.block_id)
+    end
+
     if state.flush_timer do
       Process.cancel_timer(state.flush_timer)
     end
 
-    %{state | pending: [], flush_timer: nil}
+    %{state | pending: [], flush_timer: nil, dirty: true}
   end
 
   defp schedule_index_flush(%{flush_timer: nil} = state) do
@@ -637,21 +1142,6 @@ defmodule TimelessTraces.Index do
      }}
   end
 
-  defp find_trace_blocks(db, trace_id) do
-    {:ok, stmt} =
-      Exqlite.Sqlite3.prepare(db, """
-      SELECT ti.block_id, b.file_path, b.format
-      FROM trace_index ti
-      JOIN blocks b ON ti.block_id = b.block_id
-      WHERE ti.trace_id = ?1
-      """)
-
-    Exqlite.Sqlite3.bind(stmt, [trace_id])
-    rows = collect_rows_3(db, stmt)
-    Exqlite.Sqlite3.release(db, stmt)
-    rows
-  end
-
   defp do_trace_parallel(block_info, storage, trace_id) do
     spans =
       if storage == :disk and length(block_info) > 1 do
@@ -699,78 +1189,6 @@ defmodule TimelessTraces.Index do
     {:ok, Enum.sort_by(spans, & &1.start_time)}
   end
 
-  # --- Stats ---
-
-  defp do_stats(db, db_path) do
-    {:ok, stmt} =
-      Exqlite.Sqlite3.prepare(db, """
-      SELECT
-        COUNT(*),
-        COALESCE(SUM(entry_count), 0),
-        COALESCE(SUM(byte_size), 0),
-        MIN(ts_min),
-        MAX(ts_max)
-      FROM blocks
-      """)
-
-    {:row, [total_blocks, total_entries, total_bytes, oldest, newest]} =
-      Exqlite.Sqlite3.step(db, stmt)
-
-    Exqlite.Sqlite3.release(db, stmt)
-
-    {:ok, fmt_stmt} =
-      Exqlite.Sqlite3.prepare(db, """
-      SELECT format, COUNT(*), COALESCE(SUM(byte_size), 0), COALESCE(SUM(entry_count), 0)
-      FROM blocks GROUP BY format
-      """)
-
-    format_stats = collect_format_stats(db, fmt_stmt)
-    Exqlite.Sqlite3.release(db, fmt_stmt)
-
-    index_size =
-      case db_path do
-        nil ->
-          0
-
-        path ->
-          case File.stat(path) do
-            {:ok, %{size: size}} -> size
-            _ -> 0
-          end
-      end
-
-    {:ok,
-     %TimelessTraces.Stats{
-       total_blocks: total_blocks,
-       total_entries: total_entries,
-       total_bytes: total_bytes,
-       oldest_timestamp: oldest,
-       newest_timestamp: newest,
-       disk_size: total_bytes,
-       index_size: index_size,
-       raw_blocks: format_stats["raw"][:blocks] || 0,
-       raw_bytes: format_stats["raw"][:bytes] || 0,
-       raw_entries: format_stats["raw"][:entries] || 0,
-       zstd_blocks: format_stats["zstd"][:blocks] || 0,
-       zstd_bytes: format_stats["zstd"][:bytes] || 0,
-       zstd_entries: format_stats["zstd"][:entries] || 0
-     }}
-  end
-
-  defp collect_format_stats(db, stmt) do
-    case Exqlite.Sqlite3.step(db, stmt) do
-      {:row, [format, count, bytes, entries]} ->
-        Map.put(collect_format_stats(db, stmt), format, %{
-          blocks: count,
-          bytes: bytes,
-          entries: entries
-        })
-
-      :done ->
-        %{}
-    end
-  end
-
   # --- Block reading ---
 
   defp read_block_from_db(db, block_id) do
@@ -793,35 +1211,6 @@ defmodule TimelessTraces.Index do
 
     Exqlite.Sqlite3.release(db, stmt)
     result
-  end
-
-  # --- Raw block helpers ---
-
-  defp do_raw_block_stats(db) do
-    {:ok, stmt} =
-      Exqlite.Sqlite3.prepare(db, """
-      SELECT
-        COALESCE(SUM(entry_count), 0),
-        COUNT(*),
-        MIN(created_at)
-      FROM blocks WHERE format = 'raw'
-      """)
-
-    {:row, [entry_count, block_count, oldest]} = Exqlite.Sqlite3.step(db, stmt)
-    Exqlite.Sqlite3.release(db, stmt)
-
-    %{entry_count: entry_count, block_count: block_count, oldest_created_at: oldest}
-  end
-
-  defp do_raw_block_ids(db) do
-    {:ok, stmt} =
-      Exqlite.Sqlite3.prepare(db, """
-      SELECT block_id, file_path FROM blocks WHERE format = 'raw' ORDER BY ts_min ASC
-      """)
-
-    rows = collect_rows_2(db, stmt)
-    Exqlite.Sqlite3.release(db, stmt)
-    rows
   end
 
   # --- Compaction ---
@@ -889,7 +1278,14 @@ defmodule TimelessTraces.Index do
     blocks = collect_rows_2(db, stmt)
     Exqlite.Sqlite3.release(db, stmt)
 
-    delete_blocks(db, blocks, storage)
+    block_ids = Enum.map(blocks, fn {id, _fp} -> id end)
+
+    # Collect terms/traces BEFORE deleting from SQLite
+    old_terms = collect_terms_for_blocks(db, block_ids)
+    old_traces = collect_traces_for_blocks(db, block_ids)
+
+    count = delete_blocks(db, blocks, storage)
+    {count, block_ids, old_terms, old_traces}
   end
 
   defp do_delete_over_size(db, max_bytes, storage) do
@@ -898,7 +1294,7 @@ defmodule TimelessTraces.Index do
     Exqlite.Sqlite3.release(db, stmt)
 
     if total <= max_bytes do
-      0
+      {0, [], [], []}
     else
       {:ok, stmt} =
         Exqlite.Sqlite3.prepare(
@@ -918,7 +1314,14 @@ defmodule TimelessTraces.Index do
           end
         end)
 
-      delete_blocks(db, to_delete, storage)
+      block_ids = Enum.map(to_delete, fn {id, _fp} -> id end)
+
+      # Collect terms/traces BEFORE deleting from SQLite
+      old_terms = collect_terms_for_blocks(db, block_ids)
+      old_traces = collect_traces_for_blocks(db, block_ids)
+
+      count = delete_blocks(db, to_delete, storage)
+      {count, block_ids, old_terms, old_traces}
     end
   end
 
@@ -973,36 +1376,6 @@ defmodule TimelessTraces.Index do
     {term_filters, time_filters}
   end
 
-  defp find_matching_blocks(db, term_filters, time_filters, order) do
-    terms = build_query_terms(term_filters)
-
-    {where_clauses, params} = build_where(terms, time_filters)
-
-    order_dir = if order == :asc, do: "ASC", else: "DESC"
-
-    sql =
-      if where_clauses == [] do
-        "SELECT block_id, file_path, format FROM blocks ORDER BY ts_min #{order_dir}"
-      else
-        """
-        SELECT DISTINCT b.block_id, b.file_path, b.format FROM blocks b
-        #{if terms != [], do: "JOIN block_terms bt ON b.block_id = bt.block_id", else: ""}
-        WHERE #{Enum.join(where_clauses, " AND ")}
-        ORDER BY b.ts_min #{order_dir}
-        """
-      end
-
-    {:ok, stmt} = Exqlite.Sqlite3.prepare(db, sql)
-
-    if params != [] do
-      Exqlite.Sqlite3.bind(stmt, params)
-    end
-
-    rows = collect_rows_3(db, stmt)
-    Exqlite.Sqlite3.release(db, stmt)
-    rows
-  end
-
   defp build_query_terms(term_filters) do
     Enum.flat_map(term_filters, fn
       {:name, name} -> ["name:#{name}"]
@@ -1014,32 +1387,6 @@ defmodule TimelessTraces.Index do
     end)
   end
 
-  defp build_where(terms, time_filters) do
-    {term_clauses, term_params} =
-      case terms do
-        [] ->
-          {[], []}
-
-        terms ->
-          placeholders = Enum.map_join(1..length(terms), ", ", &"?#{&1}")
-          {["bt.term IN (#{placeholders})"], terms}
-      end
-
-    {time_clauses, time_params} =
-      time_filters
-      |> Enum.reduce({[], []}, fn
-        {:since, ts}, {clauses, params} ->
-          idx = length(term_params) + length(params) + 1
-          {["b.ts_max >= ?#{idx}" | clauses], params ++ [to_nanos(ts)]}
-
-        {:until, ts}, {clauses, params} ->
-          idx = length(term_params) + length(params) + 1
-          {["b.ts_min <= ?#{idx}" | clauses], params ++ [to_nanos(ts)]}
-      end)
-
-    {term_clauses ++ time_clauses, term_params ++ time_params}
-  end
-
   defp to_nanos(%DateTime{} = dt), do: DateTime.to_unix(dt, :nanosecond)
   defp to_nanos(ts) when is_integer(ts), do: ts
 
@@ -1049,36 +1396,7 @@ defmodule TimelessTraces.Index do
   defp to_format_atom(:zstd), do: :zstd
   defp to_format_atom(_), do: :zstd
 
-  # --- Service/operation discovery ---
-
-  defp do_distinct_services(db) do
-    {:ok, stmt} =
-      Exqlite.Sqlite3.prepare(db, """
-      SELECT DISTINCT substr(term, 14) FROM block_terms
-      WHERE term LIKE 'service.name:%'
-      ORDER BY substr(term, 14)
-      """)
-
-    services = collect_single_column(db, stmt)
-    Exqlite.Sqlite3.release(db, stmt)
-    {:ok, services}
-  end
-
-  defp do_distinct_operations(db, service) do
-    # Find blocks that contain this service, then get span names from those blocks
-    {:ok, stmt} =
-      Exqlite.Sqlite3.prepare(db, """
-      SELECT DISTINCT substr(bt2.term, 6) FROM block_terms bt1
-      JOIN block_terms bt2 ON bt1.block_id = bt2.block_id
-      WHERE bt1.term = ?1 AND bt2.term LIKE 'name:%'
-      ORDER BY substr(bt2.term, 6)
-      """)
-
-    Exqlite.Sqlite3.bind(stmt, ["service.name:#{service}"])
-    operations = collect_single_column(db, stmt)
-    Exqlite.Sqlite3.release(db, stmt)
-    {:ok, operations}
-  end
+  # --- Row collectors ---
 
   defp collect_single_column(db, stmt) do
     case Exqlite.Sqlite3.step(db, stmt) do
@@ -1087,22 +1405,10 @@ defmodule TimelessTraces.Index do
     end
   end
 
-  # --- Row collectors ---
-
   defp collect_rows_2(db, stmt) do
     case Exqlite.Sqlite3.step(db, stmt) do
       {:row, [block_id, file_path]} -> [{block_id, file_path} | collect_rows_2(db, stmt)]
       :done -> []
-    end
-  end
-
-  defp collect_rows_3(db, stmt) do
-    case Exqlite.Sqlite3.step(db, stmt) do
-      {:row, [block_id, file_path, format]} ->
-        [{block_id, file_path, format} | collect_rows_3(db, stmt)]
-
-      :done ->
-        []
     end
   end
 
