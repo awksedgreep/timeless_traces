@@ -33,7 +33,7 @@ defmodule TimelessTraces.MixProject do
       {:plug, "~> 1.16"},
       {:jason, "~> 1.4"},
       {:ex_doc, "~> 0.34", only: :dev, runtime: false},
-      {:ex_openzl, path: "../ex_openzl"}
+      {:ex_openzl, github: "awksedgreep/ex_openzl", ref: "25bcbf9", submodules: true}
     ]
   end
 
