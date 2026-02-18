@@ -124,11 +124,14 @@ defmodule TimelessTraces.Index do
        raw_entries: format_stats["raw"][:entries] || 0,
        zstd_blocks: format_stats["zstd"][:blocks] || 0,
        zstd_bytes: format_stats["zstd"][:bytes] || 0,
-       zstd_entries: format_stats["zstd"][:entries] || 0
+       zstd_entries: format_stats["zstd"][:entries] || 0,
+       openzl_blocks: format_stats["openzl"][:blocks] || 0,
+       openzl_bytes: format_stats["openzl"][:bytes] || 0,
+       openzl_entries: format_stats["openzl"][:entries] || 0
      }}
   end
 
-  @spec matching_block_ids(keyword()) :: [{integer(), String.t() | nil, :raw | :zstd}]
+  @spec matching_block_ids(keyword()) :: [{integer(), String.t() | nil, :raw | :zstd | :openzl}]
   def matching_block_ids(filters) do
     {search_filters, pagination} = split_pagination(filters)
     {term_filters, time_filters} = split_filters(search_filters)
@@ -1392,8 +1395,10 @@ defmodule TimelessTraces.Index do
 
   defp to_format_atom("raw"), do: :raw
   defp to_format_atom("zstd"), do: :zstd
+  defp to_format_atom("openzl"), do: :openzl
   defp to_format_atom(:raw), do: :raw
   defp to_format_atom(:zstd), do: :zstd
+  defp to_format_atom(:openzl), do: :openzl
   defp to_format_atom(_), do: :zstd
 
   # --- Row collectors ---

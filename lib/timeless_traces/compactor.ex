@@ -85,7 +85,11 @@ defmodule TimelessTraces.Compactor do
 
       write_target = if state.storage == :memory, do: :memory, else: state.data_dir
 
-      case TimelessTraces.Writer.write_block(sorted, write_target, :zstd) do
+      case TimelessTraces.Writer.write_block(
+             sorted,
+             write_target,
+             TimelessTraces.Config.compaction_format()
+           ) do
         {:ok, new_meta} ->
           old_ids = Enum.map(raw_blocks, &elem(&1, 0))
           TimelessTraces.Index.compact_blocks(old_ids, new_meta, sorted)

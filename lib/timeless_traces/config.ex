@@ -67,6 +67,11 @@ defmodule TimelessTraces.Config do
     Application.get_env(:timeless_traces, :compression_level, 6)
   end
 
+  @spec compaction_format() :: :zstd | :openzl
+  def compaction_format do
+    Application.get_env(:timeless_traces, :compaction_format, :openzl)
+  end
+
   @spec index_publish_interval() :: pos_integer()
   def index_publish_interval do
     Application.get_env(:timeless_traces, :index_publish_interval, 2_000)
