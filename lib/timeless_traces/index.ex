@@ -31,8 +31,7 @@ defmodule TimelessTraces.Index do
 
   @spec index_block_async(TimelessTraces.Writer.block_meta(), [map()]) :: :ok
   def index_block_async(block_meta, entries) do
-    {terms, trace_rows} = precompute(entries)
-    GenServer.cast(__MODULE__, {:index_block, block_meta, terms, trace_rows})
+    GenServer.cast(__MODULE__, {:index_block_raw, block_meta, entries})
   end
 
   # --- Lock-free read functions (run in caller's process) ---
@@ -284,9 +283,67 @@ defmodule TimelessTraces.Index do
   @doc false
   @spec precompute([map()]) :: {[String.t()], [tuple()]}
   def precompute(entries) do
-    terms = extract_terms(entries)
-    trace_rows = compute_trace_rows(entries)
+    {terms_set, traces_map} =
+      Enum.reduce(entries, {MapSet.new(), %{}}, fn span, {terms_acc, traces_acc} ->
+        span_terms = extract_span_terms(span)
+        new_terms = Enum.reduce(span_terms, terms_acc, &MapSet.put(&2, &1))
+
+        new_traces =
+          Map.update(traces_acc, span.trace_id, [span], fn spans -> [span | spans] end)
+
+        {new_terms, new_traces}
+      end)
+
+    terms = MapSet.to_list(terms_set)
+
+    trace_rows =
+      Enum.map(traces_map, fn {trace_id, spans} ->
+        root = Enum.find(spans, fn s -> s.parent_span_id == nil end) || hd(spans)
+        has_error = if Enum.any?(spans, fn s -> s.status == :error end), do: 1, else: 0
+
+        {min_start, max_end, count} =
+          Enum.reduce(spans, {nil, nil, 0}, fn s, {mn, mx, c} ->
+            {
+              if(mn == nil or s.start_time < mn, do: s.start_time, else: mn),
+              if(mx == nil or s.end_time > mx, do: s.end_time, else: mx),
+              c + 1
+            }
+          end)
+
+        duration_ns = max_end - min_start
+        {trace_id, count, to_string(root.name), duration_ns, has_error}
+      end)
+
     {terms, trace_rows}
+  end
+
+  defp extract_span_terms(span) do
+    base_terms = [
+      "name:#{span.name}",
+      "kind:#{span.kind}",
+      "status:#{span.status}"
+    ]
+
+    service_term =
+      case Map.get(span.attributes, "service.name") ||
+             Map.get(span.resource || %{}, "service.name") do
+        nil -> []
+        svc -> ["service.name:#{svc}"]
+      end
+
+    attr_terms =
+      (span.attributes || %{})
+      |> Enum.flat_map(fn
+        {"http.method", v} -> ["http.method:#{v}"]
+        {"http.status_code", v} -> ["http.status_code:#{v}"]
+        {"http.route", v} -> ["http.route:#{v}"]
+        {"db.system", v} -> ["db.system:#{v}"]
+        {"rpc.system", v} -> ["rpc.system:#{v}"]
+        {"messaging.system", v} -> ["messaging.system:#{v}"]
+        _ -> []
+      end)
+
+    base_terms ++ service_term ++ attr_terms
   end
 
   # --- GenServer callbacks ---
@@ -346,6 +403,8 @@ defmodule TimelessTraces.Index do
        block_insert_stmt: block_insert_stmt,
        terms_insert_stmt: terms_insert_stmt,
        trace_insert_stmt: trace_insert_stmt,
+       terms_stmt_cache: %{@terms_batch_size => terms_insert_stmt},
+       trace_stmt_cache: %{@trace_batch_size => trace_insert_stmt},
        publish_timer: publish_ref,
        publish_interval: publish_interval,
        dirty: false
@@ -354,11 +413,19 @@ defmodule TimelessTraces.Index do
 
   @impl true
   def terminate(_reason, state) do
-    flush_pending(state)
+    state = flush_pending(state)
 
     Exqlite.Sqlite3.release(state.db, state.block_insert_stmt)
-    Exqlite.Sqlite3.release(state.db, state.terms_insert_stmt)
-    Exqlite.Sqlite3.release(state.db, state.trace_insert_stmt)
+
+    # Release all cached statements (terms and trace caches include the main stmts)
+    for {_n, stmt} <- state.terms_stmt_cache do
+      Exqlite.Sqlite3.release(state.db, stmt)
+    end
+
+    for {_n, stmt} <- state.trace_stmt_cache do
+      Exqlite.Sqlite3.release(state.db, stmt)
+    end
+
     Exqlite.Sqlite3.close(state.db)
 
     # Clean up persistent_term keys
@@ -378,6 +445,7 @@ defmodule TimelessTraces.Index do
   def handle_call({:index_block, meta, terms, trace_rows}, _from, state) do
     state = flush_pending(state)
     result = do_index_block(state, meta, terms, trace_rows)
+    state = collect_stmt_cache(state)
     # Update cache after SQLite commit
     insert_block_ets(meta)
     insert_overflow(terms, trace_rows, meta.block_id)
@@ -418,6 +486,7 @@ defmodule TimelessTraces.Index do
     old_traces = collect_traces_for_blocks(state.db, old_ids)
 
     result = do_compact_blocks(state, old_ids, new_meta, terms, trace_rows)
+    state = collect_stmt_cache(state)
 
     # Update cache: remove old, add new
     for id <- old_ids, do: :ets.delete(@blocks_table, id)
@@ -457,6 +526,12 @@ defmodule TimelessTraces.Index do
   @impl true
   def handle_cast({:index_block, meta, terms, trace_rows}, state) do
     pending = [{meta, terms, trace_rows} | state.pending]
+    state = schedule_index_flush(%{state | pending: pending})
+    {:noreply, state}
+  end
+
+  def handle_cast({:index_block_raw, meta, entries}, state) do
+    pending = [{:raw, meta, entries} | state.pending]
     state = schedule_index_flush(%{state | pending: pending})
     {:noreply, state}
   end
@@ -608,12 +683,16 @@ defmodule TimelessTraces.Index do
   end
 
   defp insert_overflow(terms, trace_rows, block_id) do
-    for term <- terms do
-      :ets.insert(@overflow_table, {:term, term, block_id})
+    if terms != [] do
+      term_objects = Enum.map(terms, fn term -> {:term, term, block_id} end)
+      :ets.insert(@overflow_table, term_objects)
     end
 
-    for {trace_id, _count, _root_name, _dur, _err} <- trace_rows do
-      :ets.insert(@overflow_table, {:trace, trace_id, block_id})
+    if trace_rows != [] do
+      trace_objects =
+        Enum.map(trace_rows, fn {trace_id, _, _, _, _} -> {:trace, trace_id, block_id} end)
+
+      :ets.insert(@overflow_table, trace_objects)
     end
   end
 
@@ -815,16 +894,29 @@ defmodule TimelessTraces.Index do
   defp flush_pending(%{pending: []} = state), do: state
 
   defp flush_pending(%{pending: pending} = state) do
+    # Precompute any raw entries
+    resolved =
+      pending
+      |> Enum.reverse()
+      |> Enum.map(fn
+        {:raw, meta, entries} ->
+          {terms, trace_rows} = precompute(entries)
+          {meta, terms, trace_rows}
+
+        {meta, terms, trace_rows} ->
+          {meta, terms, trace_rows}
+      end)
+
     Exqlite.Sqlite3.execute(state.db, "BEGIN")
 
-    for {meta, terms, trace_rows} <- Enum.reverse(pending) do
+    for {meta, terms, trace_rows} <- resolved do
       insert_block_data(state, meta, terms, trace_rows)
     end
 
     Exqlite.Sqlite3.execute(state.db, "COMMIT")
 
     # Update ETS + overflow for all flushed entries
-    for {meta, terms, trace_rows} <- Enum.reverse(pending) do
+    for {meta, terms, trace_rows} <- resolved do
       insert_block_ets(meta)
       insert_overflow(terms, trace_rows, meta.block_id)
     end
@@ -833,7 +925,28 @@ defmodule TimelessTraces.Index do
       Process.cancel_timer(state.flush_timer)
     end
 
+    state = collect_stmt_cache(state)
     %{state | pending: [], flush_timer: nil, dirty: true}
+  end
+
+  defp collect_stmt_cache(state) do
+    # Merge any newly created prepared statements from process dictionary into state
+    {new_terms, new_traces} =
+      Process.get_keys()
+      |> Enum.reduce({state.terms_stmt_cache, state.trace_stmt_cache}, fn
+        {:terms_stmt_cache, n}, {tc, trc} ->
+          stmt = Process.delete({:terms_stmt_cache, n})
+          {Map.put_new(tc, n, stmt), trc}
+
+        {:trace_stmt_cache, n}, {tc, trc} ->
+          stmt = Process.delete({:trace_stmt_cache, n})
+          {tc, Map.put_new(trc, n, stmt)}
+
+        _, acc ->
+          acc
+      end)
+
+    %{state | terms_stmt_cache: new_terms, trace_stmt_cache: new_traces}
   end
 
   defp schedule_index_flush(%{flush_timer: nil} = state) do
@@ -938,18 +1051,10 @@ defmodule TimelessTraces.Index do
     |> Enum.each(fn batch ->
       n = length(batch)
       params = Enum.flat_map(batch, fn term -> [term, block_id] end)
-
-      if n == @terms_batch_size do
-        Exqlite.Sqlite3.bind(state.terms_insert_stmt, params)
-        Exqlite.Sqlite3.step(db, state.terms_insert_stmt)
-        Exqlite.Sqlite3.reset(state.terms_insert_stmt)
-      else
-        sql = build_terms_sql(n)
-        {:ok, stmt} = Exqlite.Sqlite3.prepare(db, sql)
-        Exqlite.Sqlite3.bind(stmt, params)
-        Exqlite.Sqlite3.step(db, stmt)
-        Exqlite.Sqlite3.release(db, stmt)
-      end
+      stmt = get_or_cache_terms_stmt(state, n)
+      Exqlite.Sqlite3.bind(stmt, params)
+      Exqlite.Sqlite3.step(db, stmt)
+      Exqlite.Sqlite3.reset(stmt)
     end)
   end
 
@@ -968,73 +1073,39 @@ defmodule TimelessTraces.Index do
           [trace_id, block_id, count, root_name, dur, err]
         end)
 
-      if n == @trace_batch_size do
-        Exqlite.Sqlite3.bind(state.trace_insert_stmt, params)
-        Exqlite.Sqlite3.step(db, state.trace_insert_stmt)
-        Exqlite.Sqlite3.reset(state.trace_insert_stmt)
-      else
-        sql = build_trace_sql(n)
-        {:ok, stmt} = Exqlite.Sqlite3.prepare(db, sql)
-        Exqlite.Sqlite3.bind(stmt, params)
-        Exqlite.Sqlite3.step(db, stmt)
-        Exqlite.Sqlite3.release(db, stmt)
-      end
+      stmt = get_or_cache_trace_stmt(state, n)
+      Exqlite.Sqlite3.bind(stmt, params)
+      Exqlite.Sqlite3.step(db, stmt)
+      Exqlite.Sqlite3.reset(stmt)
     end)
   end
 
-  defp extract_terms(entries) do
-    entries
-    |> Enum.flat_map(fn span ->
-      base_terms = [
-        "name:#{span.name}",
-        "kind:#{span.kind}",
-        "status:#{span.status}"
-      ]
+  defp get_or_cache_terms_stmt(state, n) do
+    case Map.get(state.terms_stmt_cache, n) do
+      nil ->
+        {:ok, stmt} = Exqlite.Sqlite3.prepare(state.db, build_terms_sql(n))
+        # Store in process dictionary for this flush cycle; will be added to state
+        # via the caller updating state after flush_pending
+        Process.put({:terms_stmt_cache, n}, stmt)
+        stmt
 
-      service_term =
-        case Map.get(span.attributes, "service.name") ||
-               Map.get(span.resource || %{}, "service.name") do
-          nil -> []
-          svc -> ["service.name:#{svc}"]
-        end
-
-      attr_terms =
-        (span.attributes || %{})
-        |> Enum.flat_map(fn
-          {"http.method", v} -> ["http.method:#{v}"]
-          {"http.status_code", v} -> ["http.status_code:#{v}"]
-          {"http.route", v} -> ["http.route:#{v}"]
-          {"db.system", v} -> ["db.system:#{v}"]
-          {"rpc.system", v} -> ["rpc.system:#{v}"]
-          {"messaging.system", v} -> ["messaging.system:#{v}"]
-          _ -> []
-        end)
-
-      base_terms ++ service_term ++ attr_terms
-    end)
-    |> Enum.uniq()
+      stmt ->
+        stmt
+    end
   end
 
-  defp compute_trace_rows(entries) do
-    by_trace = Enum.group_by(entries, & &1.trace_id)
+  defp get_or_cache_trace_stmt(state, n) do
+    case Map.get(state.trace_stmt_cache, n) do
+      nil ->
+        {:ok, stmt} = Exqlite.Sqlite3.prepare(state.db, build_trace_sql(n))
+        Process.put({:trace_stmt_cache, n}, stmt)
+        stmt
 
-    Enum.map(by_trace, fn {trace_id, spans} ->
-      root = Enum.find(spans, fn s -> s.parent_span_id == nil end) || hd(spans)
-      has_error = if Enum.any?(spans, fn s -> s.status == :error end), do: 1, else: 0
-
-      {min_start, max_end, count} =
-        Enum.reduce(spans, {nil, nil, 0}, fn s, {mn, mx, c} ->
-          {
-            if(mn == nil or s.start_time < mn, do: s.start_time, else: mn),
-            if(mx == nil or s.end_time > mx, do: s.end_time, else: mx),
-            c + 1
-          }
-        end)
-
-      duration_ns = max_end - min_start
-      {trace_id, count, to_string(root.name), duration_ns, has_error}
-    end)
+      stmt ->
+        stmt
+    end
   end
+
 
   defp build_terms_sql(n) do
     placeholders =
@@ -1224,43 +1295,52 @@ defmodule TimelessTraces.Index do
 
     old_file_paths =
       if storage == :disk do
-        Enum.flat_map(old_ids, fn id ->
-          {:ok, stmt} =
-            Exqlite.Sqlite3.prepare(db, "SELECT file_path FROM blocks WHERE block_id = ?1")
+        {:ok, fp_stmt} =
+          Exqlite.Sqlite3.prepare(db, "SELECT file_path FROM blocks WHERE block_id = ?1")
 
-          Exqlite.Sqlite3.bind(stmt, [id])
+        paths =
+          Enum.flat_map(old_ids, fn id ->
+            Exqlite.Sqlite3.bind(fp_stmt, [id])
 
-          result =
-            case Exqlite.Sqlite3.step(db, stmt) do
-              {:row, [path]} when is_binary(path) -> [path]
-              _ -> []
-            end
+            result =
+              case Exqlite.Sqlite3.step(db, fp_stmt) do
+                {:row, [path]} when is_binary(path) -> [path]
+                _ -> []
+              end
 
-          Exqlite.Sqlite3.release(db, stmt)
-          result
-        end)
+            Exqlite.Sqlite3.reset(fp_stmt)
+            result
+          end)
+
+        Exqlite.Sqlite3.release(db, fp_stmt)
+        paths
       else
         []
       end
 
     Exqlite.Sqlite3.execute(db, "BEGIN")
 
+    {:ok, del_terms} = Exqlite.Sqlite3.prepare(db, "DELETE FROM block_terms WHERE block_id = ?1")
+    {:ok, del_traces} = Exqlite.Sqlite3.prepare(db, "DELETE FROM trace_index WHERE block_id = ?1")
+    {:ok, del_blocks} = Exqlite.Sqlite3.prepare(db, "DELETE FROM blocks WHERE block_id = ?1")
+
     for id <- old_ids do
-      {:ok, stmt} = Exqlite.Sqlite3.prepare(db, "DELETE FROM block_terms WHERE block_id = ?1")
-      Exqlite.Sqlite3.bind(stmt, [id])
-      Exqlite.Sqlite3.step(db, stmt)
-      Exqlite.Sqlite3.release(db, stmt)
+      Exqlite.Sqlite3.bind(del_terms, [id])
+      Exqlite.Sqlite3.step(db, del_terms)
+      Exqlite.Sqlite3.reset(del_terms)
 
-      {:ok, stmt} = Exqlite.Sqlite3.prepare(db, "DELETE FROM trace_index WHERE block_id = ?1")
-      Exqlite.Sqlite3.bind(stmt, [id])
-      Exqlite.Sqlite3.step(db, stmt)
-      Exqlite.Sqlite3.release(db, stmt)
+      Exqlite.Sqlite3.bind(del_traces, [id])
+      Exqlite.Sqlite3.step(db, del_traces)
+      Exqlite.Sqlite3.reset(del_traces)
 
-      {:ok, stmt} = Exqlite.Sqlite3.prepare(db, "DELETE FROM blocks WHERE block_id = ?1")
-      Exqlite.Sqlite3.bind(stmt, [id])
-      Exqlite.Sqlite3.step(db, stmt)
-      Exqlite.Sqlite3.release(db, stmt)
+      Exqlite.Sqlite3.bind(del_blocks, [id])
+      Exqlite.Sqlite3.step(db, del_blocks)
+      Exqlite.Sqlite3.reset(del_blocks)
     end
+
+    Exqlite.Sqlite3.release(db, del_terms)
+    Exqlite.Sqlite3.release(db, del_traces)
+    Exqlite.Sqlite3.release(db, del_blocks)
 
     insert_block_data(state, new_meta, terms, trace_rows)
 
@@ -1333,26 +1413,31 @@ defmodule TimelessTraces.Index do
   defp delete_blocks(db, blocks, storage) do
     Exqlite.Sqlite3.execute(db, "BEGIN")
 
+    {:ok, del_terms} = Exqlite.Sqlite3.prepare(db, "DELETE FROM block_terms WHERE block_id = ?1")
+    {:ok, del_traces} = Exqlite.Sqlite3.prepare(db, "DELETE FROM trace_index WHERE block_id = ?1")
+    {:ok, del_blocks} = Exqlite.Sqlite3.prepare(db, "DELETE FROM blocks WHERE block_id = ?1")
+
     for {block_id, file_path} <- blocks do
-      {:ok, stmt} = Exqlite.Sqlite3.prepare(db, "DELETE FROM block_terms WHERE block_id = ?1")
-      Exqlite.Sqlite3.bind(stmt, [block_id])
-      Exqlite.Sqlite3.step(db, stmt)
-      Exqlite.Sqlite3.release(db, stmt)
+      Exqlite.Sqlite3.bind(del_terms, [block_id])
+      Exqlite.Sqlite3.step(db, del_terms)
+      Exqlite.Sqlite3.reset(del_terms)
 
-      {:ok, stmt} = Exqlite.Sqlite3.prepare(db, "DELETE FROM trace_index WHERE block_id = ?1")
-      Exqlite.Sqlite3.bind(stmt, [block_id])
-      Exqlite.Sqlite3.step(db, stmt)
-      Exqlite.Sqlite3.release(db, stmt)
+      Exqlite.Sqlite3.bind(del_traces, [block_id])
+      Exqlite.Sqlite3.step(db, del_traces)
+      Exqlite.Sqlite3.reset(del_traces)
 
-      {:ok, stmt} = Exqlite.Sqlite3.prepare(db, "DELETE FROM blocks WHERE block_id = ?1")
-      Exqlite.Sqlite3.bind(stmt, [block_id])
-      Exqlite.Sqlite3.step(db, stmt)
-      Exqlite.Sqlite3.release(db, stmt)
+      Exqlite.Sqlite3.bind(del_blocks, [block_id])
+      Exqlite.Sqlite3.step(db, del_blocks)
+      Exqlite.Sqlite3.reset(del_blocks)
 
       if storage == :disk do
         File.rm(file_path)
       end
     end
+
+    Exqlite.Sqlite3.release(db, del_terms)
+    Exqlite.Sqlite3.release(db, del_traces)
+    Exqlite.Sqlite3.release(db, del_blocks)
 
     Exqlite.Sqlite3.execute(db, "COMMIT")
     length(blocks)

@@ -4,7 +4,7 @@ defmodule TimelessTraces.MixProject do
   def project do
     [
       app: :timeless_traces,
-      version: "0.4.1",
+      version: "0.5.0",
       elixir: "~> 1.18",
       start_permanent: Mix.env() == :prod,
       deps: deps(),

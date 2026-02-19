@@ -17,6 +17,7 @@ defmodule TimelessTraces.Application do
       [
         {Registry, keys: :duplicate, name: TimelessTraces.Registry},
         {TimelessTraces.Index, data_dir: data_dir, storage: storage},
+        {Task.Supervisor, name: TimelessTraces.FlushSupervisor},
         {TimelessTraces.Buffer, data_dir: data_dir},
         {TimelessTraces.Compactor, data_dir: data_dir, storage: storage},
         {TimelessTraces.Retention, []}
