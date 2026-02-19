@@ -299,7 +299,19 @@ defmodule TimelessTraces.Writer do
         status_messages,
         rest_tuples
       ],
-      fn [st, et, dur, ki, sta, tid, sid, psid, nm, sm, {attributes, events, resource, instrumentation_scope}] ->
+      fn [
+           st,
+           et,
+           dur,
+           ki,
+           sta,
+           tid,
+           sid,
+           psid,
+           nm,
+           sm,
+           {attributes, events, resource, instrumentation_scope}
+         ] ->
         %{
           start_time: st,
           end_time: et,
