@@ -19,22 +19,22 @@ defmodule TimelessTraces.Index do
   @trace_batch_size 100
 
   @blocks_table :timeless_traces_blocks
-  @overflow_table :timeless_traces_index_overflow
+  @term_index_table :timeless_traces_term_index
+  @trace_index_table :timeless_traces_trace_index
 
   @spec start_link(keyword()) :: GenServer.on_start()
   def start_link(opts) do
     GenServer.start_link(__MODULE__, opts, name: __MODULE__)
   end
 
-  @spec index_block(TimelessTraces.Writer.block_meta(), [map()]) :: :ok
-  def index_block(block_meta, entries) do
-    {terms, trace_rows} = precompute(entries)
+  @spec index_block(TimelessTraces.Writer.block_meta(), [String.t()], [tuple()]) :: :ok
+  def index_block(block_meta, terms, trace_rows) do
     GenServer.call(__MODULE__, {:index_block, block_meta, terms, trace_rows})
   end
 
-  @spec index_block_async(TimelessTraces.Writer.block_meta(), [map()]) :: :ok
-  def index_block_async(block_meta, entries) do
-    GenServer.cast(__MODULE__, {:index_block_raw, block_meta, entries})
+  @spec index_block_async(TimelessTraces.Writer.block_meta(), [String.t()], [tuple()]) :: :ok
+  def index_block_async(block_meta, terms, trace_rows) do
+    GenServer.cast(__MODULE__, {:index_block, block_meta, terms, trace_rows})
   end
 
   # --- Lock-free read functions (run in caller's process) ---
@@ -182,27 +182,14 @@ defmodule TimelessTraces.Index do
 
   @spec distinct_services() :: {:ok, [String.t()]}
   def distinct_services do
-    term_index = :persistent_term.get({__MODULE__, :term_index})
-
-    pt_services =
-      term_index
-      |> Map.keys()
-      |> Enum.flat_map(fn
-        "service.name:" <> svc -> [svc]
-        _ -> []
-      end)
-
-    overflow_services =
-      @overflow_table
-      |> :ets.match({:term, :"$1", :_})
+    services =
+      @term_index_table
+      |> :ets.match({:"$1", :_})
       |> List.flatten()
       |> Enum.flat_map(fn
         "service.name:" <> svc -> [svc]
         _ -> []
       end)
-
-    services =
-      (pt_services ++ overflow_services)
       |> Enum.uniq()
       |> Enum.sort()
 
@@ -213,21 +200,9 @@ defmodule TimelessTraces.Index do
   def distinct_operations(service) do
     service_bids = term_block_ids("service.name:#{service}")
 
-    term_index = :persistent_term.get({__MODULE__, :term_index})
-
-    pt_ops =
-      term_index
-      |> Enum.flat_map(fn
-        {"name:" <> name, bids} ->
-          if MapSet.size(MapSet.intersection(bids, service_bids)) > 0, do: [name], else: []
-
-        _ ->
-          []
-      end)
-
-    overflow_name_entries =
-      @overflow_table
-      |> :ets.match({:term, :"$1", :"$2"})
+    operations =
+      @term_index_table
+      |> :ets.match({:"$1", :"$2"})
       |> Enum.flat_map(fn
         ["name:" <> name, bid] ->
           if MapSet.member?(service_bids, bid), do: [name], else: []
@@ -235,9 +210,6 @@ defmodule TimelessTraces.Index do
         _ ->
           []
       end)
-
-    operations =
-      (pt_ops ++ overflow_name_entries)
       |> Enum.uniq()
       |> Enum.sort()
 
@@ -387,14 +359,10 @@ defmodule TimelessTraces.Index do
     :persistent_term.put({__MODULE__, :storage}, storage)
     :persistent_term.put({__MODULE__, :db_path}, db_path)
 
-    # Bulk-load from SQLite into ETS/persistent_term
+    # Bulk-load from SQLite into ETS
     bulk_load_blocks(db)
     bulk_load_term_index(db)
     bulk_load_trace_index(db)
-
-    # Schedule publish timer
-    publish_interval = TimelessTraces.Config.index_publish_interval()
-    publish_ref = Process.send_after(self(), :publish, publish_interval)
 
     {:ok,
      %{
@@ -409,10 +377,7 @@ defmodule TimelessTraces.Index do
        terms_insert_stmt: terms_insert_stmt,
        trace_insert_stmt: trace_insert_stmt,
        terms_stmt_cache: %{@terms_batch_size => terms_insert_stmt},
-       trace_stmt_cache: %{@trace_batch_size => trace_insert_stmt},
-       publish_timer: publish_ref,
-       publish_interval: publish_interval,
-       dirty: false
+       trace_stmt_cache: %{@trace_batch_size => trace_insert_stmt}
      }}
   end
 
@@ -434,15 +399,14 @@ defmodule TimelessTraces.Index do
 
     Exqlite.Sqlite3.close(state.db)
 
-    # Clean up persistent_term keys
+    # Clean up persistent_term keys (write-once config only)
     :persistent_term.erase({__MODULE__, :storage})
     :persistent_term.erase({__MODULE__, :db_path})
-    :persistent_term.erase({__MODULE__, :term_index})
-    :persistent_term.erase({__MODULE__, :trace_index})
 
     # Clean up ETS tables
     safe_delete_ets(@blocks_table)
-    safe_delete_ets(@overflow_table)
+    safe_delete_ets(@term_index_table)
+    safe_delete_ets(@trace_index_table)
   end
 
   # --- handle_call (grouped) ---
@@ -453,10 +417,10 @@ defmodule TimelessTraces.Index do
     state = flush_sqlite(state)
     result = do_index_block(state, meta, terms, trace_rows)
     state = collect_stmt_cache(state)
-    # Update cache after SQLite commit
+    # Update ETS index directly
     insert_block_ets(meta)
-    insert_overflow(terms, trace_rows, meta.block_id)
-    {:reply, result, %{state | dirty: true}}
+    insert_index_entries(terms, trace_rows, meta.block_id)
+    {:reply, result, state}
   end
 
   def handle_call({:delete_before, cutoff}, _from, state) do
@@ -467,7 +431,7 @@ defmodule TimelessTraces.Index do
       do_delete_before(state.db, cutoff, state.storage)
 
     remove_blocks_from_cache(deleted_ids, old_terms, old_traces)
-    {:reply, count, %{state | dirty: false}}
+    {:reply, count, state}
   end
 
   def handle_call({:delete_over_size, max_bytes}, _from, state) do
@@ -478,7 +442,7 @@ defmodule TimelessTraces.Index do
       do_delete_over_size(state.db, max_bytes, state.storage)
 
     remove_blocks_from_cache(deleted_ids, old_terms, old_traces)
-    {:reply, count, %{state | dirty: false}}
+    {:reply, count, state}
   end
 
   def handle_call({:read_block_data, block_id}, _from, state) do
@@ -501,16 +465,12 @@ defmodule TimelessTraces.Index do
 
     # Update cache: remove old, add new
     for id <- old_ids, do: :ets.delete(@blocks_table, id)
-    remove_block_ids_from_persistent_term(old_ids, old_terms, old_traces)
-    clear_overflow_for_blocks(old_ids)
+    remove_block_ids_from_index(old_ids, old_terms, old_traces)
 
     insert_block_ets(new_meta)
-    insert_overflow(terms, trace_rows, new_meta.block_id)
+    insert_index_entries(terms, trace_rows, new_meta.block_id)
 
-    # Force immediate publish since compaction changes are significant
-    publish_overflow(state)
-
-    {:reply, result, %{state | dirty: false}}
+    {:reply, result, state}
   end
 
   def handle_call({:backup, target_path}, _from, state) do
@@ -530,8 +490,7 @@ defmodule TimelessTraces.Index do
   def handle_call(:sync, _from, state) do
     state = flush_pending(state)
     state = flush_sqlite(state)
-    publish_overflow(state)
-    {:reply, :ok, %{state | dirty: false}}
+    {:reply, :ok, state}
   end
 
   # --- handle_cast ---
@@ -539,12 +498,6 @@ defmodule TimelessTraces.Index do
   @impl true
   def handle_cast({:index_block, meta, terms, trace_rows}, state) do
     pending = [{meta, terms, trace_rows} | state.pending]
-    state = schedule_index_flush(%{state | pending: pending})
-    {:noreply, state}
-  end
-
-  def handle_cast({:index_block_raw, meta, entries}, state) do
-    pending = [{:raw, meta, entries} | state.pending]
     state = schedule_index_flush(%{state | pending: pending})
     {:noreply, state}
   end
@@ -564,37 +517,36 @@ defmodule TimelessTraces.Index do
     {:noreply, state}
   end
 
-  def handle_info(:publish, state) do
-    if state.dirty do
-      publish_overflow(state)
-    end
-
-    ref = Process.send_after(self(), :publish, state.publish_interval)
-    {:noreply, %{state | publish_timer: ref, dirty: false}}
-  end
-
-  # --- ETS/persistent_term initialization ---
+  # --- ETS initialization ---
 
   defp init_ets_tables do
     safe_delete_ets(@blocks_table)
-    safe_delete_ets(@overflow_table)
+    safe_delete_ets(@term_index_table)
+    safe_delete_ets(@trace_index_table)
 
     :ets.new(@blocks_table, [
       :named_table,
       :ordered_set,
       :public,
-      read_concurrency: true
+      read_concurrency: true,
+      write_concurrency: true
     ])
 
-    :ets.new(@overflow_table, [
+    :ets.new(@term_index_table, [
       :named_table,
-      :duplicate_bag,
+      :bag,
       :public,
-      read_concurrency: true
+      read_concurrency: true,
+      write_concurrency: true
     ])
 
-    :persistent_term.put({__MODULE__, :term_index}, %{})
-    :persistent_term.put({__MODULE__, :trace_index}, %{})
+    :ets.new(@trace_index_table, [
+      :named_table,
+      :bag,
+      :public,
+      read_concurrency: true,
+      write_concurrency: true
+    ])
   end
 
   defp safe_delete_ets(table) do
@@ -643,21 +595,18 @@ defmodule TimelessTraces.Index do
     {:ok, stmt} =
       Exqlite.Sqlite3.prepare(db, "SELECT term, block_id FROM block_terms")
 
-    term_map = bulk_load_term_rows(db, stmt, %{})
+    bulk_load_term_rows(db, stmt)
     Exqlite.Sqlite3.release(db, stmt)
-    :persistent_term.put({__MODULE__, :term_index}, term_map)
   end
 
-  defp bulk_load_term_rows(db, stmt, acc) do
+  defp bulk_load_term_rows(db, stmt) do
     case Exqlite.Sqlite3.step(db, stmt) do
       {:row, [term, block_id]} ->
-        updated =
-          Map.update(acc, term, MapSet.new([block_id]), &MapSet.put(&1, block_id))
-
-        bulk_load_term_rows(db, stmt, updated)
+        :ets.insert(@term_index_table, {term, block_id})
+        bulk_load_term_rows(db, stmt)
 
       :done ->
-        acc
+        :ok
     end
   end
 
@@ -665,21 +614,18 @@ defmodule TimelessTraces.Index do
     {:ok, stmt} =
       Exqlite.Sqlite3.prepare(db, "SELECT trace_id, block_id FROM trace_index")
 
-    trace_map = bulk_load_trace_rows(db, stmt, %{})
+    bulk_load_trace_rows(db, stmt)
     Exqlite.Sqlite3.release(db, stmt)
-    :persistent_term.put({__MODULE__, :trace_index}, trace_map)
   end
 
-  defp bulk_load_trace_rows(db, stmt, acc) do
+  defp bulk_load_trace_rows(db, stmt) do
     case Exqlite.Sqlite3.step(db, stmt) do
       {:row, [trace_id, block_id]} ->
-        updated =
-          Map.update(acc, trace_id, MapSet.new([block_id]), &MapSet.put(&1, block_id))
-
-        bulk_load_trace_rows(db, stmt, updated)
+        :ets.insert(@trace_index_table, {trace_id, block_id})
+        bulk_load_trace_rows(db, stmt)
 
       :done ->
-        acc
+        :ok
     end
   end
 
@@ -701,44 +647,34 @@ defmodule TimelessTraces.Index do
     })
   end
 
-  defp insert_overflow(terms, trace_rows, block_id) do
+  defp insert_index_entries(terms, trace_rows, block_id) do
     if terms != [] do
-      term_objects = Enum.map(terms, fn term -> {:term, term, block_id} end)
-      :ets.insert(@overflow_table, term_objects)
+      term_objects = Enum.map(terms, fn term -> {term, block_id} end)
+      :ets.insert(@term_index_table, term_objects)
     end
 
     if trace_rows != [] do
       trace_objects =
-        Enum.map(trace_rows, fn {trace_id, _, _, _, _} -> {:trace, trace_id, block_id} end)
+        Enum.map(trace_rows, fn {trace_id, _, _, _, _} -> {trace_id, block_id} end)
 
-      :ets.insert(@overflow_table, trace_objects)
+      :ets.insert(@trace_index_table, trace_objects)
     end
   end
 
   # --- Lock-free read helpers ---
 
   defp term_block_ids(term) do
-    pt_set = Map.get(:persistent_term.get({__MODULE__, :term_index}), term, MapSet.new())
-
-    overflow_ids =
-      @overflow_table
-      |> :ets.match({:term, term, :"$1"})
-      |> List.flatten()
-      |> MapSet.new()
-
-    MapSet.union(pt_set, overflow_ids)
+    @term_index_table
+    |> :ets.lookup(term)
+    |> Enum.map(fn {_term, bid} -> bid end)
+    |> MapSet.new()
   end
 
   defp trace_block_ids(trace_id) do
-    pt_set = Map.get(:persistent_term.get({__MODULE__, :trace_index}), trace_id, MapSet.new())
-
-    overflow_ids =
-      @overflow_table
-      |> :ets.match({:trace, trace_id, :"$1"})
-      |> List.flatten()
-      |> MapSet.new()
-
-    MapSet.union(pt_set, overflow_ids)
+    @trace_index_table
+    |> :ets.lookup(trace_id)
+    |> Enum.map(fn {_trace_id, bid} -> bid end)
+    |> MapSet.new()
   end
 
   defp find_matching_blocks_ets(term_filters, time_filters, order) do
@@ -784,30 +720,6 @@ defmodule TimelessTraces.Index do
     filtered
   end
 
-  # --- Publish: merge overflow into persistent_term ---
-
-  defp publish_overflow(_state) do
-    overflow_entries = :ets.tab2list(@overflow_table)
-
-    if overflow_entries != [] do
-      term_index = :persistent_term.get({__MODULE__, :term_index})
-      trace_index = :persistent_term.get({__MODULE__, :trace_index})
-
-      {new_term_index, new_trace_index} =
-        Enum.reduce(overflow_entries, {term_index, trace_index}, fn
-          {:term, term, block_id}, {ti, tri} ->
-            {Map.update(ti, term, MapSet.new([block_id]), &MapSet.put(&1, block_id)), tri}
-
-          {:trace, trace_id, block_id}, {ti, tri} ->
-            {ti, Map.update(tri, trace_id, MapSet.new([block_id]), &MapSet.put(&1, block_id))}
-        end)
-
-      :persistent_term.put({__MODULE__, :term_index}, new_term_index)
-      :persistent_term.put({__MODULE__, :trace_index}, new_trace_index)
-      :ets.delete_all_objects(@overflow_table)
-    end
-  end
-
   # --- Cache cleanup helpers ---
 
   defp collect_terms_for_blocks(db, block_ids) do
@@ -834,77 +746,20 @@ defmodule TimelessTraces.Index do
     end)
   end
 
-  defp remove_block_ids_from_persistent_term(old_ids, old_terms, old_traces) do
-    old_id_set = MapSet.new(old_ids)
+  defp remove_block_ids_from_index(_old_ids, old_terms, old_traces) do
+    for {term, block_id} <- old_terms do
+      :ets.delete_object(@term_index_table, {term, block_id})
+    end
 
-    # Update term index
-    term_index = :persistent_term.get({__MODULE__, :term_index})
-
-    new_term_index =
-      old_terms
-      |> Enum.map(fn {term, _id} -> term end)
-      |> Enum.uniq()
-      |> Enum.reduce(term_index, fn term, acc ->
-        case Map.get(acc, term) do
-          nil ->
-            acc
-
-          bids ->
-            cleaned = MapSet.difference(bids, old_id_set)
-
-            if MapSet.size(cleaned) == 0 do
-              Map.delete(acc, term)
-            else
-              Map.put(acc, term, cleaned)
-            end
-        end
-      end)
-
-    :persistent_term.put({__MODULE__, :term_index}, new_term_index)
-
-    # Update trace index
-    trace_index = :persistent_term.get({__MODULE__, :trace_index})
-
-    new_trace_index =
-      old_traces
-      |> Enum.map(fn {trace_id, _id} -> trace_id end)
-      |> Enum.uniq()
-      |> Enum.reduce(trace_index, fn trace_id, acc ->
-        case Map.get(acc, trace_id) do
-          nil ->
-            acc
-
-          bids ->
-            cleaned = MapSet.difference(bids, old_id_set)
-
-            if MapSet.size(cleaned) == 0 do
-              Map.delete(acc, trace_id)
-            else
-              Map.put(acc, trace_id, cleaned)
-            end
-        end
-      end)
-
-    :persistent_term.put({__MODULE__, :trace_index}, new_trace_index)
-  end
-
-  defp clear_overflow_for_blocks(old_ids) do
-    old_id_set = MapSet.new(old_ids)
-
-    @overflow_table
-    |> :ets.tab2list()
-    |> Enum.each(fn {_type, _key, bid} = entry ->
-      if MapSet.member?(old_id_set, bid) do
-        :ets.delete_object(@overflow_table, entry)
-      end
-    end)
+    for {trace_id, block_id} <- old_traces do
+      :ets.delete_object(@trace_index_table, {trace_id, block_id})
+    end
   end
 
   defp remove_blocks_from_cache(deleted_ids, old_terms, old_traces) do
     if deleted_ids != [] do
       for id <- deleted_ids, do: :ets.delete(@blocks_table, id)
-      remove_block_ids_from_persistent_term(deleted_ids, old_terms, old_traces)
-      clear_overflow_for_blocks(deleted_ids)
+      remove_block_ids_from_index(deleted_ids, old_terms, old_traces)
     end
   end
 
@@ -913,23 +768,12 @@ defmodule TimelessTraces.Index do
   defp flush_pending(%{pending: []} = state), do: state
 
   defp flush_pending(%{pending: pending} = state) do
-    # Precompute any raw entries
-    resolved =
-      pending
-      |> Enum.reverse()
-      |> Enum.map(fn
-        {:raw, meta, entries} ->
-          {terms, trace_rows} = precompute(entries)
-          {meta, terms, trace_rows}
+    items = Enum.reverse(pending)
 
-        {meta, terms, trace_rows} ->
-          {meta, terms, trace_rows}
-      end)
-
-    # Update ETS + overflow immediately (data becomes queryable now)
-    for {meta, terms, trace_rows} <- resolved do
+    # Update ETS index directly (data becomes queryable now)
+    for {meta, terms, trace_rows} <- items do
       insert_block_ets(meta)
-      insert_overflow(terms, trace_rows, meta.block_id)
+      insert_index_entries(terms, trace_rows, meta.block_id)
     end
 
     if state.flush_timer do
@@ -937,8 +781,8 @@ defmodule TimelessTraces.Index do
     end
 
     # Queue SQLite persistence for background flush
-    state = schedule_sqlite_flush(%{state | sqlite_pending: resolved ++ state.sqlite_pending})
-    %{state | pending: [], flush_timer: nil, dirty: true}
+    state = schedule_sqlite_flush(%{state | sqlite_pending: items ++ state.sqlite_pending})
+    %{state | pending: [], flush_timer: nil}
   end
 
   defp flush_sqlite(%{sqlite_pending: []} = state), do: state

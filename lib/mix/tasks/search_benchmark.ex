@@ -141,7 +141,9 @@ defmodule Mix.Tasks.TimelessTraces.SearchBenchmark do
     |> Enum.chunk_every(1000)
     |> Enum.each(fn chunk ->
       case TimelessTraces.Writer.write_block(chunk, data_dir, :raw) do
-        {:ok, meta} -> TimelessTraces.Index.index_block(meta, chunk)
+        {:ok, meta} ->
+          {terms, trace_rows} = TimelessTraces.Index.precompute(chunk)
+          TimelessTraces.Index.index_block(meta, terms, trace_rows)
         _ -> :ok
       end
     end)

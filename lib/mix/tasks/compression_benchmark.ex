@@ -106,7 +106,8 @@ defmodule Mix.Tasks.TimelessTraces.CompressionBenchmark do
         # Write and index blocks in this format
         for chunk <- blocks do
           {:ok, meta} = TimelessTraces.Writer.write_block(chunk, data_dir, format)
-          TimelessTraces.Index.index_block(meta, chunk)
+          {terms, trace_rows} = TimelessTraces.Index.precompute(chunk)
+          TimelessTraces.Index.index_block(meta, terms, trace_rows)
         end
 
         IO.puts("--- #{format} queries (#{block_count} blocks on disk) ---")

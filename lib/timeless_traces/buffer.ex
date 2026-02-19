@@ -111,10 +111,12 @@ defmodule TimelessTraces.Buffer do
 
     case TimelessTraces.Writer.write_block(entries, write_target, :raw) do
       {:ok, block_meta} ->
+        {terms, trace_rows} = TimelessTraces.Index.precompute(entries)
+
         if Keyword.get(opts, :sync, false) do
-          TimelessTraces.Index.index_block(block_meta, entries)
+          TimelessTraces.Index.index_block(block_meta, terms, trace_rows)
         else
-          TimelessTraces.Index.index_block_async(block_meta, entries)
+          TimelessTraces.Index.index_block_async(block_meta, terms, trace_rows)
         end
 
         duration = System.monotonic_time() - start_time
