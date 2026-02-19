@@ -173,11 +173,11 @@ defmodule TimelessTraces.Writer do
 
   defp columnar_serialize(entries) do
     {start_times, end_times, durations, kinds, statuses, trace_ids, span_ids, parent_span_ids,
-     names, status_messages, rest_blobs} =
+     names, status_messages, rest_tuples} =
       Enum.reduce(
         entries,
         {[], [], [], [], [], [], [], [], [], [], []},
-        fn entry, {st, et, dur, ki, sta, tid, sid, psid, nm, sm, rb} ->
+        fn entry, {st, et, dur, ki, sta, tid, sid, psid, nm, sm, rt} ->
           start_time = entry.start_time
           end_time = entry.end_time
 
@@ -188,11 +188,9 @@ defmodule TimelessTraces.Writer do
           kind_u8 = Map.get(@kind_to_u8, entry.kind, 0)
           status_u8 = Map.get(@status_to_u8, entry.status, 2)
 
-          rest =
-            :erlang.term_to_binary(
-              {Map.get(entry, :attributes, %{}), Map.get(entry, :events, []),
-               Map.get(entry, :resource, %{}), Map.get(entry, :instrumentation_scope)}
-            )
+          rest_tuple =
+            {Map.get(entry, :attributes, %{}), Map.get(entry, :events, []),
+             Map.get(entry, :resource, %{}), Map.get(entry, :instrumentation_scope)}
 
           {
             [start_time | st],
@@ -205,7 +203,7 @@ defmodule TimelessTraces.Writer do
             [to_string(entry.parent_span_id || "") | psid],
             [to_string(entry.name) | nm],
             [to_string(entry.status_message || "") | sm],
-            [rest | rb]
+            [rest_tuple | rt]
           }
         end
       )
@@ -221,7 +219,10 @@ defmodule TimelessTraces.Writer do
     parent_span_ids = Enum.reverse(parent_span_ids)
     names = Enum.reverse(names)
     status_messages = Enum.reverse(status_messages)
-    rest_blobs = Enum.reverse(rest_blobs)
+
+    # Batch all rest tuples into a single term_to_binary call for atom sharing
+    rest_bin = :erlang.term_to_binary(Enum.reverse(rest_tuples))
+    rest_lengths = <<byte_size(rest_bin)::native-unsigned-32>>
 
     [
       {:numeric, pack_u64s(start_times), 8},
@@ -234,7 +235,7 @@ defmodule TimelessTraces.Writer do
       pack_string_column(parent_span_ids),
       pack_string_column(names),
       pack_string_column(status_messages),
-      pack_string_column(rest_blobs)
+      {:string, rest_bin, rest_lengths}
     ]
   end
 
@@ -280,7 +281,9 @@ defmodule TimelessTraces.Writer do
     parent_span_ids = split_strings(parent_span_id_out.data, parent_span_id_out.string_lengths)
     names = split_strings(name_out.data, name_out.string_lengths)
     status_messages = split_strings(status_message_out.data, status_message_out.string_lengths)
-    rest_blobs = split_strings(rest_blob_out.data, rest_blob_out.string_lengths)
+
+    # Detect batched vs legacy per-entry rest blob format
+    rest_tuples = deserialize_rest_blobs(rest_blob_out.data, rest_blob_out.string_lengths, n)
 
     Enum.zip_with(
       [
@@ -294,11 +297,9 @@ defmodule TimelessTraces.Writer do
         parent_span_ids,
         names,
         status_messages,
-        rest_blobs
+        rest_tuples
       ],
-      fn [st, et, dur, ki, sta, tid, sid, psid, nm, sm, rb] ->
-        {attributes, events, resource, instrumentation_scope} = :erlang.binary_to_term(rb)
-
+      fn [st, et, dur, ki, sta, tid, sid, psid, nm, sm, {attributes, events, resource, instrumentation_scope}] ->
         %{
           start_time: st,
           end_time: et,
@@ -317,6 +318,31 @@ defmodule TimelessTraces.Writer do
         }
       end
     )
+  end
+
+  # Batched format: single term_to_binary blob containing list of all rest tuples
+  defp deserialize_rest_blobs(data, lengths_bin, n) when is_binary(lengths_bin) do
+    lengths = for <<len::native-unsigned-32 <- lengths_bin>>, do: len
+
+    cond do
+      length(lengths) == 1 and n > 1 ->
+        # Batched format
+        :erlang.binary_to_term(data)
+
+      length(lengths) == 1 ->
+        # Single entry - could be either format
+        result = :erlang.binary_to_term(data)
+        if is_list(result), do: result, else: [result]
+
+      true ->
+        # Legacy per-entry format
+        {blobs, _} =
+          Enum.map_reduce(lengths, 0, fn len, offset ->
+            {binary_part(data, offset, len), offset + len}
+          end)
+
+        Enum.map(blobs, &:erlang.binary_to_term/1)
+    end
   end
 
   defp unpack_u64s(binary, n) do

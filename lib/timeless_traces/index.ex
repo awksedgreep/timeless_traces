@@ -21,6 +21,7 @@ defmodule TimelessTraces.Index do
   @blocks_table :timeless_traces_blocks
   @term_index_table :timeless_traces_term_index
   @trace_index_table :timeless_traces_trace_index
+  @compression_stats_table :timeless_traces_compression_stats
 
   @spec start_link(keyword()) :: GenServer.on_start()
   def start_link(opts) do
@@ -112,6 +113,12 @@ defmodule TimelessTraces.Index do
           end
       end
 
+    {raw_in, compressed_out, compaction_count} =
+      case :ets.lookup(@compression_stats_table, :lifetime) do
+        [{:lifetime, r, c, n}] -> {r, c, n}
+        _ -> {0, 0, 0}
+      end
+
     {:ok,
      %TimelessTraces.Stats{
        total_blocks: total_blocks,
@@ -129,7 +136,10 @@ defmodule TimelessTraces.Index do
        zstd_entries: format_stats["zstd"][:entries] || 0,
        openzl_blocks: format_stats["openzl"][:blocks] || 0,
        openzl_bytes: format_stats["openzl"][:bytes] || 0,
-       openzl_entries: format_stats["openzl"][:entries] || 0
+       openzl_entries: format_stats["openzl"][:entries] || 0,
+       compression_raw_bytes_in: raw_in,
+       compression_compressed_bytes_out: compressed_out,
+       compaction_count: compaction_count
      }}
   end
 
@@ -171,13 +181,13 @@ defmodule TimelessTraces.Index do
     )
   end
 
-  @spec raw_block_ids() :: [{integer(), String.t() | nil}]
+  @spec raw_block_ids() :: [{integer(), String.t() | nil, non_neg_integer()}]
   def raw_block_ids do
     @blocks_table
     |> :ets.tab2list()
     |> Enum.filter(fn {_bid, _fp, _bs, _ec, _tsmin, _tsmax, format, _ca} -> format == :raw end)
     |> Enum.sort_by(fn {_bid, _fp, _bs, _ec, ts_min, _tsmax, _fmt, _ca} -> ts_min end)
-    |> Enum.map(fn {bid, fp, _bs, _ec, _tsmin, _tsmax, _fmt, _ca} -> {bid, fp} end)
+    |> Enum.map(fn {bid, fp, bs, _ec, _tsmin, _tsmax, _fmt, _ca} -> {bid, fp, bs} end)
   end
 
   @spec distinct_services() :: {:ok, [String.t()]}
@@ -236,13 +246,18 @@ defmodule TimelessTraces.Index do
     GenServer.call(__MODULE__, {:delete_over_size, max_bytes}, 60_000)
   end
 
-  @spec compact_blocks([integer()], TimelessTraces.Writer.block_meta(), [map()]) :: :ok
-  def compact_blocks(old_block_ids, new_meta, new_entries) do
+  @spec compact_blocks(
+          [integer()],
+          TimelessTraces.Writer.block_meta(),
+          [map()],
+          {non_neg_integer(), non_neg_integer()}
+        ) :: :ok
+  def compact_blocks(old_block_ids, new_meta, new_entries, compression_sizes \\ {0, 0}) do
     {terms, trace_rows} = precompute(new_entries)
 
     GenServer.call(
       __MODULE__,
-      {:compact_blocks, old_block_ids, new_meta, terms, trace_rows},
+      {:compact_blocks, old_block_ids, new_meta, terms, trace_rows, compression_sizes},
       60_000
     )
   end
@@ -363,6 +378,7 @@ defmodule TimelessTraces.Index do
     bulk_load_blocks(db)
     bulk_load_term_index(db)
     bulk_load_trace_index(db)
+    bulk_load_compression_stats(db)
 
     {:ok,
      %{
@@ -407,6 +423,7 @@ defmodule TimelessTraces.Index do
     safe_delete_ets(@blocks_table)
     safe_delete_ets(@term_index_table)
     safe_delete_ets(@trace_index_table)
+    safe_delete_ets(@compression_stats_table)
   end
 
   # --- handle_call (grouped) ---
@@ -452,7 +469,11 @@ defmodule TimelessTraces.Index do
     {:reply, result, state}
   end
 
-  def handle_call({:compact_blocks, old_ids, new_meta, terms, trace_rows}, _from, state) do
+  def handle_call(
+        {:compact_blocks, old_ids, new_meta, terms, trace_rows, compression_sizes},
+        _from,
+        state
+      ) do
     state = flush_pending(state)
     state = flush_sqlite(state)
 
@@ -462,6 +483,10 @@ defmodule TimelessTraces.Index do
 
     result = do_compact_blocks(state, old_ids, new_meta, terms, trace_rows)
     state = collect_stmt_cache(state)
+
+    # Update compression stats (ETS + SQLite)
+    {raw_in, compressed_out} = compression_sizes
+    update_compression_stats(state.db, raw_in, compressed_out)
 
     # Update cache: remove old, add new
     for id <- old_ids, do: :ets.delete(@blocks_table, id)
@@ -523,6 +548,7 @@ defmodule TimelessTraces.Index do
     safe_delete_ets(@blocks_table)
     safe_delete_ets(@term_index_table)
     safe_delete_ets(@trace_index_table)
+    safe_delete_ets(@compression_stats_table)
 
     :ets.new(@blocks_table, [
       :named_table,
@@ -546,6 +572,13 @@ defmodule TimelessTraces.Index do
       :public,
       read_concurrency: true,
       write_concurrency: true
+    ])
+
+    :ets.new(@compression_stats_table, [
+      :named_table,
+      :set,
+      :public,
+      read_concurrency: true
     ])
   end
 
@@ -626,6 +659,134 @@ defmodule TimelessTraces.Index do
 
       :done ->
         :ok
+    end
+  end
+
+  @seed_version 2
+
+  defp bulk_load_compression_stats(db) do
+    # Migration: add seed_version column if missing
+    Exqlite.Sqlite3.execute(db, """
+    ALTER TABLE compression_stats ADD COLUMN seed_version INTEGER NOT NULL DEFAULT 0
+    """)
+  rescue
+    _ -> :ok
+  after
+    {:ok, stmt} =
+      Exqlite.Sqlite3.prepare(
+        db,
+        "SELECT raw_bytes_in, compressed_bytes_out, compaction_count, seed_version FROM compression_stats WHERE id = 1"
+      )
+
+    {raw_in, compressed_out, count, version} =
+      case Exqlite.Sqlite3.step(db, stmt) do
+        {:row, [r, c, n, v]} -> {r, c, n, v || 0}
+        {:row, [r, c, n]} -> {r, c, n, 0}
+        :done -> {0, 0, 0, 0}
+      end
+
+    Exqlite.Sqlite3.release(db, stmt)
+
+    # Re-seed if never seeded or seeded with old method
+    if count == 0 or version < @seed_version do
+      seed_compression_stats_from_blocks(db)
+    else
+      :ets.insert(@compression_stats_table, {:lifetime, raw_in, compressed_out, count})
+    end
+  end
+
+  defp seed_compression_stats_from_blocks(db) do
+    storage = :persistent_term.get({__MODULE__, :storage})
+
+    {:ok, stmt} =
+      Exqlite.Sqlite3.prepare(
+        db,
+        "SELECT block_id, file_path, byte_size, format FROM blocks WHERE format != 'raw'"
+      )
+
+    compressed_blocks = collect_compressed_blocks(db, stmt)
+    Exqlite.Sqlite3.release(db, stmt)
+
+    if compressed_blocks == [] do
+      :ets.insert(@compression_stats_table, {:lifetime, 0, 0, 0})
+    else
+      {total_raw, total_compressed, block_count} =
+        Enum.reduce(compressed_blocks, {0, 0, 0}, fn {block_id, file_path, byte_size, format},
+                                                      {raw_acc, comp_acc, count_acc} ->
+          format_atom = to_format_atom(format)
+
+          entries =
+            case storage do
+              :disk ->
+                case TimelessTraces.Writer.read_block(file_path, format_atom) do
+                  {:ok, e} -> e
+                  _ -> []
+                end
+
+              :memory ->
+                case read_block_from_db(db, block_id) do
+                  {:ok, e} -> e
+                  _ -> []
+                end
+            end
+
+          # Sum per-entry ETF sizes to avoid atom-caching underestimate
+          raw_bytes =
+            Enum.reduce(entries, 0, fn entry, acc ->
+              acc + byte_size(:erlang.term_to_binary(entry))
+            end)
+
+          {raw_acc + raw_bytes, comp_acc + byte_size, count_acc + 1}
+        end)
+
+      :ets.insert(@compression_stats_table, {:lifetime, total_raw, total_compressed, block_count})
+
+      # Persist so this migration only runs once
+      Exqlite.Sqlite3.execute(db, """
+      UPDATE compression_stats
+      SET raw_bytes_in = #{total_raw},
+          compressed_bytes_out = #{total_compressed},
+          compaction_count = #{block_count},
+          seed_version = #{@seed_version}
+      WHERE id = 1
+      """)
+    end
+  end
+
+  defp collect_compressed_blocks(db, stmt) do
+    case Exqlite.Sqlite3.step(db, stmt) do
+      {:row, [block_id, file_path, byte_size, format]} ->
+        [{block_id, file_path, byte_size, format} | collect_compressed_blocks(db, stmt)]
+
+      :done ->
+        []
+    end
+  end
+
+  defp update_compression_stats(db, raw_in, compressed_out) do
+    if raw_in > 0 or compressed_out > 0 do
+      # Update ETS
+      case :ets.lookup(@compression_stats_table, :lifetime) do
+        [{:lifetime, old_raw, old_comp, old_count}] ->
+          :ets.insert(@compression_stats_table, {
+            :lifetime,
+            old_raw + raw_in,
+            old_comp + compressed_out,
+            old_count + 1
+          })
+
+        _ ->
+          :ets.insert(@compression_stats_table, {:lifetime, raw_in, compressed_out, 1})
+      end
+
+      # Persist to SQLite
+      Exqlite.Sqlite3.execute(db, """
+      UPDATE compression_stats
+      SET raw_bytes_in = raw_bytes_in + #{raw_in},
+          compressed_bytes_out = compressed_bytes_out + #{compressed_out},
+          compaction_count = compaction_count + 1
+      WHERE id = 1
+      """)
     end
   end
 
@@ -861,6 +1022,20 @@ defmodule TimelessTraces.Index do
       format TEXT NOT NULL DEFAULT 'zstd',
       created_at INTEGER NOT NULL DEFAULT (unixepoch())
     )
+    """)
+
+    Exqlite.Sqlite3.execute(db, """
+    CREATE TABLE IF NOT EXISTS compression_stats (
+      id INTEGER PRIMARY KEY CHECK (id = 1),
+      raw_bytes_in INTEGER NOT NULL DEFAULT 0,
+      compressed_bytes_out INTEGER NOT NULL DEFAULT 0,
+      compaction_count INTEGER NOT NULL DEFAULT 0
+    )
+    """)
+
+    Exqlite.Sqlite3.execute(db, """
+    INSERT OR IGNORE INTO compression_stats (id, raw_bytes_in, compressed_bytes_out, compaction_count)
+    VALUES (1, 0, 0, 0)
     """)
 
     Exqlite.Sqlite3.execute(db, """
