@@ -1106,7 +1106,6 @@ defmodule TimelessTraces.Index do
     end
   end
 
-
   defp build_terms_sql(n) do
     placeholders =
       Enum.map_join(1..n, ", ", fn i ->
