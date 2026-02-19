@@ -136,9 +136,9 @@ Ingestion throughput on 500K spans (1000 spans/block):
 
 | Phase | Throughput |
 |---|---|
-| Writer only (serialization + disk I/O) | ~130K spans/sec |
-| Writer + Index (sync SQLite indexing) | ~35K spans/sec |
-| Full pipeline (Buffer → Writer → async Index) | ~99K spans/sec |
+| Writer only (serialization + disk I/O) | ~119K spans/sec |
+| Writer + Index (sync SQLite indexing) | ~31K spans/sec |
+| Full pipeline (Buffer → Writer → async Index) | ~83K spans/sec |
 
 Query latency (500K spans, 500 blocks, avg over 3 runs):
 
