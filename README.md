@@ -113,7 +113,7 @@ OTel SDK → Exporter → Buffer → Writer (raw) → SQLite Index
 - **Buffer** accumulates spans, flushes every 1s or 1000 spans
 - **Writer** serializes blocks as raw Erlang terms initially
 - **Index** stores block metadata + inverted term index + trace index in SQLite
-- **Compactor** merges raw blocks into zstd-compressed blocks (~9.9x ratio at 500 spans)
+- **Compactor** merges raw blocks into compressed blocks (zstd or OpenZL columnar)
 - **Retention** enforces age and size limits
 
 ### Storage Modes
@@ -123,15 +123,12 @@ OTel SDK → Exporter → Buffer → Writer (raw) → SQLite Index
 
 ## Compression
 
-Spans compress well with zstd (level 6). Sweet spot is 200-500 spans per block:
+Two compression backends are supported. OpenZL columnar compression (default) achieves better ratios and faster queries by encoding span fields in typed columns:
 
-| Spans | Raw | Compressed | Ratio |
-|---|---|---|---|
-| 1 | 610 B | 421 B | 1.4x |
-| 10 | 6.0 KB | 1.2 KB | 5.2x |
-| 100 | 60.3 KB | 6.6 KB | 9.1x |
-| 500 | 302.1 KB | 30.4 KB | 9.9x |
-| 5000 | 3.0 MB | 297.1 KB | 10.2x |
+| Backend | Size (500K spans) | Ratio | Compress | Decompress |
+|---|---|---|---|---|
+| zstd | 32.8 MB | 6.8x | 2.0s | 1.1s |
+| OpenZL columnar | 22.3 MB | 10.0x | 2.0s | 2.3s |
 
 ## Performance
 
@@ -139,9 +136,19 @@ Ingestion throughput on 500K spans (1000 spans/block):
 
 | Phase | Throughput |
 |---|---|
-| Writer only (serialization + disk I/O) | ~260K spans/sec |
-| Writer + Index (sync SQLite indexing) | ~19K spans/sec |
-| Full pipeline (Buffer → Writer → async Index) | ~66K spans/sec |
+| Writer only (serialization + disk I/O) | ~130K spans/sec |
+| Writer + Index (sync SQLite indexing) | ~35K spans/sec |
+| Full pipeline (Buffer → Writer → async Index) | ~99K spans/sec |
+
+Query latency (500K spans, 500 blocks, avg over 3 runs):
+
+| Query | zstd | OpenZL | Speedup |
+|---|---|---|---|
+| All spans (limit 100) | 945ms | 442ms | 2.1x |
+| status=error | 289ms | 148ms | 2.0x |
+| service filter | 318ms | 243ms | 1.3x |
+| kind=server | 275ms | 225ms | 1.2x |
+| Trace lookup | 5.5ms | 5.7ms | 1.0x |
 
 ## License
 

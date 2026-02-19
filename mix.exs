@@ -4,7 +4,7 @@ defmodule TimelessTraces.MixProject do
   def project do
     [
       app: :timeless_traces,
-      version: "0.4.0",
+      version: "0.4.1",
       elixir: "~> 1.18",
       start_permanent: Mix.env() == :prod,
       deps: deps(),
@@ -33,7 +33,7 @@ defmodule TimelessTraces.MixProject do
       {:plug, "~> 1.16"},
       {:jason, "~> 1.4"},
       {:ex_doc, "~> 0.34", only: :dev, runtime: false},
-      {:ex_openzl, github: "awksedgreep/ex_openzl", ref: "25bcbf9", submodules: true}
+      {:ex_openzl, "~> 0.4.0"}
     ]
   end
 

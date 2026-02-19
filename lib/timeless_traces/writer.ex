@@ -33,7 +33,7 @@ defmodule TimelessTraces.Writer do
 
         :openzl ->
           columns = columnar_serialize(entries)
-          ctx = ExOpenzl.create_compression_context()
+          {:ok, ctx} = ExOpenzl.create_compression_context()
           level = Keyword.get(opts, :level, TimelessTraces.Config.compression_level())
           ExOpenzl.set_compression_level(ctx, level)
           {:ok, compressed} = ExOpenzl.compress_multi_typed(ctx, columns)
@@ -73,7 +73,7 @@ defmodule TimelessTraces.Writer do
 
         :openzl ->
           columns = columnar_serialize(entries)
-          ctx = ExOpenzl.create_compression_context()
+          {:ok, ctx} = ExOpenzl.create_compression_context()
           level = Keyword.get(opts, :level, TimelessTraces.Config.compression_level())
           ExOpenzl.set_compression_level(ctx, level)
           {:ok, compressed} = ExOpenzl.compress_multi_typed(ctx, columns)
@@ -141,7 +141,7 @@ defmodule TimelessTraces.Writer do
 
   def decompress_block(compressed, :openzl) do
     try do
-      ctx = ExOpenzl.create_decompression_context()
+      {:ok, ctx} = ExOpenzl.create_decompression_context()
       {:ok, outputs} = ExOpenzl.decompress_multi_typed(ctx, compressed)
       {:ok, columnar_deserialize(outputs)}
     rescue
