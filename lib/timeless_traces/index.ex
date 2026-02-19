@@ -9,6 +9,9 @@ defmodule TimelessTraces.Index do
   # Flush pending index operations after this interval
   @index_flush_interval 100
 
+  # Flush SQLite persistence after this interval
+  @sqlite_flush_interval 500
+
   # Batch INSERT up to 400 terms per statement (800 params, under SQLite's 999 limit)
   @terms_batch_size 400
 
@@ -400,6 +403,8 @@ defmodule TimelessTraces.Index do
        storage: storage,
        pending: [],
        flush_timer: nil,
+       sqlite_pending: [],
+       sqlite_flush_timer: nil,
        block_insert_stmt: block_insert_stmt,
        terms_insert_stmt: terms_insert_stmt,
        trace_insert_stmt: trace_insert_stmt,
@@ -414,6 +419,7 @@ defmodule TimelessTraces.Index do
   @impl true
   def terminate(_reason, state) do
     state = flush_pending(state)
+    state = flush_sqlite(state)
 
     Exqlite.Sqlite3.release(state.db, state.block_insert_stmt)
 
@@ -444,6 +450,7 @@ defmodule TimelessTraces.Index do
   @impl true
   def handle_call({:index_block, meta, terms, trace_rows}, _from, state) do
     state = flush_pending(state)
+    state = flush_sqlite(state)
     result = do_index_block(state, meta, terms, trace_rows)
     state = collect_stmt_cache(state)
     # Update cache after SQLite commit
@@ -454,6 +461,7 @@ defmodule TimelessTraces.Index do
 
   def handle_call({:delete_before, cutoff}, _from, state) do
     state = flush_pending(state)
+    state = flush_sqlite(state)
 
     {count, deleted_ids, old_terms, old_traces} =
       do_delete_before(state.db, cutoff, state.storage)
@@ -464,6 +472,7 @@ defmodule TimelessTraces.Index do
 
   def handle_call({:delete_over_size, max_bytes}, _from, state) do
     state = flush_pending(state)
+    state = flush_sqlite(state)
 
     {count, deleted_ids, old_terms, old_traces} =
       do_delete_over_size(state.db, max_bytes, state.storage)
@@ -474,12 +483,14 @@ defmodule TimelessTraces.Index do
 
   def handle_call({:read_block_data, block_id}, _from, state) do
     state = flush_pending(state)
+    state = flush_sqlite(state)
     result = read_block_from_db(state.db, block_id)
     {:reply, result, state}
   end
 
   def handle_call({:compact_blocks, old_ids, new_meta, terms, trace_rows}, _from, state) do
     state = flush_pending(state)
+    state = flush_sqlite(state)
 
     # Collect old terms/traces for cache cleanup
     old_terms = collect_terms_for_blocks(state.db, old_ids)
@@ -504,6 +515,7 @@ defmodule TimelessTraces.Index do
 
   def handle_call({:backup, target_path}, _from, state) do
     state = flush_pending(state)
+    state = flush_sqlite(state)
     {:ok, stmt} = Exqlite.Sqlite3.prepare(state.db, "VACUUM INTO ?1")
     Exqlite.Sqlite3.bind(stmt, [target_path])
     result = Exqlite.Sqlite3.step(state.db, stmt)
@@ -517,6 +529,7 @@ defmodule TimelessTraces.Index do
 
   def handle_call(:sync, _from, state) do
     state = flush_pending(state)
+    state = flush_sqlite(state)
     publish_overflow(state)
     {:reply, :ok, %{state | dirty: false}}
   end
@@ -542,6 +555,12 @@ defmodule TimelessTraces.Index do
   def handle_info(:flush_index, state) do
     state = %{state | flush_timer: nil}
     state = flush_pending(state)
+    {:noreply, state}
+  end
+
+  def handle_info(:flush_sqlite, state) do
+    state = %{state | sqlite_flush_timer: nil}
+    state = flush_sqlite(state)
     {:noreply, state}
   end
 
@@ -907,15 +926,7 @@ defmodule TimelessTraces.Index do
           {meta, terms, trace_rows}
       end)
 
-    Exqlite.Sqlite3.execute(state.db, "BEGIN")
-
-    for {meta, terms, trace_rows} <- resolved do
-      insert_block_data(state, meta, terms, trace_rows)
-    end
-
-    Exqlite.Sqlite3.execute(state.db, "COMMIT")
-
-    # Update ETS + overflow for all flushed entries
+    # Update ETS + overflow immediately (data becomes queryable now)
     for {meta, terms, trace_rows} <- resolved do
       insert_block_ets(meta)
       insert_overflow(terms, trace_rows, meta.block_id)
@@ -925,9 +936,38 @@ defmodule TimelessTraces.Index do
       Process.cancel_timer(state.flush_timer)
     end
 
-    state = collect_stmt_cache(state)
+    # Queue SQLite persistence for background flush
+    state = schedule_sqlite_flush(%{state | sqlite_pending: resolved ++ state.sqlite_pending})
     %{state | pending: [], flush_timer: nil, dirty: true}
   end
+
+  defp flush_sqlite(%{sqlite_pending: []} = state), do: state
+
+  defp flush_sqlite(%{sqlite_pending: pending} = state) do
+    items = Enum.reverse(pending)
+
+    Exqlite.Sqlite3.execute(state.db, "BEGIN")
+
+    for {meta, terms, trace_rows} <- items do
+      insert_block_data(state, meta, terms, trace_rows)
+    end
+
+    Exqlite.Sqlite3.execute(state.db, "COMMIT")
+
+    if state.sqlite_flush_timer do
+      Process.cancel_timer(state.sqlite_flush_timer)
+    end
+
+    state = collect_stmt_cache(state)
+    %{state | sqlite_pending: [], sqlite_flush_timer: nil}
+  end
+
+  defp schedule_sqlite_flush(%{sqlite_flush_timer: nil} = state) do
+    ref = Process.send_after(self(), :flush_sqlite, @sqlite_flush_interval)
+    %{state | sqlite_flush_timer: ref}
+  end
+
+  defp schedule_sqlite_flush(state), do: state
 
   defp collect_stmt_cache(state) do
     # Merge any newly created prepared statements from process dictionary into state
