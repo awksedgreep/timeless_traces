@@ -46,7 +46,12 @@ defmodule TimelessTraces.IndexTest do
       spans = [make_span(), make_span(%{name: "HTTP POST", status: :error})]
 
       {:ok, meta} = TimelessTraces.Writer.write_block(spans, :memory, :raw)
-      :ok = (fn -> {terms, trace_rows} = TimelessTraces.Index.precompute(spans); TimelessTraces.Index.index_block(meta, terms, trace_rows) end).()
+
+      :ok =
+        (fn ->
+           {terms, trace_rows} = TimelessTraces.Index.precompute(spans)
+           TimelessTraces.Index.index_block(meta, terms, trace_rows)
+         end).()
 
       {:ok, %TimelessTraces.Result{entries: entries, total: 2}} =
         TimelessTraces.Index.query([])
@@ -61,7 +66,12 @@ defmodule TimelessTraces.IndexTest do
       ]
 
       {:ok, meta} = TimelessTraces.Writer.write_block(spans, :memory, :raw)
-      :ok = (fn -> {terms, trace_rows} = TimelessTraces.Index.precompute(spans); TimelessTraces.Index.index_block(meta, terms, trace_rows) end).()
+
+      :ok =
+        (fn ->
+           {terms, trace_rows} = TimelessTraces.Index.precompute(spans)
+           TimelessTraces.Index.index_block(meta, terms, trace_rows)
+         end).()
 
       {:ok, %TimelessTraces.Result{entries: entries}} =
         TimelessTraces.Index.query(name: "HTTP GET")
@@ -77,7 +87,12 @@ defmodule TimelessTraces.IndexTest do
       ]
 
       {:ok, meta} = TimelessTraces.Writer.write_block(spans, :memory, :raw)
-      :ok = (fn -> {terms, trace_rows} = TimelessTraces.Index.precompute(spans); TimelessTraces.Index.index_block(meta, terms, trace_rows) end).()
+
+      :ok =
+        (fn ->
+           {terms, trace_rows} = TimelessTraces.Index.precompute(spans)
+           TimelessTraces.Index.index_block(meta, terms, trace_rows)
+         end).()
 
       {:ok, %TimelessTraces.Result{entries: entries}} =
         TimelessTraces.Index.query(status: :error)
@@ -93,7 +108,12 @@ defmodule TimelessTraces.IndexTest do
       ]
 
       {:ok, meta} = TimelessTraces.Writer.write_block(spans, :memory, :raw)
-      :ok = (fn -> {terms, trace_rows} = TimelessTraces.Index.precompute(spans); TimelessTraces.Index.index_block(meta, terms, trace_rows) end).()
+
+      :ok =
+        (fn ->
+           {terms, trace_rows} = TimelessTraces.Index.precompute(spans)
+           TimelessTraces.Index.index_block(meta, terms, trace_rows)
+         end).()
 
       {:ok, %TimelessTraces.Result{entries: entries}} =
         TimelessTraces.Index.query(kind: :client)
@@ -123,7 +143,12 @@ defmodule TimelessTraces.IndexTest do
       ]
 
       {:ok, meta} = TimelessTraces.Writer.write_block(spans, :memory, :raw)
-      :ok = (fn -> {terms, trace_rows} = TimelessTraces.Index.precompute(spans); TimelessTraces.Index.index_block(meta, terms, trace_rows) end).()
+
+      :ok =
+        (fn ->
+           {terms, trace_rows} = TimelessTraces.Index.precompute(spans)
+           TimelessTraces.Index.index_block(meta, terms, trace_rows)
+         end).()
 
       {:ok, trace_spans} = TimelessTraces.Index.trace("trace-abc")
       assert length(trace_spans) == 3
@@ -143,7 +168,12 @@ defmodule TimelessTraces.IndexTest do
 
       spans = [make_span()]
       {:ok, meta} = TimelessTraces.Writer.write_block(spans, :memory, :raw)
-      :ok = (fn -> {terms, trace_rows} = TimelessTraces.Index.precompute(spans); TimelessTraces.Index.index_block(meta, terms, trace_rows) end).()
+
+      :ok =
+        (fn ->
+           {terms, trace_rows} = TimelessTraces.Index.precompute(spans)
+           TimelessTraces.Index.index_block(meta, terms, trace_rows)
+         end).()
 
       {:ok, stats} = TimelessTraces.Index.stats()
       assert stats.total_blocks == 1
@@ -159,7 +189,12 @@ defmodule TimelessTraces.IndexTest do
       ]
 
       {:ok, meta} = TimelessTraces.Writer.write_block(spans, :memory, :raw)
-      :ok = (fn -> {terms, trace_rows} = TimelessTraces.Index.precompute(spans); TimelessTraces.Index.index_block(meta, terms, trace_rows) end).()
+
+      :ok =
+        (fn ->
+           {terms, trace_rows} = TimelessTraces.Index.precompute(spans)
+           TimelessTraces.Index.index_block(meta, terms, trace_rows)
+         end).()
 
       {:ok, %TimelessTraces.Result{entries: entries}} =
         TimelessTraces.Index.query(service: "payments")

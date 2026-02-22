@@ -144,7 +144,9 @@ defmodule Mix.Tasks.TimelessTraces.SearchBenchmark do
         {:ok, meta} ->
           {terms, trace_rows} = TimelessTraces.Index.precompute(chunk)
           TimelessTraces.Index.index_block(meta, terms, trace_rows)
-        _ -> :ok
+
+        _ ->
+          :ok
       end
     end)
 
