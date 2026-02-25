@@ -2,12 +2,24 @@
 
 Embedded OpenTelemetry span storage and compression for Elixir applications.
 
-TimelessTraces receives spans directly from the OpenTelemetry Erlang SDK (no HTTP, no protobuf), compresses them with two-tier raw/zstd block storage (~9.9x compression), and indexes them in SQLite for fast trace-level and span-level queries. Zero external infrastructure required.
+TimelessTraces receives spans directly from the OpenTelemetry Erlang SDK (no HTTP, no protobuf), compresses them with two-tier raw/OpenZL block storage (~10x compression), and indexes them in SQLite for fast trace-level and span-level queries. Zero external infrastructure required.
 
 Part of the embedded observability stack:
 - [timeless_metrics](https://github.com/awksedgreep/timeless_metrics) - numeric time series compression
 - [timeless_logs](https://github.com/awksedgreep/timeless_logs) - log ingestion/compression/indexing
 - **timeless_traces** - OTel span storage/compression (this library)
+
+## Documentation
+
+- [Getting Started](docs/getting_started.md)
+- [Configuration Reference](docs/configuration.md)
+- [Architecture](docs/architecture.md)
+- [Querying](docs/querying.md)
+- [HTTP API](docs/http_api.md)
+- [Live Tail (Subscriptions)](docs/subscriptions.md)
+- [Storage & Compression](docs/storage.md)
+- [Operations](docs/operations.md)
+- [Telemetry](docs/telemetry.md)
 
 ## Installation
 
@@ -28,8 +40,9 @@ config :timeless_traces,
   data_dir: "priv/span_stream",
   flush_interval: 1_000,       # ms between auto-flushes
   max_buffer_size: 1_000,      # spans before forced flush
-  compaction_threshold: 500,   # raw entries before zstd compaction
-  compression_level: 6,        # zstd level 1-22 (default 6)
+  compaction_threshold: 500,   # raw entries before compaction
+  compaction_format: :openzl,  # :openzl (default) or :zstd
+  compression_level: 6,        # compression level 1-22 (default 6)
   retention_max_age: nil,      # seconds, nil = no age limit
   retention_max_size: nil      # bytes, nil = no size limit
 
@@ -107,7 +120,7 @@ stats.disk_size       #=> 24_000_000
 ```
 OTel SDK → Exporter → Buffer → Writer (raw) → SQLite Index
                                     ↓
-                              Compactor (zstd)
+                              Compactor (OpenZL/zstd)
 ```
 
 - **Buffer** accumulates spans, flushes every 1s or 1000 spans
