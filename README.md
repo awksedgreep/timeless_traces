@@ -1,5 +1,7 @@
 # TimelessTraces
 
+> "I always found it odd that the first thing you do to time series data is squash the timestamp. That's how the name Timeless was born." --Mark Cotner
+
 Embedded OpenTelemetry span storage and compression for Elixir applications.
 
 TimelessTraces receives spans directly from the OpenTelemetry Erlang SDK (no HTTP, no protobuf), compresses them with two-tier raw/OpenZL block storage (~10x compression), and indexes them in SQLite for fast trace-level and span-level queries. Zero external infrastructure required.
