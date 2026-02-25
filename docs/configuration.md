@@ -15,6 +15,8 @@ All configuration is set under the `:timeless_traces` application key in `config
 | `compaction_interval` | integer (ms) | `30_000` | Compaction check interval |
 | `compaction_max_raw_age` | integer (s) | `60` | Force compact raw blocks older than this |
 | `compaction_format` | atom | `:openzl` | Compression format (`:openzl` or `:zstd`) |
+| `merge_compaction_target_size` | integer | `2_000` | Target entries per merged compressed block |
+| `merge_compaction_min_blocks` | integer | `4` | Min small compressed blocks before merge triggers |
 | `compression_level` | integer | `6` | Compression level (1-22) |
 | `index_publish_interval` | integer (ms) | `2_000` | Index batch write interval |
 | `retention_max_age` | integer (s) or nil | `604_800` (7 days) | Max span age (`nil` = keep forever) |
@@ -50,6 +52,8 @@ config :timeless_traces,
   compaction_max_raw_age: 60,
   compaction_format: :openzl,
   compression_level: 6,
+  merge_compaction_target_size: 2_000,
+  merge_compaction_min_blocks: 4,
 
   # Indexing
   index_publish_interval: 2_000,
@@ -129,6 +133,16 @@ config :timeless_traces,
   retention_max_age: nil,    # No age limit
   retention_max_size: nil    # No size limit
 ```
+
+### Merge compaction
+
+After initial compaction, many small compressed blocks accumulate (one per flush cycle). Merge compaction consolidates them into larger blocks for better compression and fewer blocks to scan during queries.
+
+- **High volume**: the defaults (target 2000 entries, min 4 blocks) work well
+- **Low volume**: lower `merge_compaction_min_blocks` to 2 so merges happen with fewer blocks
+- **Large queries**: increase `merge_compaction_target_size` to 5000+ to produce fewer, larger blocks
+
+Merge compaction can also be triggered manually via `TimelessTraces.merge_now()`.
 
 ### Index publish interval
 

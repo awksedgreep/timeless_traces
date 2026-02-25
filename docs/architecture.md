@@ -137,6 +137,23 @@ The compaction process:
 6. Delete old raw block files
 7. Update compression statistics
 
+## Merge compaction
+
+After initial compaction produces many small compressed blocks (e.g. one per flush cycle), the Compactor runs a second pass that merges them into fewer, larger blocks. Larger blocks compress better (bigger dictionary window) and reduce per-block I/O overhead during reads.
+
+1. Scan for compressed blocks with `entry_count < merge_compaction_target_size`
+2. If enough small blocks exist (`>= merge_compaction_min_blocks`), group into batches by `ts_min`
+3. For each batch: decompress all blocks, merge entries sorted by `start_time`, recompress
+4. Update the index: remove old block metadata, add new merged block
+5. Delete old compressed block files
+
+The merge pass runs automatically after every compaction timer tick and can also be triggered manually via `TimelessTraces.merge_now()`.
+
+| Configuration | Default | Description |
+|---------------|---------|-------------|
+| `merge_compaction_target_size` | 2000 | Target entries per merged block |
+| `merge_compaction_min_blocks` | 4 | Minimum small blocks before merge triggers |
+
 ## Retention
 
 The Retention GenServer enforces two independent policies every `retention_check_interval` ms:

@@ -140,6 +140,8 @@ TimelessTraces emits telemetry events for monitoring:
 | `[:timeless_traces, :flush, :stop]` | `duration`, `entry_count`, `byte_size` | `block_id` |
 | `[:timeless_traces, :query, :stop]` | `duration`, `total`, `blocks_read` | `filters` |
 | `[:timeless_traces, :retention, :stop]` | `duration`, `blocks_deleted` | |
+| `[:timeless_traces, :compaction, :stop]` | `duration`, `raw_blocks`, `entry_count`, `byte_size` | |
+| `[:timeless_traces, :merge_compaction, :stop]` | `duration`, `batches_merged`, `blocks_consumed` | |
 | `[:timeless_traces, :block, :error]` | | `file_path`, `reason` |
 
 See the [Telemetry](telemetry.md) guide for handler examples.
@@ -177,6 +179,7 @@ See the [Telemetry](telemetry.md) guide for handler examples.
 - Avoid full scans (no filters) on large datasets
 - Reduce the time range with `:since` and `:until`
 - Check `raw_blocks` count -- many small raw blocks are slower to query than fewer compressed blocks
+- Trigger merge compaction to consolidate small compressed blocks: `TimelessTraces.merge_now()`
 
 ### Spans not appearing in queries
 

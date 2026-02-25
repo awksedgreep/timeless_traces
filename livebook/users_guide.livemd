@@ -1,0 +1,602 @@
+# TimelessTraces User's Guide
+
+## Setup
+
+```elixir
+Mix.install(
+  [
+    {:timeless_traces, github: "awksedgreep/timeless_traces"},
+    {:opentelemetry_api, "~> 1.4"},
+    {:opentelemetry, "~> 1.5"}
+  ],
+  config: [
+    opentelemetry: [traces_exporter: {TimelessTraces.Exporter, []}],
+    timeless_traces: [flush_interval: 5_000, compaction_threshold: 100]
+  ]
+)
+```
+
+Start the application:
+
+```elixir
+Application.ensure_all_started(:timeless_traces)
+```
+
+Seed some trace data so the query examples below have something to return:
+
+```elixir
+now = System.os_time(:nanosecond)
+
+spans =
+  for i <- 1..50 do
+    trace_id = Base.encode16(:crypto.strong_rand_bytes(16), case: :lower)
+    root_id = Base.encode16(:crypto.strong_rand_bytes(8), case: :lower)
+    child_id = Base.encode16(:crypto.strong_rand_bytes(8), case: :lower)
+
+    service = Enum.random(["api", "payments", "auth", "web"])
+    status = Enum.random([:ok, :ok, :ok, :error])
+    duration = :rand.uniform(500_000_000)
+    start = now - :rand.uniform(3_600_000_000_000)
+
+    [
+      %{
+        trace_id: trace_id,
+        span_id: root_id,
+        parent_span_id: nil,
+        name: "HTTP GET /#{service}/health",
+        kind: :server,
+        start_time: start,
+        end_time: start + duration,
+        duration_ns: duration,
+        status: status,
+        status_message: if(status == :error, do: "Internal error", else: nil),
+        attributes: %{"service.name" => service, "http.method" => "GET", "http.status_code" => if(status == :error, do: "500", else: "200")},
+        events: [],
+        resource: %{"service.name" => service},
+        instrumentation_scope: nil
+      },
+      %{
+        trace_id: trace_id,
+        span_id: child_id,
+        parent_span_id: root_id,
+        name: "db.query",
+        kind: :client,
+        start_time: start + 10_000,
+        end_time: start + duration - 10_000,
+        duration_ns: duration - 20_000,
+        status: :ok,
+        status_message: nil,
+        attributes: %{"service.name" => service, "db.system" => "postgresql"},
+        events: [],
+        resource: %{"service.name" => service},
+        instrumentation_scope: nil
+      }
+    ]
+  end
+  |> List.flatten()
+
+TimelessTraces.Buffer.ingest(spans)
+Process.sleep(2_000)
+TimelessTraces.flush()
+```
+
+## Getting Started
+
+TimelessTraces is an embedded OpenTelemetry span storage and compression
+library for Elixir. It plugs into the OTel SDK as a span exporter, stores
+spans locally with zstd or OpenZL compression (~10x), indexes them in SQLite,
+and exposes a Jaeger-compatible HTTP API for trace visualization.
+
+### Add the Dependency
+
+<!-- livebook:{"force_markdown":true} -->
+
+```elixir
+# mix.exs
+defp deps do
+  [
+    {:timeless_traces, "~> 0.5"},
+    {:opentelemetry_api, "~> 1.4"},
+    {:opentelemetry, "~> 1.5"}
+  ]
+end
+```
+
+### Configure the Exporter
+
+Tell the OpenTelemetry SDK to export spans to TimelessTraces:
+
+<!-- livebook:{"force_markdown":true} -->
+
+```elixir
+# config/config.exs
+config :opentelemetry,
+  traces_exporter: {TimelessTraces.Exporter, []}
+```
+
+### Configuration Options
+
+TimelessTraces is configured via application config. All options have sensible
+defaults:
+
+| Option                      | Default              | Description                                                 |
+| --------------------------- | -------------------- | ----------------------------------------------------------- |
+| `:data_dir`                 | `"priv/span_stream"` | Directory for block files and SQLite index                  |
+| `:storage`                  | `:disk`              | `:disk` or `:memory` (memory stores blocks as SQLite BLOBs) |
+| `:flush_interval`           | `1_000`              | Buffer flush interval (ms)                                  |
+| `:max_buffer_size`          | `1_000`              | Spans before auto-flush                                     |
+| `:query_timeout`            | `30_000`             | Query operation timeout (ms)                                |
+| `:retention_max_age`        | `604_800`            | Delete spans older than this (seconds, default 7 days)      |
+| `:retention_max_size`       | `536_870_912`        | Max total block size (bytes, default 512 MB)                |
+| `:retention_check_interval` | `300_000`            | Retention check interval (ms, default 5 min)                |
+| `:compaction_threshold`     | `500`                | Min raw entries to trigger compaction                       |
+| `:compaction_interval`      | `30_000`             | Compaction check interval (ms)                              |
+| `:compaction_max_raw_age`   | `60`                 | Force compact raw blocks older than this (seconds)          |
+| `:compaction_format`        | `:openzl`            | Compression format: `:zstd` or `:openzl`                    |
+| `:compression_level`        | `6`                  | Compression level (1-22)                                    |
+| `:index_publish_interval`   | `2_000`              | ETS → SQLite batch flush interval (ms)                    |
+| `:http`                     | `false`              | `true`, or `[port: 10428, bearer_token: "secret"]`          |
+
+### Full Configuration Example
+
+<!-- livebook:{"force_markdown":true} -->
+
+```elixir
+# config/config.exs
+config :timeless_traces,
+  data_dir: "/var/data/traces",
+  storage: :disk,
+  flush_interval: 1_000,
+  max_buffer_size: 1_000,
+  retention_max_age: 30 * 86_400,
+  retention_max_size: 2 * 1_073_741_824,
+  compaction_format: :openzl,
+  compression_level: 6,
+  http: [port: 10428, bearer_token: "my-secret-token"]
+
+config :opentelemetry,
+  traces_exporter: {TimelessTraces.Exporter, []}
+```
+
+### Enable the HTTP API
+
+<!-- livebook:{"force_markdown":true} -->
+
+```elixir
+# Defaults to port 10428, no auth
+config :timeless_traces, http: true
+
+# Custom port + bearer token auth
+config :timeless_traces, http: [port: 10500, bearer_token: "secret"]
+```
+
+## Instrumenting Your Code
+
+With OpenTelemetry configured, use the standard API to create spans:
+
+<!-- livebook:{"force_markdown":true} -->
+
+```elixir
+require OpenTelemetry.Tracer, as: Tracer
+
+Tracer.with_span "process_order", %{attributes: %{"order.id" => "ord-123"}} do
+  # Your business logic here
+  Tracer.with_span "validate_payment" do
+    Process.sleep(10)
+  end
+
+  Tracer.with_span "update_inventory", %{attributes: %{"db.system" => "postgresql"}} do
+    Process.sleep(5)
+  end
+end
+```
+
+All spans are automatically exported to TimelessTraces when they end.
+
+## Querying Traces (Elixir)
+
+### Search Spans
+
+`query/1` returns matching spans with pagination:
+
+```elixir
+{:ok, result} = TimelessTraces.query(limit: 10)
+```
+
+### Query Filters
+
+All filters are optional and can be combined:
+
+```elixir
+# By service name
+{:ok, result} = TimelessTraces.query(service: "api")
+
+# By span name (substring, case-insensitive)
+{:ok, result} = TimelessTraces.query(name: "HTTP GET")
+
+# By span kind
+{:ok, result} = TimelessTraces.query(kind: :server)
+
+# By status
+{:ok, result} = TimelessTraces.query(status: :error)
+
+# By duration range (nanoseconds)
+{:ok, result} = TimelessTraces.query(
+  min_duration: 100_000_000,
+  max_duration: 1_000_000_000
+)
+
+# By time range
+{:ok, result} = TimelessTraces.query(
+  since: DateTime.utc_now() |> DateTime.add(-3600, :second),
+  until: DateTime.utc_now()
+)
+
+# By trace ID
+{:ok, result} = TimelessTraces.query(trace_id: "abc123def456...")
+
+# By attributes
+{:ok, result} = TimelessTraces.query(
+  attributes: %{"http.status_code" => "500"}
+)
+
+# Combined filters with pagination
+{:ok, result} = TimelessTraces.query(
+  service: "payments",
+  status: :error,
+  min_duration: 100_000_000,
+  since: DateTime.utc_now() |> DateTime.add(-86_400, :second),
+  limit: 50,
+  offset: 0,
+  order: :desc
+)
+```
+
+### Filter Reference
+
+| Filter          | Type                   | Description                                                 |
+| --------------- | ---------------------- | ----------------------------------------------------------- |
+| `:name`         | string                 | Case-insensitive substring match on span name               |
+| `:service`      | string                 | Match `service.name` in attributes or resource              |
+| `:kind`         | atom                   | `:internal`, `:server`, `:client`, `:producer`, `:consumer` |
+| `:status`       | atom                   | `:ok`, `:error`, `:unset`                                   |
+| `:min_duration` | integer                | Minimum duration (nanoseconds)                              |
+| `:max_duration` | integer                | Maximum duration (nanoseconds)                              |
+| `:since`        | DateTime or unix nanos | Lower time bound                                            |
+| `:until`        | DateTime or unix nanos | Upper time bound                                            |
+| `:trace_id`     | string                 | Filter to specific trace                                    |
+| `:attributes`   | map                    | Exact key/value matches                                     |
+| `:limit`        | integer                | Max entries returned (default 100)                          |
+| `:offset`       | integer                | Skip N entries (default 0)                                  |
+| `:order`        | atom                   | `:asc` (oldest first) or `:desc` (newest first, default)    |
+
+### Retrieve a Full Trace
+
+`trace/1` returns all spans for a given trace ID, sorted by start time:
+
+```elixir
+# Get a trace ID from a query result
+{:ok, result} = TimelessTraces.query(status: :error, limit: 1)
+[span | _] = result.entries
+
+{:ok, spans} = TimelessTraces.trace(span.trace_id)
+
+for s <- spans do
+  indent = if s.parent_span_id, do: "  ", else: ""
+  duration_ms = s.duration_ns / 1_000_000
+  IO.puts("#{indent}#{s.name} (#{s.kind}) #{Float.round(duration_ms, 2)}ms [#{s.status}]")
+end
+```
+
+### Service and Operation Discovery
+
+List all services that have reported spans:
+
+```elixir
+{:ok, services} = TimelessTraces.services()
+```
+
+List all operation names for a service:
+
+```elixir
+{:ok, ops} = TimelessTraces.operations("api")
+```
+
+## Querying Traces (HTTP)
+
+The HTTP API is Jaeger-compatible, so you can point the Jaeger UI directly
+at TimelessTraces.
+
+### List Services
+
+```bash
+curl "http://localhost:10428/select/jaeger/api/services"
+```
+
+```json
+{"data":["api","payments","auth","web"]}
+```
+
+### List Operations
+
+```bash
+curl "http://localhost:10428/select/jaeger/api/services/api/operations"
+```
+
+```json
+{"data":["HTTP GET /api/health","db.query"]}
+```
+
+### Search Traces
+
+```bash
+curl "http://localhost:10428/select/jaeger/api/traces?\
+service=payments&\
+operation=HTTP+GET&\
+minDuration=100ms&\
+limit=20"
+```
+
+Duration supports units: `100us`, `1ms`, `2s`.
+
+Time range uses microsecond timestamps:
+
+```bash
+curl "http://localhost:10428/select/jaeger/api/traces?\
+service=api&\
+start=1700000000000000&\
+end=1700003600000000&\
+limit=50"
+```
+
+### Get a Single Trace
+
+```bash
+curl "http://localhost:10428/select/jaeger/api/traces/abc123def456..."
+```
+
+Response is Jaeger-compatible JSON with full span details.
+
+### OTLP JSON Ingest
+
+Ingest spans via the OpenTelemetry Protocol (OTLP) JSON format:
+
+```bash
+curl -X POST http://localhost:10428/insert/opentelemetry/v1/traces \
+  -H "Content-Type: application/json" \
+  -d '{
+    "resourceSpans": [{
+      "resource": {
+        "attributes": [{"key": "service.name", "value": {"stringValue": "my-service"}}]
+      },
+      "scopeSpans": [{
+        "spans": [{
+          "traceId": "0af7651916cd43dd8448eb211c80319c",
+          "spanId": "b7ad6b7169203331",
+          "name": "HTTP GET /health",
+          "kind": 2,
+          "startTimeUnixNano": "1700000000000000000",
+          "endTimeUnixNano": "1700000000050000000",
+          "status": {"code": 1}
+        }]
+      }]
+    }]
+  }'
+```
+
+### Jaeger UI Integration
+
+To use the Jaeger UI with TimelessTraces, point Jaeger's query service at
+the TimelessTraces HTTP API:
+
+```
+http://localhost:10428/select/jaeger
+```
+
+## Real-Time Subscriptions
+
+Subscribe to receive spans as they arrive, before they are buffered and
+flushed to disk:
+
+```elixir
+{:ok, _pid} = TimelessTraces.subscribe(status: :error)
+
+# Generate some spans to see them come through
+Task.start(fn ->
+  Process.sleep(500)
+
+  spans = [
+    %{
+      trace_id: Base.encode16(:crypto.strong_rand_bytes(16), case: :lower),
+      span_id: Base.encode16(:crypto.strong_rand_bytes(8), case: :lower),
+      parent_span_id: nil,
+      name: "failing_request",
+      kind: :server,
+      start_time: System.os_time(:nanosecond),
+      end_time: System.os_time(:nanosecond) + 50_000_000,
+      duration_ns: 50_000_000,
+      status: :error,
+      status_message: "Connection refused",
+      attributes: %{"service.name" => "payments"},
+      events: [],
+      resource: %{"service.name" => "payments"},
+      instrumentation_scope: nil
+    }
+  ]
+
+  TimelessTraces.Buffer.ingest(spans)
+end)
+
+receive do
+  {:timeless_traces, :span, span} ->
+    IO.puts("Got span: #{span.name} [#{span.status}] #{span.status_message}")
+after
+  3_000 -> IO.puts("(no span received)")
+end
+```
+
+Filter subscriptions by name, kind, status, or service:
+
+```elixir
+# Only server spans from a specific service
+{:ok, _pid} = TimelessTraces.subscribe(kind: :server, service: "payments")
+
+Task.start(fn ->
+  Process.sleep(500)
+
+  TimelessTraces.Buffer.ingest([
+    %{
+      trace_id: Base.encode16(:crypto.strong_rand_bytes(16), case: :lower),
+      span_id: Base.encode16(:crypto.strong_rand_bytes(8), case: :lower),
+      parent_span_id: nil,
+      name: "payment_processed",
+      kind: :server,
+      start_time: System.os_time(:nanosecond),
+      end_time: System.os_time(:nanosecond) + 25_000_000,
+      duration_ns: 25_000_000,
+      status: :ok,
+      status_message: nil,
+      attributes: %{"service.name" => "payments"},
+      events: [],
+      resource: %{"service.name" => "payments"},
+      instrumentation_scope: nil
+    }
+  ])
+end)
+
+receive do
+  {:timeless_traces, :span, span} ->
+    IO.puts("Got: #{span.name} (#{span.kind}) from #{span.attributes["service.name"]}")
+after
+  3_000 -> IO.puts("(no span received)")
+end
+```
+
+Unsubscribe when done:
+
+```elixir
+TimelessTraces.unsubscribe()
+```
+
+## Statistics
+
+### Elixir API
+
+```elixir
+{:ok, stats} = TimelessTraces.stats()
+```
+
+Returns a `%TimelessTraces.Stats{}` struct with fields:
+
+| Field                                               | Description                         |
+| --------------------------------------------------- | ----------------------------------- |
+| `total_blocks`                                      | Total block count                   |
+| `total_entries`                                     | Total spans stored                  |
+| `total_bytes`                                       | Total block data bytes              |
+| `disk_size`                                         | On-disk storage size                |
+| `index_size`                                        | SQLite index size                   |
+| `oldest_timestamp`                                  | Oldest span timestamp (nanoseconds) |
+| `newest_timestamp`                                  | Newest span timestamp (nanoseconds) |
+| `raw_blocks` / `raw_bytes` / `raw_entries`          | Uncompressed block stats            |
+| `zstd_blocks` / `zstd_bytes` / `zstd_entries`       | Zstd-compressed block stats         |
+| `openzl_blocks` / `openzl_bytes` / `openzl_entries` | OpenZL-compressed block stats       |
+| `compression_raw_bytes_in`                          | Total bytes before compression      |
+| `compression_compressed_bytes_out`                  | Total bytes after compression       |
+| `compaction_count`                                  | Number of compaction runs           |
+
+### HTTP API
+
+```bash
+curl "http://localhost:10428/health"
+```
+
+```json
+{"status":"ok","blocks":48,"spans":125000,"disk_size":24000000}
+```
+
+## Operations
+
+### Flush
+
+Force all buffered spans to disk immediately:
+
+```elixir
+TimelessTraces.flush()
+```
+
+Via HTTP:
+
+```bash
+curl "http://localhost:10428/api/v1/flush"
+```
+
+```json
+{"status":"ok"}
+```
+
+### Backup
+
+Create a consistent online backup without stopping the application:
+
+```elixir
+{:ok, result} = TimelessTraces.backup("/tmp/traces_backup")
+# result => %{path: "/tmp/traces_backup", files: ["index.db", ...], total_bytes: 24000000}
+```
+
+Via HTTP:
+
+```bash
+curl -X POST http://localhost:10428/api/v1/backup \
+  -H "Content-Type: application/json" \
+  -d '{"path": "/tmp/traces_backup"}'
+```
+
+```json
+{"status":"ok","path":"/tmp/traces_backup","files":["index.db","blocks"],"total_bytes":24000000}
+```
+
+To download the backup, archive it from the server filesystem:
+
+```bash
+tar czf traces_backup.tar.gz -C /tmp/traces_backup .
+```
+
+To restore, stop the application, replace the `data_dir` contents with the
+backup files, and restart.
+
+### Authentication
+
+All endpoints except `/health` support optional Bearer token authentication
+when configured:
+
+```bash
+# Via header
+curl -H "Authorization: Bearer my-secret-token" \
+  "http://localhost:10428/select/jaeger/api/services"
+
+# Via query parameter
+curl "http://localhost:10428/select/jaeger/api/traces?service=api&token=my-secret-token"
+```
+
+## Telemetry
+
+TimelessTraces emits telemetry events for monitoring integration:
+
+| Event                                    | Measurements                                         | Metadata              |
+| ---------------------------------------- | ---------------------------------------------------- | --------------------- |
+| `[:timeless_traces, :flush, :stop]`      | `duration`, `entry_count`, `byte_size`               | `block_id`            |
+| `[:timeless_traces, :query, :stop]`      | `duration`, `total`, `blocks_read`                   | `filters`             |
+| `[:timeless_traces, :compaction, :stop]` | `duration`, `raw_blocks`, `entry_count`, `byte_size` | —                   |
+| `[:timeless_traces, :retention, :stop]`  | `duration`, `blocks_deleted`                         | —                   |
+| `[:timeless_traces, :block, :error]`     | —                                                  | `file_path`, `reason` |
+
+Attach a handler to monitor query performance:
+
+<!-- livebook:{"force_markdown":true} -->
+
+```elixir
+:telemetry.attach("trace-query-monitor", [:timeless_traces, :query, :stop], fn _event, measurements, metadata, _config ->
+  require Logger
+  Logger.info("Query took #{measurements.duration}ns, scanned #{measurements.blocks_read} blocks, found #{measurements.total} spans")
+end, nil)
+```

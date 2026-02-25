@@ -310,4 +310,211 @@ defmodule TimelessTraces.CompactorTest do
       {:ok, %TimelessTraces.Result{total: 25}} = TimelessTraces.query([])
     end
   end
+
+  describe "merge compaction on disk" do
+    test "merges multiple small compressed blocks into fewer larger ones" do
+      # Create 10 separate raw blocks with 5 entries each
+      for _ <- 1..10 do
+        spans = for _ <- 1..5, do: make_span()
+        TimelessTraces.Buffer.ingest(spans)
+        TimelessTraces.flush()
+      end
+
+      # Compact raw → compressed
+      assert :ok = TimelessTraces.Compactor.compact_now()
+
+      {:ok, stats_before} = TimelessTraces.stats()
+      assert stats_before.raw_blocks == 0
+      assert stats_before.openzl_blocks >= 1
+
+      # Set merge config: target 200 entries, min 2 blocks
+      # Since we compacted 50 entries into 1 block, we need multiple compaction rounds
+      # to get multiple small compressed blocks. Instead, flush individual small batches
+      # and compact each separately.
+      # Actually the first compact produces 1 big block. Let's create more small ones.
+
+      # Create more small raw blocks and compact them individually
+      for _ <- 1..4 do
+        TimelessTraces.Buffer.ingest([make_span()])
+        TimelessTraces.flush()
+      end
+
+      # Set threshold to 1 to compact these small blocks
+      Application.put_env(:timeless_traces, :compaction_threshold, 1)
+      assert :ok = TimelessTraces.Compactor.compact_now()
+
+      {:ok, stats_mid} = TimelessTraces.stats()
+      # Should now have multiple compressed blocks (the big one + the new small one)
+      assert stats_mid.raw_blocks == 0
+      total_compressed = stats_mid.openzl_blocks + stats_mid.zstd_blocks
+      assert total_compressed >= 2
+
+      blocks_before_merge = stats_mid.total_blocks
+
+      # Merge: target large enough to fit all, min_blocks 2
+      Application.put_env(:timeless_traces, :merge_compaction_target_size, 500)
+      Application.put_env(:timeless_traces, :merge_compaction_min_blocks, 2)
+
+      assert :ok = TimelessTraces.Compactor.merge_now()
+
+      {:ok, stats_after} = TimelessTraces.stats()
+      assert stats_after.total_blocks < blocks_before_merge
+      assert stats_after.total_entries == 54
+
+      # All entries still queryable
+      {:ok, %TimelessTraces.Result{total: 54}} = TimelessTraces.query([])
+    end
+
+    test "returns :noop when not enough small blocks" do
+      # Create one compressed block via compact cycle
+      TimelessTraces.Buffer.ingest(for _ <- 1..15, do: make_span())
+      TimelessTraces.flush()
+
+      assert :ok = TimelessTraces.Compactor.compact_now()
+
+      # Only 1 compressed block, min_blocks is 4
+      Application.put_env(:timeless_traces, :merge_compaction_min_blocks, 4)
+      Application.put_env(:timeless_traces, :merge_compaction_target_size, 500)
+
+      assert :noop = TimelessTraces.Compactor.merge_now()
+    end
+
+    test "preserves trace index after merge" do
+      trace_id = "merge-trace-#{System.unique_integer([:positive])}"
+      now = System.system_time(:nanosecond)
+      Application.put_env(:timeless_traces, :compaction_threshold, 1)
+
+      # Create trace spans, compact into one compressed block
+      TimelessTraces.Buffer.ingest([
+        make_span(%{
+          trace_id: trace_id,
+          span_id: "root",
+          parent_span_id: nil,
+          name: "root",
+          start_time: now,
+          end_time: now + 100_000_000
+        }),
+        make_span(%{
+          trace_id: trace_id,
+          span_id: "child",
+          parent_span_id: "root",
+          name: "child",
+          start_time: now + 10_000_000,
+          end_time: now + 50_000_000
+        })
+      ])
+
+      TimelessTraces.flush()
+      assert :ok = TimelessTraces.Compactor.compact_now()
+
+      # Create more separate compact cycles to get multiple compressed blocks
+      for _ <- 1..3 do
+        TimelessTraces.Buffer.ingest([make_span()])
+        TimelessTraces.flush()
+        assert :ok = TimelessTraces.Compactor.compact_now()
+      end
+
+      # Verify trace works before merge
+      {:ok, pre_spans} = TimelessTraces.trace(trace_id)
+      assert length(pre_spans) == 2
+
+      {:ok, stats_mid} = TimelessTraces.stats()
+      assert stats_mid.raw_blocks == 0
+      assert stats_mid.total_blocks >= 4
+
+      # Merge compressed blocks
+      Application.put_env(:timeless_traces, :merge_compaction_target_size, 500)
+      Application.put_env(:timeless_traces, :merge_compaction_min_blocks, 2)
+      assert :ok = TimelessTraces.Compactor.merge_now()
+
+      # Trace should still work after merge
+      {:ok, post_spans} = TimelessTraces.trace(trace_id)
+      assert length(post_spans) == 2
+      assert Enum.all?(post_spans, &(&1.trace_id == trace_id))
+    end
+
+    test "preserves query after merge" do
+      Application.put_env(:timeless_traces, :compaction_threshold, 1)
+
+      # Create multiple small compressed blocks via separate compact cycles
+      for _ <- 1..4 do
+        TimelessTraces.Buffer.ingest([
+          make_span(%{name: "GET /api", status: :ok}),
+          make_span(%{name: "POST /submit", status: :error})
+        ])
+
+        TimelessTraces.flush()
+        assert :ok = TimelessTraces.Compactor.compact_now()
+      end
+
+      {:ok, stats_mid} = TimelessTraces.stats()
+      assert stats_mid.raw_blocks == 0
+      assert stats_mid.total_blocks >= 4
+
+      # Merge compressed blocks
+      Application.put_env(:timeless_traces, :merge_compaction_target_size, 500)
+      Application.put_env(:timeless_traces, :merge_compaction_min_blocks, 2)
+      assert :ok = TimelessTraces.Compactor.merge_now()
+
+      # Filtered query should still work
+      {:ok, %TimelessTraces.Result{total: total_errors}} = TimelessTraces.query(status: :error)
+      assert total_errors >= 4
+
+      {:ok, %TimelessTraces.Result{total: total}} = TimelessTraces.query([])
+      assert total == 8
+    end
+  end
+
+  describe "merge compaction in memory mode" do
+    setup do
+      Application.stop(:timeless_traces)
+      Application.put_env(:timeless_traces, :storage, :memory)
+      Application.put_env(:timeless_traces, :data_dir, "test/tmp/merge_mem_should_not_exist")
+      Application.put_env(:timeless_traces, :compaction_threshold, 10)
+      Application.ensure_all_started(:timeless_traces)
+
+      on_exit(fn ->
+        Application.stop(:timeless_traces)
+        Application.put_env(:timeless_traces, :storage, :disk)
+      end)
+
+      :ok
+    end
+
+    test "works in memory mode" do
+      # Create multiple small blocks
+      for _ <- 1..6 do
+        TimelessTraces.Buffer.ingest(for _ <- 1..5, do: make_span())
+        TimelessTraces.flush()
+      end
+
+      # Compact raw → compressed
+      assert :ok = TimelessTraces.Compactor.compact_now()
+
+      # Create more small blocks and compact again
+      for _ <- 1..4 do
+        TimelessTraces.Buffer.ingest([make_span()])
+        TimelessTraces.flush()
+      end
+
+      Application.put_env(:timeless_traces, :compaction_threshold, 1)
+      assert :ok = TimelessTraces.Compactor.compact_now()
+
+      {:ok, stats_before} = TimelessTraces.stats()
+      assert stats_before.raw_blocks == 0
+      blocks_before = stats_before.total_blocks
+      assert blocks_before >= 2
+
+      # Merge
+      Application.put_env(:timeless_traces, :merge_compaction_target_size, 500)
+      Application.put_env(:timeless_traces, :merge_compaction_min_blocks, 2)
+      assert :ok = TimelessTraces.Compactor.merge_now()
+
+      {:ok, stats_after} = TimelessTraces.stats()
+      assert stats_after.total_blocks < blocks_before
+      assert stats_after.total_entries == 34
+
+      {:ok, %TimelessTraces.Result{total: 34}} = TimelessTraces.query([])
+    end
+  end
 end

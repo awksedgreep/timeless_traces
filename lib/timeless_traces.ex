@@ -146,6 +146,14 @@ defmodule TimelessTraces do
   end
 
   @doc """
+  Merge multiple small compressed blocks into fewer, larger blocks.
+
+  Returns `:ok` if blocks were merged, `:noop` if no merge was needed.
+  """
+  @spec merge_now() :: :ok | :noop
+  defdelegate merge_now(), to: TimelessTraces.Compactor
+
+  @doc """
   Create a consistent online backup of the span store.
 
   Flushes all in-flight data, then uses SQLite's `VACUUM INTO` to snapshot
