@@ -25,3 +25,6 @@ span_stream-*.tar
 # Runtime data directory
 /priv/span_stream/
 
+# Environment files
+.env
+.env.*

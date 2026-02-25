@@ -26,7 +26,7 @@ Part of the embedded observability stack:
 ```elixir
 def deps do
   [
-    {:timeless_traces, "~> 0.2.0"}
+    {:timeless_traces, "~> 1.0"}
   ]
 end
 ```
