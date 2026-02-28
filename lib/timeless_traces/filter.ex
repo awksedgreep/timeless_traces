@@ -10,7 +10,12 @@ defmodule TimelessTraces.Filter do
   def matches?(span, filters) do
     Enum.all?(filters, fn
       {:name, pattern} ->
-        String.contains?(String.downcase(to_string(span.name)), String.downcase(pattern))
+        downcased = String.downcase(pattern)
+
+        String.contains?(String.downcase(to_string(span.name)), downcased) or
+          Enum.any?(Map.get(span, :attributes, %{}) || %{}, fn {_k, v} ->
+            is_binary(v) and String.contains?(String.downcase(v), downcased)
+          end)
 
       {:service, service} ->
         get_service_name(span) == service
