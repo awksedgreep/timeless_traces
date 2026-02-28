@@ -94,8 +94,8 @@ defmodule TimelessTraces.Compactor do
     else
       sorted = Enum.sort_by(all_entries, & &1.start_time)
 
-      # Sum actual raw block file sizes (true "before compression" size)
-      raw_bytes = Enum.reduce(raw_blocks, 0, fn {_bid, _fp, bs}, acc -> acc + bs end)
+      # Sum per-entry ETF sizes (logical size before compression)
+      raw_bytes = Enum.reduce(sorted, 0, fn entry, acc -> acc + byte_size(:erlang.term_to_binary(entry)) end)
 
       write_target = if state.storage == :memory, do: :memory, else: state.data_dir
 
@@ -218,7 +218,7 @@ defmodule TimelessTraces.Compactor do
       :noop
     else
       sorted = Enum.sort_by(all_entries, & &1.start_time)
-      old_bytes = Enum.reduce(batch, 0, fn {_, _, bs, _}, a -> a + bs end)
+      raw_bytes = Enum.reduce(sorted, 0, fn entry, acc -> acc + byte_size(:erlang.term_to_binary(entry)) end)
       write_target = if state.storage == :memory, do: :memory, else: state.data_dir
 
       case TimelessTraces.Writer.write_block(
@@ -233,7 +233,7 @@ defmodule TimelessTraces.Compactor do
             old_ids,
             new_meta,
             sorted,
-            {old_bytes, new_meta.byte_size}
+            {raw_bytes, new_meta.byte_size}
           )
 
           :ok
