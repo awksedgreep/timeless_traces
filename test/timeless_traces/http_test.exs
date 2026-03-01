@@ -26,7 +26,11 @@ defmodule TimelessTraces.HTTPTest do
   end
 
   defp json_body(conn) do
-    Jason.decode!(conn.resp_body)
+    :json.decode(conn.resp_body)
+  end
+
+  defp json_encode(term) do
+    term |> :json.encode() |> IO.iodata_to_binary()
   end
 
   defp make_span(overrides \\ %{}) do
@@ -78,7 +82,7 @@ defmodule TimelessTraces.HTTPTest do
   describe "POST /insert/opentelemetry/v1/traces" do
     test "ingests OTLP JSON with resourceSpans" do
       otlp_body =
-        Jason.encode!(%{
+        json_encode(%{
           resourceSpans: [
             %{
               resource: %{
@@ -142,86 +146,258 @@ defmodule TimelessTraces.HTTPTest do
       assert names == ["DB query", "GET /users"]
     end
 
-    test "parses OTLP kind integers correctly" do
-      for {kind_int, expected_kind} <- [
-            {1, :internal},
-            {2, :server},
-            {3, :client},
-            {4, :producer},
-            {5, :consumer}
-          ] do
-        Application.stop(:timeless_traces)
-        Application.ensure_all_started(:timeless_traces)
-
-        otlp_body =
-          Jason.encode!(%{
-            resourceSpans: [
+    test "ingests protobuf from real OpenTelemetry exporter" do
+      # Build a protobuf ExportTraceServiceRequest exactly as the Erlang exporter would
+      pb_msg = %{
+        resource_spans: [
+          %{
+            resource: %{
+              attributes: [
+                %{key: "service.name", value: %{value: {:string_value, "pb-test-svc"}}}
+              ]
+            },
+            scope_spans: [
               %{
-                resource: %{attributes: []},
-                scopeSpans: [
+                scope: %{name: "otel-test", version: "0.1"},
+                spans: [
                   %{
-                    spans: [
-                      %{
-                        traceId: "trace#{kind_int}00000000000000000000",
-                        spanId: "span#{kind_int}0000000000",
-                        name: "kind-test",
-                        kind: kind_int,
-                        startTimeUnixNano: 1_700_000_000_000_000_000,
-                        endTimeUnixNano: 1_700_000_001_000_000_000,
-                        attributes: []
-                      }
-                    ]
+                    trace_id: <<0xAA, 0xBB, 0xCC, 0xDD, 0x11, 0x22, 0x33, 0x44,
+                                0x55, 0x66, 0x77, 0x88, 0x99, 0x00, 0xAA, 0xBB>>,
+                    span_id: <<0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88>>,
+                    parent_span_id: <<>>,
+                    name: "GET /protobuf-test",
+                    kind: :SPAN_KIND_SERVER,
+                    start_time_unix_nano: 1_700_000_000_000_000_000,
+                    end_time_unix_nano: 1_700_000_001_000_000_000,
+                    status: %{code: :STATUS_CODE_OK, message: ""},
+                    attributes: [
+                      %{key: "http.method", value: %{value: {:string_value, "GET"}}},
+                      %{key: "http.status_code", value: %{value: {:int_value, 200}}},
+                      %{key: "http.duration_ms", value: %{value: {:double_value, 42.5}}},
+                      %{key: "http.ok", value: %{value: {:bool_value, true}}}
+                    ],
+                    events: [],
+                    links: []
+                  },
+                  %{
+                    trace_id: <<0xAA, 0xBB, 0xCC, 0xDD, 0x11, 0x22, 0x33, 0x44,
+                                0x55, 0x66, 0x77, 0x88, 0x99, 0x00, 0xAA, 0xBB>>,
+                    span_id: <<0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x00>>,
+                    parent_span_id: <<0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88>>,
+                    name: "DB query",
+                    kind: :SPAN_KIND_CLIENT,
+                    start_time_unix_nano: 1_700_000_000_100_000_000,
+                    end_time_unix_nano: 1_700_000_000_900_000_000,
+                    status: %{code: :STATUS_CODE_UNSET, message: ""},
+                    attributes: [
+                      %{key: "db.system", value: %{value: {:string_value, "postgresql"}}}
+                    ],
+                    events: [],
+                    links: []
                   }
                 ]
               }
             ]
-          })
+          }
+        ]
+      }
 
-        conn(:post, "/insert/opentelemetry/v1/traces", otlp_body)
-        |> put_req_header("content-type", "application/json")
+      body =
+        :opentelemetry_exporter_trace_service_pb.encode_msg(
+          pb_msg,
+          :export_trace_service_request
+        )
+
+      conn =
+        conn(:post, "/insert/opentelemetry/v1/traces", body)
+        |> put_req_header("content-type", "application/x-protobuf")
+        |> call()
+
+      assert conn.status == 200
+
+      TimelessTraces.flush()
+
+      {:ok, %{entries: spans}} = TimelessTraces.query([])
+      assert length(spans) == 2
+
+      names = Enum.map(spans, & &1.name) |> Enum.sort()
+      assert names == ["DB query", "GET /protobuf-test"]
+
+      root = Enum.find(spans, &(&1.name == "GET /protobuf-test"))
+      assert root.trace_id == "aabbccdd11223344556677889900aabb"
+      assert root.span_id == "1122334455667788"
+      assert root.parent_span_id == nil
+      assert root.kind == :server
+      assert root.status == :ok
+      assert root.attributes["http.method"] == "GET"
+      assert root.attributes["http.status_code"] == 200
+      assert root.attributes["http.duration_ms"] == 42.5
+      assert root.attributes["http.ok"] == true
+      assert root.duration_ns == 1_000_000_000
+
+      child = Enum.find(spans, &(&1.name == "DB query"))
+      assert child.parent_span_id == "1122334455667788"
+      assert child.kind == :client
+      assert child.status == :unset
+      assert child.attributes["db.system"] == "postgresql"
+    end
+
+    test "ingests gzip-compressed protobuf" do
+      pb_msg = %{
+        resource_spans: [
+          %{
+            resource: %{
+              attributes: [
+                %{key: "service.name", value: %{value: {:string_value, "gzip-svc"}}}
+              ]
+            },
+            scope_spans: [
+              %{
+                scope: %{name: "test", version: "1.0"},
+                spans: [
+                  %{
+                    trace_id: <<1::128>>,
+                    span_id: <<2::64>>,
+                    parent_span_id: <<>>,
+                    name: "gzip-span",
+                    kind: :SPAN_KIND_INTERNAL,
+                    start_time_unix_nano: 1_700_000_000_000_000_000,
+                    end_time_unix_nano: 1_700_000_001_000_000_000,
+                    status: %{code: :STATUS_CODE_OK, message: ""},
+                    attributes: [],
+                    events: [],
+                    links: []
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      }
+
+      body =
+        :opentelemetry_exporter_trace_service_pb.encode_msg(
+          pb_msg,
+          :export_trace_service_request
+        )
+
+      gzipped = :zlib.gzip(body)
+
+      conn =
+        conn(:post, "/insert/opentelemetry/v1/traces", gzipped)
+        |> put_req_header("content-type", "application/x-protobuf")
+        |> put_req_header("content-encoding", "gzip")
+        |> call()
+
+      assert conn.status == 200
+
+      TimelessTraces.flush()
+
+      {:ok, %{entries: [span]}} = TimelessTraces.query([])
+      assert span.name == "gzip-span"
+    end
+
+    test "protobuf span kind mapping" do
+      for {pb_kind, expected} <- [
+            {:SPAN_KIND_INTERNAL, :internal},
+            {:SPAN_KIND_SERVER, :server},
+            {:SPAN_KIND_CLIENT, :client},
+            {:SPAN_KIND_PRODUCER, :producer},
+            {:SPAN_KIND_CONSUMER, :consumer}
+          ] do
+        Application.stop(:timeless_traces)
+        Application.ensure_all_started(:timeless_traces)
+
+        pb_msg = %{
+          resource_spans: [
+            %{
+              resource: %{attributes: []},
+              scope_spans: [
+                %{
+                  spans: [
+                    %{
+                      trace_id: :crypto.strong_rand_bytes(16),
+                      span_id: :crypto.strong_rand_bytes(8),
+                      parent_span_id: <<>>,
+                      name: "kind-test",
+                      kind: pb_kind,
+                      start_time_unix_nano: 1_700_000_000_000_000_000,
+                      end_time_unix_nano: 1_700_000_001_000_000_000,
+                      status: %{code: :STATUS_CODE_UNSET, message: ""},
+                      attributes: [],
+                      events: [],
+                      links: []
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+
+        body =
+          :opentelemetry_exporter_trace_service_pb.encode_msg(
+            pb_msg,
+            :export_trace_service_request
+          )
+
+        conn(:post, "/insert/opentelemetry/v1/traces", body)
+        |> put_req_header("content-type", "application/x-protobuf")
         |> call()
 
         TimelessTraces.flush()
 
         {:ok, %{entries: [span]}} = TimelessTraces.query([])
 
-        assert span.kind == expected_kind,
-               "Expected kind #{expected_kind} for OTLP kind #{kind_int}, got #{span.kind}"
+        assert span.kind == expected,
+               "Expected kind #{expected} for protobuf kind #{pb_kind}, got #{span.kind}"
       end
     end
 
-    test "parses OTLP status codes correctly" do
-      for {code, expected} <- [{0, :unset}, {1, :ok}, {2, :error}] do
+    test "protobuf status code mapping" do
+      for {pb_code, expected} <- [
+            {:STATUS_CODE_UNSET, :unset},
+            {:STATUS_CODE_OK, :ok},
+            {:STATUS_CODE_ERROR, :error}
+          ] do
         Application.stop(:timeless_traces)
         Application.ensure_all_started(:timeless_traces)
 
-        otlp_body =
-          Jason.encode!(%{
-            resourceSpans: [
-              %{
-                resource: %{attributes: []},
-                scopeSpans: [
-                  %{
-                    spans: [
-                      %{
-                        traceId: "status#{code}000000000000000000000",
-                        spanId: "statspan#{code}00000000",
-                        name: "status-test",
-                        kind: 1,
-                        startTimeUnixNano: 1_700_000_000_000_000_000,
-                        endTimeUnixNano: 1_700_000_001_000_000_000,
-                        status: %{code: code},
-                        attributes: []
-                      }
-                    ]
-                  }
-                ]
-              }
-            ]
-          })
+        pb_msg = %{
+          resource_spans: [
+            %{
+              resource: %{attributes: []},
+              scope_spans: [
+                %{
+                  spans: [
+                    %{
+                      trace_id: :crypto.strong_rand_bytes(16),
+                      span_id: :crypto.strong_rand_bytes(8),
+                      parent_span_id: <<>>,
+                      name: "status-test",
+                      kind: :SPAN_KIND_INTERNAL,
+                      start_time_unix_nano: 1_700_000_000_000_000_000,
+                      end_time_unix_nano: 1_700_000_001_000_000_000,
+                      status: %{code: pb_code, message: ""},
+                      attributes: [],
+                      events: [],
+                      links: []
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
 
-        conn(:post, "/insert/opentelemetry/v1/traces", otlp_body)
-        |> put_req_header("content-type", "application/json")
+        body =
+          :opentelemetry_exporter_trace_service_pb.encode_msg(
+            pb_msg,
+            :export_trace_service_request
+          )
+
+        conn(:post, "/insert/opentelemetry/v1/traces", body)
+        |> put_req_header("content-type", "application/x-protobuf")
         |> call()
 
         TimelessTraces.flush()
@@ -229,51 +405,8 @@ defmodule TimelessTraces.HTTPTest do
         {:ok, %{entries: [span]}} = TimelessTraces.query([])
 
         assert span.status == expected,
-               "Expected status #{expected} for OTLP code #{code}, got #{span.status}"
+               "Expected status #{expected} for protobuf code #{pb_code}, got #{span.status}"
       end
-    end
-
-    test "parses OTLP attributes with different value types" do
-      otlp_body =
-        Jason.encode!(%{
-          resourceSpans: [
-            %{
-              resource: %{attributes: []},
-              scopeSpans: [
-                %{
-                  spans: [
-                    %{
-                      traceId: "attrtest00000000000000000000000",
-                      spanId: "attrspan00000000",
-                      name: "attr-test",
-                      kind: 1,
-                      startTimeUnixNano: 1_700_000_000_000_000_000,
-                      endTimeUnixNano: 1_700_000_001_000_000_000,
-                      attributes: [
-                        %{key: "str_attr", value: %{stringValue: "hello"}},
-                        %{key: "int_attr", value: %{intValue: 42}},
-                        %{key: "float_attr", value: %{doubleValue: 3.14}},
-                        %{key: "bool_attr", value: %{boolValue: true}}
-                      ]
-                    }
-                  ]
-                }
-              ]
-            }
-          ]
-        })
-
-      conn(:post, "/insert/opentelemetry/v1/traces", otlp_body)
-      |> put_req_header("content-type", "application/json")
-      |> call()
-
-      TimelessTraces.flush()
-
-      {:ok, %{entries: [span]}} = TimelessTraces.query([])
-      assert span.attributes["str_attr"] == "hello"
-      assert span.attributes["int_attr"] == 42
-      assert span.attributes["float_attr"] == 3.14
-      assert span.attributes["bool_attr"] == true
     end
 
     test "returns error for missing resourceSpans" do
@@ -294,6 +427,16 @@ defmodule TimelessTraces.HTTPTest do
 
       assert conn.status == 400
       assert json_body(conn)["error"] =~ "invalid JSON"
+    end
+
+    test "returns error for invalid protobuf" do
+      conn =
+        conn(:post, "/insert/opentelemetry/v1/traces", "not protobuf at all")
+        |> put_req_header("content-type", "application/x-protobuf")
+        |> call()
+
+      assert conn.status == 400
+      assert json_body(conn)["error"] =~ "protobuf"
     end
   end
 
@@ -337,8 +480,6 @@ defmodule TimelessTraces.HTTPTest do
 
   describe "GET /select/jaeger/api/services/:service/operations" do
     test "returns operations for a service" do
-      # Flush separately so spans end up in different blocks
-      # (operations query uses block-level term co-occurrence)
       api_spans = [
         make_span(%{
           name: "GET /users",
