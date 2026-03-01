@@ -157,20 +157,14 @@ defmodule TimelessTraces.HTTP do
   # List service names (Jaeger-compatible)
   get "/select/jaeger/api/services" do
     {:ok, services} = TimelessTraces.services()
-
-    conn
-    |> put_resp_content_type("application/json")
-    |> send_resp(200, :json.encode(%{data: services}) |> IO.iodata_to_binary())
+    send_jaeger_response(conn, services)
   end
 
   # Operations for a service (Jaeger-compatible)
   get "/select/jaeger/api/services/:service/operations" do
     service = conn.path_params["service"]
     {:ok, operations} = TimelessTraces.operations(service)
-
-    conn
-    |> put_resp_content_type("application/json")
-    |> send_resp(200, :json.encode(%{data: operations}) |> IO.iodata_to_binary())
+    send_jaeger_response(conn, operations)
   end
 
   # Search traces (Jaeger-compatible)
@@ -183,10 +177,7 @@ defmodule TimelessTraces.HTTP do
     case TimelessTraces.query(filters) do
       {:ok, %{entries: spans}} ->
         traces = group_spans_to_jaeger_traces(spans)
-
-        conn
-        |> put_resp_content_type("application/json")
-        |> send_resp(200, :json.encode(%{data: traces}) |> IO.iodata_to_binary())
+        send_jaeger_response(conn, traces)
 
       {:error, reason} ->
         json_error(conn, 500, inspect(reason))
@@ -200,10 +191,7 @@ defmodule TimelessTraces.HTTP do
     case TimelessTraces.trace(trace_id) do
       {:ok, spans} ->
         trace = spans_to_jaeger_trace(trace_id, spans)
-
-        conn
-        |> put_resp_content_type("application/json")
-        |> send_resp(200, :json.encode(%{data: [trace]}) |> IO.iodata_to_binary())
+        send_jaeger_response(conn, [trace])
 
       {:error, reason} ->
         json_error(conn, 500, inspect(reason))
@@ -479,27 +467,35 @@ defmodule TimelessTraces.HTTP do
   end
 
   defp spans_to_jaeger_trace(trace_id, spans) do
-    # Build processes map (one entry per unique service)
-    processes =
+    # Build processes map (one entry per unique service, with merged resource tags)
+    service_resources =
       spans
-      |> Enum.map(fn span ->
+      |> Enum.reduce(%{}, fn span, acc ->
         service =
           Map.get(span.attributes, "service.name") ||
             Map.get(span.resource || %{}, "service.name") || "unknown"
 
-        {span.span_id, service}
+        resource = span.resource || %{}
+        existing = Map.get(acc, service, %{})
+        Map.put(acc, service, Map.merge(existing, resource))
       end)
-      |> Enum.uniq_by(fn {_, svc} -> svc end)
-      |> Enum.with_index(1)
-      |> Enum.map(fn {{_span_id, service}, idx} ->
-        key = "p#{idx}"
-        {service, key}
-      end)
+      |> Enum.to_list()
+
+    indexed = Enum.with_index(service_resources, 1)
+
+    processes =
+      indexed
+      |> Enum.map(fn {{service, _resource}, idx} -> {service, "p#{idx}"} end)
       |> Map.new()
 
     process_entries =
-      Map.new(processes, fn {service, key} ->
-        {key, %{serviceName: service, tags: []}}
+      Map.new(indexed, fn {{service, resource}, idx} ->
+        tags =
+          resource
+          |> Map.drop(["service.name"])
+          |> Enum.map(fn {k, v} -> attribute_to_jaeger_tag(k, v) end)
+
+        {"p#{idx}", %{serviceName: service, tags: tags}}
       end)
 
     jaeger_spans =
@@ -526,14 +522,16 @@ defmodule TimelessTraces.HTTP do
           duration: div(span.duration_ns, 1000),
           tags: span_to_jaeger_tags(span),
           logs: span_events_to_jaeger_logs(span.events),
-          processID: process_id
+          processID: process_id,
+          warnings: :null
         }
       end)
 
     %{
       traceID: trace_id,
       spans: jaeger_spans,
-      processes: process_entries
+      processes: process_entries,
+      warnings: :null
     }
   end
 
@@ -601,6 +599,19 @@ defmodule TimelessTraces.HTTP do
 
       %{timestamp: timestamp, fields: List.flatten(fields)}
     end)
+  end
+
+  defp send_jaeger_response(conn, data) do
+    total = if is_list(data), do: length(data), else: 0
+
+    body =
+      %{data: data, errors: :null, limit: 0, offset: 0, total: total}
+      |> :json.encode()
+      |> IO.iodata_to_binary()
+
+    conn
+    |> put_resp_content_type("application/json")
+    |> send_resp(200, body)
   end
 
   defp default_backup_dir do
