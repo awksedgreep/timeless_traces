@@ -16,6 +16,10 @@ defmodule TimelessTraces.Telemetry do
       * Measurements: `%{duration: native_time, blocks_deleted: integer}`
       * Metadata: `%{}`
 
+    * `[:timeless_traces, :flush, :error]` - A buffer flush failed or crashed.
+      * Measurements: `%{entry_count: integer}`
+      * Metadata: `%{reason: term}`
+
     * `[:timeless_traces, :block, :error]` - A block read failed (corrupt or missing).
       * Measurements: `%{}`
       * Metadata: `%{file_path: string, reason: atom}`

@@ -132,10 +132,17 @@ defmodule TimelessTraces.Compactor do
           :ok
 
         {:error, reason} ->
-          Logger.warning("TimelessTraces: compaction failed: #{inspect(reason)}")
+          Logger.error("TimelessTraces: compaction write failed: #{inspect(reason)}")
           :noop
       end
     end
+  rescue
+    e ->
+      Logger.error(
+        "TimelessTraces: compaction crashed: #{Exception.format(:error, e, __STACKTRACE__)}"
+      )
+
+      :noop
   end
 
   # --- Merge compaction ---
@@ -242,10 +249,18 @@ defmodule TimelessTraces.Compactor do
 
           :ok
 
-        {:error, _} ->
+        {:error, reason} ->
+          Logger.error("TimelessTraces: merge batch write failed: #{inspect(reason)}")
           :noop
       end
     end
+  rescue
+    e ->
+      Logger.error(
+        "TimelessTraces: merge batch crashed: #{Exception.format(:error, e, __STACKTRACE__)}"
+      )
+
+      :noop
   end
 
   defp format_from_path(nil), do: :raw

@@ -3,6 +3,8 @@ defmodule TimelessTraces.Buffer do
 
   use GenServer
 
+  require Logger
+
   @max_in_flight System.schedulers_online()
 
   @spec start_link(keyword()) :: GenServer.on_start()
@@ -132,8 +134,25 @@ defmodule TimelessTraces.Buffer do
         )
 
       {:error, reason} ->
-        IO.warn("TimelessTraces: failed to write block: #{inspect(reason)}")
+        Logger.error("TimelessTraces: failed to write block: #{inspect(reason)}")
+
+        TimelessTraces.Telemetry.event(
+          [:timeless_traces, :flush, :error],
+          %{entry_count: length(entries)},
+          %{reason: reason}
+        )
     end
+  rescue
+    e ->
+      Logger.error(
+        "TimelessTraces: flush crashed: #{Exception.format(:error, e, __STACKTRACE__)}"
+      )
+
+      TimelessTraces.Telemetry.event(
+        [:timeless_traces, :flush, :error],
+        %{entry_count: length(entries)},
+        %{reason: e}
+      )
   end
 
   defp schedule_flush(interval) do
