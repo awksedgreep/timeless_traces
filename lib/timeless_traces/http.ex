@@ -642,7 +642,9 @@ defmodule TimelessTraces.HTTP do
     body = maybe_gunzip(conn, body)
 
     try do
-      msg = :opentelemetry_exporter_trace_service_pb.decode_msg(body, :export_trace_service_request)
+      msg =
+        :opentelemetry_exporter_trace_service_pb.decode_msg(body, :export_trace_service_request)
+
       resource_spans = Map.get(msg, :resource_spans, [])
       spans = parse_protobuf_resource_spans(resource_spans)
 
@@ -713,9 +715,11 @@ defmodule TimelessTraces.HTTP do
   defp encode_hex(_), do: ""
 
   defp encode_hex_or_nil(<<>>), do: nil
+
   defp encode_hex_or_nil(bin) when is_binary(bin) and byte_size(bin) > 0 do
     Base.encode16(bin, case: :lower)
   end
+
   defp encode_hex_or_nil(_), do: nil
 
   defp parse_pb_kind(:SPAN_KIND_INTERNAL), do: :internal
