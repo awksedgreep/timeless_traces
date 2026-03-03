@@ -50,8 +50,10 @@ defmodule TimelessTraces.DiskTest do
       assert File.dir?(Path.join(@data_dir, "blocks"))
     end
 
-    test "creates index.db" do
-      assert File.exists?(Path.join(@data_dir, "index.db"))
+    test "creates index files on shutdown" do
+      # index.snapshot is written on graceful shutdown (terminate/2)
+      # index.log is created when the disk_log opens
+      assert File.exists?(Path.join(@data_dir, "index.log"))
     end
 
     test "ingest, flush, and query with disk storage" do

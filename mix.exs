@@ -25,7 +25,6 @@ defmodule TimelessTraces.MixProject do
 
   defp deps do
     [
-      {:exqlite, "~> 0.27"},
       {:ezstd, "~> 1.2"},
       {:opentelemetry_api, "~> 1.4"},
       {:opentelemetry, "~> 1.5"},
