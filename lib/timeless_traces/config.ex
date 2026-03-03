@@ -29,8 +29,8 @@ defmodule TimelessTraces.Config do
   # 7 days in seconds
   @default_retention_max_age 7 * 86_400
 
-  # 512 MB
-  @default_retention_max_size 512 * 1_048_576
+  # 256 MB
+  @default_retention_max_size 256 * 1_048_576
 
   @spec retention_max_age() :: pos_integer() | nil
   def retention_max_age do
@@ -44,7 +44,7 @@ defmodule TimelessTraces.Config do
 
   @spec retention_check_interval() :: pos_integer()
   def retention_check_interval do
-    Application.get_env(:timeless_traces, :retention_check_interval, 300_000)
+    Application.get_env(:timeless_traces, :retention_check_interval, 120_000)
   end
 
   @spec compaction_threshold() :: pos_integer()
@@ -85,5 +85,15 @@ defmodule TimelessTraces.Config do
   @spec merge_compaction_min_blocks() :: pos_integer()
   def merge_compaction_min_blocks do
     Application.get_env(:timeless_traces, :merge_compaction_min_blocks, 4)
+  end
+
+  @spec compaction_max_backoff() :: pos_integer()
+  def compaction_max_backoff do
+    Application.get_env(:timeless_traces, :compaction_max_backoff, 300_000)
+  end
+
+  @spec max_term_index_entries() :: pos_integer() | nil
+  def max_term_index_entries do
+    Application.get_env(:timeless_traces, :max_term_index_entries, 500_000)
   end
 end
