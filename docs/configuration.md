@@ -89,7 +89,7 @@ The exporter reads spans directly from the OTel SDK's ETS table -- no HTTP or pr
 
 ### Disk (default)
 
-Blocks are stored as files in `data_dir/blocks/` and the index in `data_dir/index.db` (SQLite WAL mode):
+Blocks are stored as files in `data_dir/blocks/` and the index is persisted as `data_dir/index.snapshot` + `data_dir/index.log`:
 
 ```elixir
 config :timeless_traces, storage: :disk
@@ -97,7 +97,7 @@ config :timeless_traces, storage: :disk
 
 ### Memory
 
-Blocks are stored as BLOBs in an in-memory SQLite database. No files are written to disk. Data does not survive restarts. Useful for testing:
+Blocks are stored in ETS tables only. No files are written to disk. Data does not survive restarts. Useful for testing:
 
 ```elixir
 config :timeless_traces, storage: :memory
@@ -146,4 +146,4 @@ Merge compaction can also be triggered manually via `TimelessTraces.merge_now()`
 
 ### Index publish interval
 
-The index batches SQLite writes every 2 seconds by default. Lower values mean spans become queryable faster but increase SQLite write load. For most workloads the default is fine.
+The index journals mutations to a disk log every 2 seconds by default. Lower values mean faster persistence but increase disk I/O. For most workloads the default is fine.

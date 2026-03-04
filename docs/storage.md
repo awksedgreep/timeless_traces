@@ -114,9 +114,8 @@ TimelessTraces.Compactor.compact_now()
 
 ```
 data_dir/
-├── index.db          # SQLite index (WAL mode)
-├── index.db-wal      # SQLite WAL file
-├── index.db-shm      # SQLite shared memory
+├── index.snapshot    # Periodic ETS table dump (compressed ETF)
+├── index.log         # Write-ahead log (Erlang disk_log)
 └── blocks/
     ├── 000000000001.raw   # Raw block (temporary)
     ├── 000000000002.raw   # Raw block (temporary)
@@ -136,7 +135,7 @@ config :timeless_traces, storage: :memory
 ```
 
 In memory mode:
-- Block data is stored as BLOBs in an in-memory SQLite database
+- Block data is stored in ETS tables only
 - No block files are written to disk
 - The ETS tables still provide lock-free read access
 - Data does not survive application restarts

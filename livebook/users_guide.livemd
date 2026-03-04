@@ -84,7 +84,7 @@ TimelessTraces.flush()
 
 TimelessTraces is an embedded OpenTelemetry span storage and compression
 library for Elixir. It plugs into the OTel SDK as a span exporter, stores
-spans locally with zstd or OpenZL compression (~10x), indexes them in SQLite,
+spans locally with zstd or OpenZL compression (~10x), indexes them in ETS,
 and exposes a Jaeger-compatible HTTP API for trace visualization.
 
 ### Add the Dependency
@@ -121,8 +121,8 @@ defaults:
 
 | Option                      | Default              | Description                                                 |
 | --------------------------- | -------------------- | ----------------------------------------------------------- |
-| `:data_dir`                 | `"priv/span_stream"` | Directory for block files and SQLite index                  |
-| `:storage`                  | `:disk`              | `:disk` or `:memory` (memory stores blocks as SQLite BLOBs) |
+| `:data_dir`                 | `"priv/span_stream"` | Directory for block files and index snapshots               |
+| `:storage`                  | `:disk`              | `:disk` (block files + ETS snapshots) or `:memory` (ETS only) |
 | `:flush_interval`           | `1_000`              | Buffer flush interval (ms)                                  |
 | `:max_buffer_size`          | `1_000`              | Spans before auto-flush                                     |
 | `:query_timeout`            | `30_000`             | Query operation timeout (ms)                                |
@@ -134,7 +134,7 @@ defaults:
 | `:compaction_max_raw_age`   | `60`                 | Force compact raw blocks older than this (seconds)          |
 | `:compaction_format`        | `:openzl`            | Compression format: `:zstd` or `:openzl`                    |
 | `:compression_level`        | `6`                  | Compression level (1-22)                                    |
-| `:index_publish_interval`   | `2_000`              | ETS → SQLite batch flush interval (ms)                    |
+| `:index_publish_interval`   | `2_000`              | Index disk log flush interval (ms)                          |
 | `:http`                     | `false`              | `true`, or `[port: 10428, bearer_token: "secret"]`          |
 
 ### Full Configuration Example
@@ -494,7 +494,7 @@ Returns a `%TimelessTraces.Stats{}` struct with fields:
 | `total_entries`                                     | Total spans stored                  |
 | `total_bytes`                                       | Total block data bytes              |
 | `disk_size`                                         | On-disk storage size                |
-| `index_size`                                        | SQLite index size                   |
+| `index_size`                                        | Index snapshot + log size           |
 | `oldest_timestamp`                                  | Oldest span timestamp (nanoseconds) |
 | `newest_timestamp`                                  | Newest span timestamp (nanoseconds) |
 | `raw_blocks` / `raw_bytes` / `raw_entries`          | Uncompressed block stats            |
@@ -540,7 +540,7 @@ Create a consistent online backup without stopping the application:
 
 ```elixir
 {:ok, result} = TimelessTraces.backup("/tmp/traces_backup")
-# result => %{path: "/tmp/traces_backup", files: ["index.db", ...], total_bytes: 24000000}
+# result => %{path: "/tmp/traces_backup", files: ["index.snapshot", ...], total_bytes: 24000000}
 ```
 
 Via HTTP:
@@ -552,7 +552,7 @@ curl -X POST http://localhost:10428/api/v1/backup \
 ```
 
 ```json
-{"status":"ok","path":"/tmp/traces_backup","files":["index.db","blocks"],"total_bytes":24000000}
+{"status":"ok","path":"/tmp/traces_backup","files":["index.snapshot","blocks"],"total_bytes":24000000}
 ```
 
 To download the backup, archive it from the server filesystem:

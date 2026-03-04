@@ -3,7 +3,7 @@ defmodule TimelessTraces do
   Embedded OpenTelemetry span storage and compression for Elixir applications.
 
   TimelessTraces receives spans from the OpenTelemetry Erlang SDK, compresses them
-  into zstd blocks, and indexes them in SQLite for fast querying.
+  into compressed blocks, and indexes them in ETS for fast querying.
 
   ## Setup
 
@@ -156,8 +156,8 @@ defmodule TimelessTraces do
   @doc """
   Create a consistent online backup of the span store.
 
-  Flushes all in-flight data, then uses SQLite's `VACUUM INTO` to snapshot
-  the index database and copies block files to the target directory.
+  Flushes all in-flight data, writes an ETS index snapshot,
+  and copies block files to the target directory.
 
   ## Parameters
 
@@ -177,8 +177,8 @@ defmodule TimelessTraces do
 
     File.mkdir_p!(target_dir)
 
-    # Backup index DB via VACUUM INTO
-    index_target = Path.join(target_dir, "index.db")
+    # Backup index snapshot
+    index_target = Path.join(target_dir, "index.snapshot")
 
     case TimelessTraces.Index.backup(index_target) do
       :ok ->
@@ -193,7 +193,7 @@ defmodule TimelessTraces do
         {:ok,
          %{
            path: target_dir,
-           files: ["index.db", "blocks"],
+           files: ["index.snapshot", "blocks"],
            total_bytes: index_bytes + block_bytes
          }}
 

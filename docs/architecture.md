@@ -7,7 +7,7 @@ This document covers TimelessTraces' internal architecture: the supervision tree
 ```
 TimelessTraces.Supervisor (:one_for_one)
 ├── Registry (TimelessTraces.Registry)     # Pub/sub for live tail
-├── Index (GenServer)                       # SQLite + ETS indexing
+├── Index (GenServer)                       # ETS indexing + snapshot/disk log persistence
 ├── FlushSupervisor (Task.Supervisor)       # Async flush tasks
 ├── Buffer (GenServer)                      # Span accumulation
 ├── Compactor (GenServer)                   # Raw → compressed blocks
@@ -28,9 +28,9 @@ Buffer (accumulate, auto-flush every 1s or 1000 spans)
     ↓ broadcasts to subscribers
 Writer (serialize as raw Erlang terms)
     ↓
-Disk (blocks/) or Memory (SQLite BLOB)
+Disk (blocks/) or Memory (ETS)
     ↓
-Index (block metadata + inverted term index + trace index → SQLite + ETS)
+Index (block metadata + inverted term index + trace index → ETS + disk log)
     ↓
 Compactor (merge raw → compressed OpenZL/zstd every 30s or at threshold)
     ↓
@@ -66,33 +66,32 @@ Each flush writes a **raw block** -- a batch of spans serialized with `:erlang.t
 2. **Write**: The binary is written to a block file (`blocks/000000000001.raw`)
 3. **Index**: Block metadata, inverted terms, and trace index rows are sent to the Index
 
-The Index processes block metadata in batches (every `index_publish_interval` ms) to reduce SQLite write contention.
+The Index processes block metadata with sub-millisecond ETS inserts, journaled to a disk log for durability.
 
 ## Index
 
-The Index uses a two-tier architecture for fast reads and durable writes:
+All index state lives in ETS tables — the authoritative source of truth at runtime:
 
-### SQLite (persistence)
-
-SQLite (WAL mode, 128MB mmap, 16MB cache) stores:
-
-- **blocks** table: `block_id`, `file_path`, `byte_size`, `entry_count`, `ts_min`, `ts_max`, `format`, `data` (BLOB in memory mode)
-- **block_terms** table: inverted index mapping terms to block IDs
-- **trace_index** table: maps `trace_id` to block IDs with `span_count`, `root_span_name`, `duration_ns`, `has_error`
-- **compression_stats** table: singleton row tracking compaction statistics
-
-### ETS (fast reads)
-
-Four ETS tables provide lock-free concurrent reads:
+### ETS tables
 
 | Table | Type | Purpose |
 |-------|------|---------|
-| `timeless_traces_blocks` | ordered_set | Block metadata lookup |
+| `timeless_traces_blocks` | ordered_set | Block metadata (block_id → file_path, byte_size, entry_count, ts_min, ts_max, format, created_at) |
 | `timeless_traces_term_index` | bag | Term → block_id mapping |
 | `timeless_traces_trace_index` | bag | trace_id → block_id mapping |
 | `timeless_traces_compression_stats` | set | Compression statistics |
+| `timeless_traces_block_data` | set | In-memory block data (memory storage mode only) |
 
 All ETS tables are created with `read_concurrency: true` and `write_concurrency: true`.
+
+### Persistence
+
+Index durability uses a snapshot + write-ahead log strategy:
+
+- **`index.snapshot`**: Periodic full dump of all ETS tables (Erlang `term_to_binary`, compressed). Written every 1000 index operations or on graceful shutdown.
+- **`index.log`**: Erlang `:disk_log` that journals every index mutation (block inserts, deletes, compactions). Replayed on startup after loading the snapshot.
+
+On startup: load snapshot → replay log entries newer than the snapshot → index is fully reconstructed in ETS. No external database required.
 
 ### Inverted term index
 
@@ -165,9 +164,8 @@ The Retention GenServer enforces two independent policies every `retention_check
 
 ```
 data_dir/
-├── index.db          # SQLite index (WAL mode)
-├── index.db-wal      # SQLite WAL file
-├── index.db-shm      # SQLite shared memory
+├── index.snapshot    # Periodic ETS table dump (compressed ETF)
+├── index.log         # Write-ahead log (Erlang disk_log)
 └── blocks/
     ├── 000000000001.raw   # Raw block (temporary)
     ├── 000000000002.raw   # Raw block (temporary)

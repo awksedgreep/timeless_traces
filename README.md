@@ -4,7 +4,7 @@
 
 Embedded OpenTelemetry span storage and compression for Elixir applications.
 
-TimelessTraces receives spans directly from the OpenTelemetry Erlang SDK (no HTTP, no protobuf), compresses them with two-tier raw/OpenZL block storage (~10x compression), and indexes them in SQLite for fast trace-level and span-level queries. Zero external infrastructure required.
+TimelessTraces receives spans directly from the OpenTelemetry Erlang SDK (no HTTP, no protobuf), compresses them with two-tier raw/OpenZL block storage (~10x compression), and indexes them in ETS for lock-free trace-level and span-level queries. Zero external infrastructure required.
 
 Part of the embedded observability stack:
 - [timeless_metrics](https://github.com/awksedgreep/timeless_metrics) - numeric time series compression
@@ -120,21 +120,21 @@ stats.disk_size       #=> 24_000_000
 ## Architecture
 
 ```
-OTel SDK → Exporter → Buffer → Writer (raw) → SQLite Index
+OTel SDK → Exporter → Buffer → Writer (raw) → ETS Index → disk log
                                     ↓
                               Compactor (OpenZL/zstd)
 ```
 
 - **Buffer** accumulates spans, flushes every 1s or 1000 spans
 - **Writer** serializes blocks as raw Erlang terms initially
-- **Index** stores block metadata + inverted term index + trace index in SQLite
+- **Index** stores block metadata + inverted term index + trace index in ETS, persisted via snapshots + disk log
 - **Compactor** merges raw blocks into compressed blocks (zstd or OpenZL columnar)
 - **Retention** enforces age and size limits
 
 ### Storage Modes
 
-- **`:disk`** - Blocks as files in `data_dir/blocks/`, index in `data_dir/index.db`
-- **`:memory`** - Blocks as BLOBs in SQLite `:memory:`, no filesystem needed
+- **`:disk`** - Blocks as files in `data_dir/blocks/`, index persisted as `index.snapshot` + `index.log`
+- **`:memory`** - Blocks in ETS tables only, no filesystem needed
 
 ## Compression
 
@@ -142,28 +142,32 @@ Two compression backends are supported. OpenZL columnar compression (default) ac
 
 | Backend | Size (500K spans) | Ratio | Compress | Decompress |
 |---|---|---|---|---|
-| zstd | 32.8 MB | 6.8x | 2.0s | 1.1s |
-| OpenZL columnar | 22.3 MB | 10.0x | 2.0s | 2.3s |
+| zstd | 32.8 MB | 6.8x | 2.1s | 1.5s |
+| OpenZL columnar | 22.1 MB | 10.2x | 1.9s | 564ms |
 
 ## Performance
+
+Run on a 28-core laptop. Reproduce with `mix timeless_traces.ingest_benchmark`, `mix timeless_traces.compression_benchmark`, and `mix timeless_traces.search_benchmark`.
 
 Ingestion throughput on 500K spans (1000 spans/block):
 
 | Phase | Throughput |
 |---|---|
-| Writer only (serialization + disk I/O) | ~131K spans/sec |
-| Writer + Index (sync SQLite indexing) | ~38K spans/sec |
-| Full pipeline (Buffer → Writer → async Index) | ~115K spans/sec |
+| Writer only (serialization + disk I/O) | ~196K spans/sec |
+| Writer + Index (ETS immediate + disk log persist) | ~468K spans/sec |
+| Full pipeline (Buffer → Writer → async Index) | ~303K spans/sec |
+
+The ETS-first indexing architecture makes index overhead negligible.
 
 Query latency (500K spans, 500 blocks, avg over 3 runs):
 
 | Query | zstd | OpenZL | Speedup |
 |---|---|---|---|
-| All spans (limit 100) | 945ms | 442ms | 2.1x |
-| status=error | 289ms | 148ms | 2.0x |
-| service filter | 318ms | 243ms | 1.3x |
-| kind=server | 275ms | 225ms | 1.2x |
-| Trace lookup | 5.5ms | 5.7ms | 1.0x |
+| All spans (limit 100) | 1.12s | 860ms | 1.3x |
+| status=error | 327ms | 158ms | 2.1x |
+| service filter | 316ms | 225ms | 1.4x |
+| kind=server | 324ms | 226ms | 1.4x |
+| Trace lookup | 7.1ms | 10.0ms | 0.7x |
 
 ## License
 

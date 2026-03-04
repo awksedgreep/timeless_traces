@@ -21,7 +21,7 @@ graph TD
 ```
 
 * **Registry** — Duplicate-key registry for real-time span subscriptions
-* **Index** — SQLite persistence + ETS caching for block metadata, term index, and trace index
+* **Index** — ETS tables for block metadata, term index, and trace index, persisted via snapshots + disk log
 * **FlushSupervisor** — Task.Supervisor managing concurrent async flush tasks
 * **Buffer** — Accumulates spans, auto-flushes on size or interval threshold
 * **Compactor** — Merges raw blocks into compressed blocks (zstd or OpenZL)
@@ -119,7 +119,7 @@ sequenceDiagram
     W->>I: index_block_async(meta, terms, trace_rows)
     I->>I: ETS insert (hot cache)
 
-    Note over I: Every 2s:<br/>ETS → SQLite batch persist
+    Note over I: Every 100ms:<br/>flush pending to disk log
 ```
 
 ### Backpressure
@@ -151,14 +151,14 @@ flowchart TD
     subgraph "On-Disk Layout"
         DIR["data_dir/"]
         DIR --> BLK["blocks/<br/>000000000001.raw<br/>000000000002.zst<br/>000000000003.ozl"]
-        DIR --> IDX["index.db<br/><i>SQLite</i>"]
+        DIR --> IDX["index.snapshot + index.log<br/><i>ETS persistence</i>"]
     end
 ```
 
 ### Memory Mode
 
 When `storage: :memory` is configured, block data is stored as BLOBs inside
-SQLite instead of individual files. The index and ETS caches operate identically.
+ETS tables only. No files are written to disk. Data does not survive restarts.
 
 ## Indexing Strategy
 
@@ -173,15 +173,15 @@ flowchart LR
         TR["trace_index<br/><i>bag</i><br/>trace_id → block_id"]
     end
 
-    subgraph "SQLite (Persistent)"
-        BM["blocks table<br/>id, file_path, format,<br/>byte_size, entry_count,<br/>ts_min, ts_max"]
-        BTM["block_terms table<br/>term, block_id"]
-        TRM["trace_index table<br/>trace_id, block_id,<br/>span_count, root_span_name,<br/>duration_ns, has_error"]
+    subgraph "Persistence"
+        SNAP["index.snapshot<br/><i>periodic ETS dump</i>"]
+        LOG["index.log<br/><i>write-ahead log</i>"]
     end
 
     W["Writer"] -->|"index_block_async"| I["Index GenServer"]
     I -->|"immediate"| BT & TI & TR
-    I -->|"batched 2s"| BM & BTM & TRM
+    I -->|"journal"| LOG
+    I -->|"every 1000 ops"| SNAP
 ```
 
 ### Indexed Terms
@@ -269,7 +269,7 @@ flowchart TD
     READ --> SORT["Sort by start_time"]
     SORT --> COMPRESS["Compress to zstd or OpenZL"]
     COMPRESS --> WRITE["Write compressed block"]
-    WRITE --> REINDEX["Update Index<br/>(ETS + SQLite)"]
+    WRITE --> REINDEX["Update Index<br/>(ETS + disk log)"]
     REINDEX --> DELETE["Delete raw block files"]
     DELETE --> STATS["Update compression stats"]
 ```
@@ -278,8 +278,8 @@ flowchart TD
 
 | Format           | Ratio | Query (status=error) |
 | ---------------- | ----- | -------------------- |
-| Zstd (level 6)   | ~6.8x | 289ms                |
-| OpenZL (level 6) | ~10x  | 148ms                |
+| Zstd (level 6)   | ~6.8x | 327ms                |
+| OpenZL (level 6) | ~10.2x | 158ms               |
 
 OpenZL achieves better compression and faster queries due to columnar layout.
 
@@ -307,7 +307,7 @@ flowchart TD
     B1 & B2 & BN --> DECOMP["Decompress all blocks in batch"]
     DECOMP --> SORT["Sort spans by start_time"]
     SORT --> RECOMP["Recompress as single block<br/><i>zstd or OpenZL</i>"]
-    RECOMP --> REINDEX["Update Index<br/>(ETS + SQLite + trace_index)"]
+    RECOMP --> REINDEX["Update Index<br/>(ETS + disk log + trace_index)"]
     REINDEX --> DELETE["Delete old block files"]
     DELETE --> TEL["Emit telemetry:<br/>[:timeless_traces, :merge_compaction, :stop]"]
 ```

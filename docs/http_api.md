@@ -266,7 +266,7 @@ Response:
 {
   "status": "ok",
   "path": "/tmp/span_backup",
-  "files": ["index.db", "blocks"],
+  "files": ["index.snapshot", "blocks"],
   "total_bytes": 24000000
 }
 ```
