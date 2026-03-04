@@ -38,7 +38,7 @@ defmodule TimelessTraces.MixProject do
 
   defp package do
     [
-      maintainers: ["Matt Cotner"],
+      maintainers: ["Mark Cotner"],
       licenses: ["MIT"],
       links: %{"GitHub" => "https://github.com/awksedgreep/timeless_traces"},
       files: ~w(lib .formatter.exs mix.exs README.md LICENSE)
