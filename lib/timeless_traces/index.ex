@@ -742,9 +742,7 @@ defmodule TimelessTraces.Index do
       {:repaired, ref, {:recovered, recovered}, {:badbytes, bad}} ->
         require Logger
 
-        Logger.warning(
-          "disk_log #{log_name} repaired: recovered=#{recovered} badbytes=#{bad}"
-        )
+        Logger.warning("disk_log #{log_name} repaired: recovered=#{recovered} badbytes=#{bad}")
 
         ref
     end
