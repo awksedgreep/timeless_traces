@@ -45,17 +45,26 @@ defmodule Mix.Tasks.TimelessTraces.HttpBenchmark do
     IO.puts("--- Phase 3: POST OTLP ingest (10 spans/req) ---")
     batch_body = otlp_body(10)
     ingest_10_rps = bench_post("/insert/opentelemetry/v1/traces", batch_body, "application/json")
-    IO.puts("  #{fmt_number(ingest_10_rps)} req/sec (#{fmt_number(ingest_10_rps * 10)} spans/sec)\n")
+
+    IO.puts(
+      "  #{fmt_number(ingest_10_rps)} req/sec (#{fmt_number(ingest_10_rps * 10)} spans/sec)\n"
+    )
 
     # --- Phase 4: OTLP JSON ingest (100 spans per request) ---
     IO.puts("--- Phase 4: POST OTLP ingest (100 spans/req) ---")
     big_body = otlp_body(100)
     ingest_100_rps = bench_post("/insert/opentelemetry/v1/traces", big_body, "application/json")
-    IO.puts("  #{fmt_number(ingest_100_rps)} req/sec (#{fmt_number(ingest_100_rps * 100)} spans/sec)\n")
+
+    IO.puts(
+      "  #{fmt_number(ingest_100_rps)} req/sec (#{fmt_number(ingest_100_rps * 100)} spans/sec)\n"
+    )
 
     # --- Phase 5: Concurrent ingest (multiple connections) ---
     IO.puts("--- Phase 5: Concurrent ingest (8 workers, 10 spans/req) ---")
-    conc_rps = bench_concurrent_post("/insert/opentelemetry/v1/traces", batch_body, "application/json", 8)
+
+    conc_rps =
+      bench_concurrent_post("/insert/opentelemetry/v1/traces", batch_body, "application/json", 8)
+
     IO.puts("  #{fmt_number(conc_rps)} req/sec (#{fmt_number(conc_rps * 10)} spans/sec)\n")
 
     # Reset state for query benchmarks with small dataset
@@ -83,9 +92,19 @@ defmodule Mix.Tasks.TimelessTraces.HttpBenchmark do
     IO.puts("=== Summary ===")
     IO.puts("  Health (baseline):      #{fmt_number(health_rps)} req/sec")
     IO.puts("  Ingest 1 span/req:      #{fmt_number(ingest_1_rps)} req/sec")
-    IO.puts("  Ingest 10 spans/req:    #{fmt_number(ingest_10_rps)} req/sec  (#{fmt_number(ingest_10_rps * 10)} spans/sec)")
-    IO.puts("  Ingest 100 spans/req:   #{fmt_number(ingest_100_rps)} req/sec  (#{fmt_number(ingest_100_rps * 100)} spans/sec)")
-    IO.puts("  Concurrent ingest (8x): #{fmt_number(conc_rps)} req/sec  (#{fmt_number(conc_rps * 10)} spans/sec)")
+
+    IO.puts(
+      "  Ingest 10 spans/req:    #{fmt_number(ingest_10_rps)} req/sec  (#{fmt_number(ingest_10_rps * 10)} spans/sec)"
+    )
+
+    IO.puts(
+      "  Ingest 100 spans/req:   #{fmt_number(ingest_100_rps)} req/sec  (#{fmt_number(ingest_100_rps * 100)} spans/sec)"
+    )
+
+    IO.puts(
+      "  Concurrent ingest (8x): #{fmt_number(conc_rps)} req/sec  (#{fmt_number(conc_rps * 10)} spans/sec)"
+    )
+
     IO.puts("  Services query:         #{fmt_number(svc_rps)} req/sec")
     IO.puts("  Trace search:           #{fmt_number(search_rps)} req/sec")
     IO.puts("  Get trace:              #{fmt_number(trace_rps)} req/sec")
@@ -132,9 +151,11 @@ defmodule Mix.Tasks.TimelessTraces.HttpBenchmark do
 
     # Timed run
     deadline = System.monotonic_time(:millisecond) + @bench_duration_sec * 1000
-    count = run_until(deadline, 0, fn ->
-      {:ok, _} = :httpc.request(:get, {url, []}, http_opts, req_opts)
-    end)
+
+    count =
+      run_until(deadline, 0, fn ->
+        {:ok, _} = :httpc.request(:get, {url, []}, http_opts, req_opts)
+      end)
 
     round(count / @bench_duration_sec)
   end
@@ -152,9 +173,11 @@ defmodule Mix.Tasks.TimelessTraces.HttpBenchmark do
 
     # Timed run
     deadline = System.monotonic_time(:millisecond) + @bench_duration_sec * 1000
-    count = run_until(deadline, 0, fn ->
-      {:ok, _} = :httpc.request(:post, {url, [], ct, body}, http_opts, req_opts)
-    end)
+
+    count =
+      run_until(deadline, 0, fn ->
+        {:ok, _} = :httpc.request(:post, {url, [], ct, body}, http_opts, req_opts)
+      end)
 
     round(count / @bench_duration_sec)
   end
@@ -176,9 +199,11 @@ defmodule Mix.Tasks.TimelessTraces.HttpBenchmark do
     pids =
       for _ <- 1..workers do
         spawn_link(fn ->
-          count = run_until(deadline, 0, fn ->
-            {:ok, _} = :httpc.request(:post, {url, [], ct, body}, http_opts, req_opts)
-          end)
+          count =
+            run_until(deadline, 0, fn ->
+              {:ok, _} = :httpc.request(:post, {url, [], ct, body}, http_opts, req_opts)
+            end)
+
           send(parent, {:done, count})
         end)
       end
@@ -248,7 +273,10 @@ defmodule Mix.Tasks.TimelessTraces.HttpBenchmark do
   defp random_hex(n), do: :crypto.strong_rand_bytes(n) |> Base.encode16(case: :lower)
 
   defp fmt_number(n) when is_float(n), do: fmt_number(round(n))
-  defp fmt_number(n) when n >= 1_000_000, do: "#{:erlang.float_to_binary(n / 1_000_000, decimals: 1)}M"
+
+  defp fmt_number(n) when n >= 1_000_000,
+    do: "#{:erlang.float_to_binary(n / 1_000_000, decimals: 1)}M"
+
   defp fmt_number(n) when n >= 1_000, do: "#{:erlang.float_to_binary(n / 1_000, decimals: 1)}K"
   defp fmt_number(n), do: "#{n}"
 end

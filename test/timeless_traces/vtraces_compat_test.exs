@@ -612,9 +612,7 @@ defmodule TimelessTraces.VTracesCompatTest do
         |> IO.iodata_to_binary()
 
       resp =
-        post("/insert/opentelemetry/v1/traces", otlp_body,
-          content_type: "application/json"
-        )
+        post("/insert/opentelemetry/v1/traces", otlp_body, content_type: "application/json")
 
       assert resp.status == 200
       # VictoriaTraces returns {"partialSuccess":{}}

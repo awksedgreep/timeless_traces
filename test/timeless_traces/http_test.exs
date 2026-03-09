@@ -133,9 +133,7 @@ defmodule TimelessTraces.HTTPTest do
         })
 
       resp =
-        post("/insert/opentelemetry/v1/traces", otlp_body,
-          content_type: "application/json"
-        )
+        post("/insert/opentelemetry/v1/traces", otlp_body, content_type: "application/json")
 
       assert resp.status == 200
 
@@ -213,9 +211,7 @@ defmodule TimelessTraces.HTTPTest do
         )
 
       resp =
-        post("/insert/opentelemetry/v1/traces", body,
-          content_type: "application/x-protobuf"
-        )
+        post("/insert/opentelemetry/v1/traces", body, content_type: "application/x-protobuf")
 
       assert resp.status == 200
 
@@ -345,9 +341,7 @@ defmodule TimelessTraces.HTTPTest do
             :export_trace_service_request
           )
 
-        post("/insert/opentelemetry/v1/traces", body,
-          content_type: "application/x-protobuf"
-        )
+        post("/insert/opentelemetry/v1/traces", body, content_type: "application/x-protobuf")
 
         TimelessTraces.flush()
 
@@ -400,9 +394,7 @@ defmodule TimelessTraces.HTTPTest do
             :export_trace_service_request
           )
 
-        post("/insert/opentelemetry/v1/traces", body,
-          content_type: "application/x-protobuf"
-        )
+        post("/insert/opentelemetry/v1/traces", body, content_type: "application/x-protobuf")
 
         TimelessTraces.flush()
 
@@ -425,9 +417,7 @@ defmodule TimelessTraces.HTTPTest do
 
     test "returns error for invalid JSON" do
       resp =
-        post("/insert/opentelemetry/v1/traces", "not json",
-          content_type: "application/json"
-        )
+        post("/insert/opentelemetry/v1/traces", "not json", content_type: "application/json")
 
       assert resp.status == 400
       assert json_body(resp)["error"] =~ "invalid JSON"

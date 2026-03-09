@@ -22,7 +22,10 @@ defmodule Mix.Tasks.TimelessTraces.IndexBenchmark do
     total_spans = @block_count * @spans_per_block
 
     IO.puts("=== TimelessTraces Index Benchmark ===\n")
-    IO.puts("Seeding #{fmt_number(@block_count)} blocks (#{fmt_number(total_spans)} spans, ~200K term index entries)...")
+
+    IO.puts(
+      "Seeding #{fmt_number(@block_count)} blocks (#{fmt_number(total_spans)} spans, ~200K term index entries)..."
+    )
 
     {setup_us, _} = :timer.tc(fn -> seed_blocks() end)
     IO.puts("Setup: #{fmt_ms(setup_us)}\n")
@@ -39,7 +42,8 @@ defmodule Mix.Tasks.TimelessTraces.IndexBenchmark do
     benchmarks = [
       {"stats()", fn -> TimelessTraces.Index.stats() end},
       {"raw_block_ids()", fn -> TimelessTraces.Index.raw_block_ids() end},
-      {"matching_block_ids (no filter)", fn -> TimelessTraces.Index.matching_block_ids(limit: 1000) end},
+      {"matching_block_ids (no filter)",
+       fn -> TimelessTraces.Index.matching_block_ids(limit: 1000) end},
       {"matching_block_ids (term filter)",
        fn -> TimelessTraces.Index.matching_block_ids(service: "api-gateway", limit: 1000) end},
       {"matching_block_ids (time range)",
@@ -80,7 +84,9 @@ defmodule Mix.Tasks.TimelessTraces.IndexBenchmark do
     end
 
     # Destructive operations — restart app + re-seed before each iteration
-    IO.puts("\n--- Destructive Operations (#{@destructive_iterations} iterations, re-seed each) ---")
+    IO.puts(
+      "\n--- Destructive Operations (#{@destructive_iterations} iterations, re-seed each) ---"
+    )
 
     IO.puts(
       String.pad_trailing("Operation", 38) <>
