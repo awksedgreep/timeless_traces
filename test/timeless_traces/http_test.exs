@@ -1,8 +1,7 @@
 defmodule TimelessTraces.HTTPTest do
   use ExUnit.Case, async: false
 
-  import Plug.Test
-  import Plug.Conn
+  @port 10_428
 
   setup do
     Application.stop(:timeless_traces)
@@ -13,6 +12,9 @@ defmodule TimelessTraces.HTTPTest do
     Application.put_env(:timeless_traces, :http, false)
     Application.ensure_all_started(:timeless_traces)
 
+    start_supervised!({TimelessTraces.HTTP, port: @port})
+    :persistent_term.put({TimelessTraces.HTTP, :bearer_token}, nil)
+
     on_exit(fn ->
       Application.stop(:timeless_traces)
       Application.put_env(:timeless_traces, :storage, :disk)
@@ -21,12 +23,12 @@ defmodule TimelessTraces.HTTPTest do
     :ok
   end
 
-  defp call(conn, opts \\ []) do
-    TimelessTraces.HTTP.call(conn, TimelessTraces.HTTP.init(opts))
-  end
+  defp get(path), do: TimelessTraces.TestHTTP.get(@port, path)
+  defp get(path, opts), do: TimelessTraces.TestHTTP.get(@port, path, opts)
+  defp post(path, body, opts \\ []), do: TimelessTraces.TestHTTP.post(@port, path, body, opts)
 
-  defp json_body(conn) do
-    :json.decode(conn.resp_body)
+  defp json_body(resp) do
+    :json.decode(resp.body)
   end
 
   defp json_encode(term) do
@@ -66,10 +68,10 @@ defmodule TimelessTraces.HTTPTest do
 
   describe "GET /health" do
     test "returns ok with stats" do
-      conn = conn(:get, "/health") |> call()
+      resp = get("/health")
 
-      assert conn.status == 200
-      body = json_body(conn)
+      assert resp.status == 200
+      body = json_body(resp)
       assert body["status"] == "ok"
       assert is_integer(body["blocks"])
       assert is_integer(body["spans"])
@@ -130,12 +132,12 @@ defmodule TimelessTraces.HTTPTest do
           ]
         })
 
-      conn =
-        conn(:post, "/insert/opentelemetry/v1/traces", otlp_body)
-        |> put_req_header("content-type", "application/json")
-        |> call()
+      resp =
+        post("/insert/opentelemetry/v1/traces", otlp_body,
+          content_type: "application/json"
+        )
 
-      assert conn.status == 200
+      assert resp.status == 200
 
       TimelessTraces.flush()
 
@@ -210,12 +212,12 @@ defmodule TimelessTraces.HTTPTest do
           :export_trace_service_request
         )
 
-      conn =
-        conn(:post, "/insert/opentelemetry/v1/traces", body)
-        |> put_req_header("content-type", "application/x-protobuf")
-        |> call()
+      resp =
+        post("/insert/opentelemetry/v1/traces", body,
+          content_type: "application/x-protobuf"
+        )
 
-      assert conn.status == 200
+      assert resp.status == 200
 
       TimelessTraces.flush()
 
@@ -285,13 +287,13 @@ defmodule TimelessTraces.HTTPTest do
 
       gzipped = :zlib.gzip(body)
 
-      conn =
-        conn(:post, "/insert/opentelemetry/v1/traces", gzipped)
-        |> put_req_header("content-type", "application/x-protobuf")
-        |> put_req_header("content-encoding", "gzip")
-        |> call()
+      resp =
+        post("/insert/opentelemetry/v1/traces", gzipped,
+          content_type: "application/x-protobuf",
+          headers: [{"content-encoding", "gzip"}]
+        )
 
-      assert conn.status == 200
+      assert resp.status == 200
 
       TimelessTraces.flush()
 
@@ -343,9 +345,9 @@ defmodule TimelessTraces.HTTPTest do
             :export_trace_service_request
           )
 
-        conn(:post, "/insert/opentelemetry/v1/traces", body)
-        |> put_req_header("content-type", "application/x-protobuf")
-        |> call()
+        post("/insert/opentelemetry/v1/traces", body,
+          content_type: "application/x-protobuf"
+        )
 
         TimelessTraces.flush()
 
@@ -398,9 +400,9 @@ defmodule TimelessTraces.HTTPTest do
             :export_trace_service_request
           )
 
-        conn(:post, "/insert/opentelemetry/v1/traces", body)
-        |> put_req_header("content-type", "application/x-protobuf")
-        |> call()
+        post("/insert/opentelemetry/v1/traces", body,
+          content_type: "application/x-protobuf"
+        )
 
         TimelessTraces.flush()
 
@@ -412,33 +414,33 @@ defmodule TimelessTraces.HTTPTest do
     end
 
     test "returns error for missing resourceSpans" do
-      conn =
-        conn(:post, "/insert/opentelemetry/v1/traces", ~s({"data": "nope"}))
-        |> put_req_header("content-type", "application/json")
-        |> call()
+      resp =
+        post("/insert/opentelemetry/v1/traces", ~s({"data": "nope"}),
+          content_type: "application/json"
+        )
 
-      assert conn.status == 400
-      assert json_body(conn)["error"] =~ "resourceSpans"
+      assert resp.status == 400
+      assert json_body(resp)["error"] =~ "resourceSpans"
     end
 
     test "returns error for invalid JSON" do
-      conn =
-        conn(:post, "/insert/opentelemetry/v1/traces", "not json")
-        |> put_req_header("content-type", "application/json")
-        |> call()
+      resp =
+        post("/insert/opentelemetry/v1/traces", "not json",
+          content_type: "application/json"
+        )
 
-      assert conn.status == 400
-      assert json_body(conn)["error"] =~ "invalid JSON"
+      assert resp.status == 400
+      assert json_body(resp)["error"] =~ "invalid JSON"
     end
 
     test "returns error for invalid protobuf" do
-      conn =
-        conn(:post, "/insert/opentelemetry/v1/traces", "not protobuf at all")
-        |> put_req_header("content-type", "application/x-protobuf")
-        |> call()
+      resp =
+        post("/insert/opentelemetry/v1/traces", "not protobuf at all",
+          content_type: "application/x-protobuf"
+        )
 
-      assert conn.status == 400
-      assert json_body(conn)["error"] =~ "protobuf"
+      assert resp.status == 400
+      assert json_body(resp)["error"] =~ "protobuf"
     end
   end
 
@@ -446,10 +448,10 @@ defmodule TimelessTraces.HTTPTest do
 
   describe "GET /select/jaeger/api/services" do
     test "returns empty list when no data" do
-      conn = conn(:get, "/select/jaeger/api/services") |> call()
+      resp = get("/select/jaeger/api/services")
 
-      assert conn.status == 200
-      assert json_body(conn)["data"] == []
+      assert resp.status == 200
+      assert json_body(resp)["data"] == []
     end
 
     test "returns distinct service names" do
@@ -470,10 +472,10 @@ defmodule TimelessTraces.HTTPTest do
 
       ingest_and_flush(spans)
 
-      conn = conn(:get, "/select/jaeger/api/services") |> call()
-      assert conn.status == 200
+      resp = get("/select/jaeger/api/services")
+      assert resp.status == 200
 
-      services = json_body(conn)["data"]
+      services = json_body(resp)["data"]
       assert Enum.sort(services) == ["alpha", "beta"]
     end
   end
@@ -507,10 +509,10 @@ defmodule TimelessTraces.HTTPTest do
 
       ingest_and_flush(monitor_spans)
 
-      conn = conn(:get, "/select/jaeger/api/services/api/operations") |> call()
-      assert conn.status == 200
+      resp = get("/select/jaeger/api/services/api/operations")
+      assert resp.status == 200
 
-      ops = json_body(conn)["data"]
+      ops = json_body(resp)["data"]
       assert "GET /users" in ops
       assert "POST /users" in ops
       refute "GET /health" in ops
@@ -550,10 +552,10 @@ defmodule TimelessTraces.HTTPTest do
 
       ingest_and_flush(spans)
 
-      conn = conn(:get, "/select/jaeger/api/traces?service=web&limit=10") |> call()
-      assert conn.status == 200
+      resp = get("/select/jaeger/api/traces?service=web&limit=10")
+      assert resp.status == 200
 
-      body = json_body(conn)
+      body = json_body(resp)
       traces = body["data"]
       assert length(traces) >= 1
 
@@ -580,8 +582,8 @@ defmodule TimelessTraces.HTTPTest do
 
       ingest_and_flush(spans)
 
-      conn = conn(:get, "/select/jaeger/api/traces?limit=1") |> call()
-      body = json_body(conn)
+      resp = get("/select/jaeger/api/traces?limit=1")
+      body = json_body(resp)
       trace = hd(body["data"])
       span = hd(trace["spans"])
 
@@ -633,10 +635,10 @@ defmodule TimelessTraces.HTTPTest do
 
       ingest_and_flush(spans)
 
-      conn = conn(:get, "/select/jaeger/api/traces/#{trace_id}") |> call()
-      assert conn.status == 200
+      resp = get("/select/jaeger/api/traces/#{trace_id}")
+      assert resp.status == 200
 
-      body = json_body(conn)
+      body = json_body(resp)
       assert length(body["data"]) == 1
 
       trace = hd(body["data"])
@@ -681,8 +683,8 @@ defmodule TimelessTraces.HTTPTest do
 
       ingest_and_flush(spans)
 
-      conn = conn(:get, "/select/jaeger/api/traces/#{trace_id}") |> call()
-      trace = hd(json_body(conn)["data"])
+      resp = get("/select/jaeger/api/traces/#{trace_id}")
+      trace = hd(json_body(resp)["data"])
       span = hd(trace["spans"])
       tags = span["tags"]
 
@@ -701,9 +703,9 @@ defmodule TimelessTraces.HTTPTest do
 
   describe "GET /api/v1/flush" do
     test "returns ok" do
-      conn = conn(:get, "/api/v1/flush") |> call()
-      assert conn.status == 200
-      assert json_body(conn)["status"] == "ok"
+      resp = get("/api/v1/flush")
+      assert resp.status == 200
+      assert json_body(resp)["status"] == "ok"
     end
   end
 
@@ -711,41 +713,45 @@ defmodule TimelessTraces.HTTPTest do
 
   describe "bearer token auth" do
     test "401 when token required but not provided" do
-      conn = conn(:get, "/select/jaeger/api/services") |> call(bearer_token: "secret")
-      assert conn.status == 401
-      assert json_body(conn)["error"] == "unauthorized"
+      :persistent_term.put({TimelessTraces.HTTP, :bearer_token}, "secret")
+      resp = get("/select/jaeger/api/services")
+      assert resp.status == 401
+      assert json_body(resp)["error"] == "unauthorized"
     end
 
     test "403 when token is wrong" do
-      conn =
-        conn(:get, "/select/jaeger/api/services")
-        |> put_req_header("authorization", "Bearer wrong")
-        |> call(bearer_token: "secret")
+      :persistent_term.put({TimelessTraces.HTTP, :bearer_token}, "secret")
 
-      assert conn.status == 403
-      assert json_body(conn)["error"] == "forbidden"
+      resp =
+        get("/select/jaeger/api/services",
+          headers: [{"authorization", "Bearer wrong"}]
+        )
+
+      assert resp.status == 403
+      assert json_body(resp)["error"] == "forbidden"
     end
 
     test "passes with correct bearer token" do
-      conn =
-        conn(:get, "/select/jaeger/api/services")
-        |> put_req_header("authorization", "Bearer secret")
-        |> call(bearer_token: "secret")
+      :persistent_term.put({TimelessTraces.HTTP, :bearer_token}, "secret")
 
-      assert conn.status == 200
+      resp =
+        get("/select/jaeger/api/services",
+          headers: [{"authorization", "Bearer secret"}]
+        )
+
+      assert resp.status == 200
     end
 
     test "passes with query param token" do
-      conn =
-        conn(:get, "/select/jaeger/api/services?token=secret")
-        |> call(bearer_token: "secret")
-
-      assert conn.status == 200
+      :persistent_term.put({TimelessTraces.HTTP, :bearer_token}, "secret")
+      resp = get("/select/jaeger/api/services?token=secret")
+      assert resp.status == 200
     end
 
     test "health endpoint skips auth" do
-      conn = conn(:get, "/health") |> call(bearer_token: "secret")
-      assert conn.status == 200
+      :persistent_term.put({TimelessTraces.HTTP, :bearer_token}, "secret")
+      resp = get("/health")
+      assert resp.status == 200
     end
   end
 
@@ -753,8 +759,8 @@ defmodule TimelessTraces.HTTPTest do
 
   describe "catch-all" do
     test "returns 404 for unknown routes" do
-      conn = conn(:get, "/nonexistent") |> call()
-      assert conn.status == 404
+      resp = get("/nonexistent")
+      assert resp.status == 404
     end
   end
 end

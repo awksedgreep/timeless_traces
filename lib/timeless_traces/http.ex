@@ -34,225 +34,240 @@ defmodule TimelessTraces.HTTP do
     * `GET /api/v1/flush` - Force buffer flush
   """
 
-  use Plug.Router
+  use Rocket.Router
 
   @max_body_bytes 10 * 1024 * 1024
-
-  plug(:match)
-  plug(:authenticate)
-  plug(:dispatch)
 
   def child_spec(opts) do
     port = Keyword.get(opts, :port, 10428)
     bearer_token = Keyword.get(opts, :bearer_token)
-    plug_opts = [bearer_token: bearer_token]
+
+    :persistent_term.put({__MODULE__, :bearer_token}, bearer_token)
 
     %{
       id: __MODULE__,
-      start: {Bandit, :start_link, [[plug: {__MODULE__, plug_opts}, port: port]]},
+      start:
+        {Rocket, :start_link, [[port: port, handler: __MODULE__, max_body: @max_body_bytes]]},
       type: :supervisor
     }
   end
 
-  @impl Plug
-  def init(opts), do: opts
+  # --- Config access ---
 
-  @impl Plug
-  def call(conn, opts) do
-    conn
-    |> Plug.Conn.put_private(:timeless_traces_token, Keyword.get(opts, :bearer_token))
-    |> super(opts)
-  end
+  defp bearer_token, do: :persistent_term.get({__MODULE__, :bearer_token})
 
-  defp authenticate(%{request_path: "/health"} = conn, _opts), do: conn
+  # --- Authentication ---
 
-  defp authenticate(conn, _opts) do
-    case conn.private[:timeless_traces_token] do
-      nil -> conn
-      expected -> check_token(conn, expected)
+  defp check_auth(req) do
+    case bearer_token() do
+      nil -> :ok
+      expected -> verify_token(req, expected)
     end
   end
 
-  defp check_token(conn, expected) do
-    case extract_token(conn) do
+  defp verify_token(req, expected) do
+    case extract_token(req) do
       nil ->
-        conn
-        |> put_resp_content_type("application/json")
-        |> send_resp(401, ~s({"error":"unauthorized"}))
-        |> halt()
+        json_resp(req, 401, %{error: "unauthorized"})
+        :halt
 
       token ->
-        if Plug.Crypto.secure_compare(token, expected) do
-          conn
+        if constant_time_compare(token, expected) do
+          :ok
         else
-          conn
-          |> put_resp_content_type("application/json")
-          |> send_resp(403, ~s({"error":"forbidden"}))
-          |> halt()
+          json_resp(req, 403, %{error: "forbidden"})
+          :halt
         end
     end
   end
 
-  defp extract_token(conn) do
-    case Plug.Conn.get_req_header(conn, "authorization") do
-      ["Bearer " <> token] ->
+  defp extract_token(req) do
+    auth =
+      Rocket.Request.get_header(req, "Authorization") ||
+        Rocket.Request.get_header(req, "authorization")
+
+    case auth do
+      "Bearer " <> token ->
         String.trim(token)
 
       _ ->
-        conn = Plug.Conn.fetch_query_params(conn)
-        conn.query_params["token"]
+        Rocket.Request.get_query_param(req, "token")
     end
   end
 
-  # Health check
+  defp constant_time_compare(a, b) when byte_size(a) == byte_size(b) do
+    :crypto.hash_equals(a, b)
+  end
+
+  defp constant_time_compare(_a, _b), do: false
+
+  # --- Response helpers ---
+
+  defp json_resp(req, status, term) do
+    body = term |> :json.encode() |> IO.iodata_to_binary()
+    Rocket.Response.send_iodata(req, status, [{"content-type", "application/json"}], body)
+  end
+
+  defp json_error(req, status, msg) do
+    json_resp(req, status, %{error: msg})
+  end
+
+  # --- Route Handlers ---
+
+  # Health check (no auth required)
   get "/health" do
     {:ok, stats} = TimelessTraces.stats()
 
-    body =
-      %{
-        status: "ok",
-        blocks: stats.total_blocks,
-        spans: stats.total_entries,
-        disk_size: stats.disk_size
-      }
-      |> :json.encode()
-      |> IO.iodata_to_binary()
-
-    conn
-    |> put_resp_content_type("application/json")
-    |> send_resp(200, body)
+    json_resp(req, 200, %{
+      status: "ok",
+      blocks: stats.total_blocks,
+      spans: stats.total_entries,
+      disk_size: stats.disk_size
+    })
   end
 
   # OTLP trace ingest (JSON + Protobuf)
   post "/insert/opentelemetry/v1/traces" do
-    case Plug.Conn.read_body(conn, length: @max_body_bytes) do
-      {:ok, body, conn} ->
+    case check_auth(req) do
+      :halt ->
+        :ok
+
+      :ok ->
+        body = req.body
+
         content_type =
-          case Plug.Conn.get_req_header(conn, "content-type") do
-            [ct | _] -> ct
-            _ -> "application/json"
-          end
+          Rocket.Request.get_header(req, "content-type") || "application/json"
 
         if String.contains?(content_type, "application/x-protobuf") do
-          ingest_protobuf(conn, body)
+          ingest_protobuf(req, body)
         else
-          ingest_json(conn, body)
+          ingest_json(req, body)
         end
-
-      {:more, _partial, conn} ->
-        body =
-          %{error: "body too large", max_bytes: @max_body_bytes}
-          |> :json.encode()
-          |> IO.iodata_to_binary()
-
-        conn
-        |> put_resp_content_type("application/json")
-        |> send_resp(413, body)
-
-      {:error, reason} ->
-        json_error(conn, 400, to_string(reason))
     end
   end
 
   # List service names (Jaeger-compatible)
   get "/select/jaeger/api/services" do
-    {:ok, services} = TimelessTraces.services()
-    send_jaeger_response(conn, services)
+    case check_auth(req) do
+      :halt ->
+        :ok
+
+      :ok ->
+        {:ok, services} = TimelessTraces.services()
+        send_jaeger_response(req, services)
+    end
   end
 
   # Operations for a service (Jaeger-compatible)
   get "/select/jaeger/api/services/:service/operations" do
-    service = conn.path_params["service"]
-    {:ok, operations} = TimelessTraces.operations(service)
-    send_jaeger_response(conn, operations)
+    case check_auth(req) do
+      :halt ->
+        :ok
+
+      :ok ->
+        service = req.path_params["service"]
+        {:ok, operations} = TimelessTraces.operations(service)
+        send_jaeger_response(req, operations)
+    end
   end
 
   # Search traces (Jaeger-compatible)
   get "/select/jaeger/api/traces" do
-    conn = Plug.Conn.fetch_query_params(conn)
-    params = conn.query_params
+    case check_auth(req) do
+      :halt ->
+        :ok
 
-    filters = build_trace_search_filters(params)
+      :ok ->
+        {params, _} = Rocket.Request.query_params(req)
+        filters = build_trace_search_filters(params)
 
-    case TimelessTraces.query(filters) do
-      {:ok, %{entries: spans}} ->
-        traces = group_spans_to_jaeger_traces(spans)
-        send_jaeger_response(conn, traces)
+        case TimelessTraces.query(filters) do
+          {:ok, %{entries: spans}} ->
+            traces = group_spans_to_jaeger_traces(spans)
+            send_jaeger_response(req, traces)
 
-      {:error, reason} ->
-        json_error(conn, 500, inspect(reason))
+          {:error, reason} ->
+            json_error(req, 500, inspect(reason))
+        end
     end
   end
 
   # Get full trace by ID (Jaeger-compatible)
   get "/select/jaeger/api/traces/:trace_id" do
-    trace_id = conn.path_params["trace_id"]
+    case check_auth(req) do
+      :halt ->
+        :ok
 
-    case TimelessTraces.trace(trace_id) do
-      {:ok, spans} ->
-        trace = spans_to_jaeger_trace(trace_id, spans)
-        send_jaeger_response(conn, [trace])
+      :ok ->
+        trace_id = req.path_params["trace_id"]
 
-      {:error, reason} ->
-        json_error(conn, 500, inspect(reason))
+        case TimelessTraces.trace(trace_id) do
+          {:ok, spans} ->
+            trace = spans_to_jaeger_trace(trace_id, spans)
+            send_jaeger_response(req, [trace])
+
+          {:error, reason} ->
+            json_error(req, 500, inspect(reason))
+        end
     end
   end
 
   # Online backup
   post "/api/v1/backup" do
-    parsed_path =
-      case Plug.Conn.read_body(conn, length: 64_000) do
-        {:ok, "", _} ->
-          nil
+    case check_auth(req) do
+      :halt ->
+        :ok
 
-        {:ok, body, _} ->
-          try do
-            case :json.decode(body) do
-              %{"path" => path} when is_binary(path) and path != "" -> path
-              _ -> nil
-            end
-          rescue
-            _ -> nil
+      :ok ->
+        body = req.body
+
+        parsed_path =
+          case body do
+            "" ->
+              nil
+
+            _ ->
+              try do
+                case :json.decode(body) do
+                  %{"path" => path} when is_binary(path) and path != "" -> path
+                  _ -> nil
+                end
+              rescue
+                _ -> nil
+              end
           end
 
-        _ ->
-          nil
-      end
+        target_dir = parsed_path || default_backup_dir()
 
-    target_dir = parsed_path || default_backup_dir()
+        case TimelessTraces.backup(target_dir) do
+          {:ok, result} ->
+            json_resp(req, 200, %{
+              status: "ok",
+              path: result.path,
+              files: result.files,
+              total_bytes: result.total_bytes
+            })
 
-    case TimelessTraces.backup(target_dir) do
-      {:ok, result} ->
-        body =
-          %{
-            status: "ok",
-            path: result.path,
-            files: result.files,
-            total_bytes: result.total_bytes
-          }
-          |> :json.encode()
-          |> IO.iodata_to_binary()
-
-        conn
-        |> put_resp_content_type("application/json")
-        |> send_resp(200, body)
-
-      {:error, reason} ->
-        json_error(conn, 500, inspect(reason))
+          {:error, reason} ->
+            json_error(req, 500, inspect(reason))
+        end
     end
   end
 
   # Force buffer flush
   get "/api/v1/flush" do
-    TimelessTraces.flush()
+    case check_auth(req) do
+      :halt ->
+        :ok
 
-    conn
-    |> put_resp_content_type("application/json")
-    |> send_resp(200, :json.encode(%{status: "ok"}) |> IO.iodata_to_binary())
+      :ok ->
+        TimelessTraces.flush()
+        json_resp(req, 200, %{status: "ok"})
+    end
   end
 
   match _ do
-    send_resp(conn, 404, "not found")
+    send_resp(req, 404, "not found")
   end
 
   # --- OTLP JSON parsing ---
@@ -601,7 +616,7 @@ defmodule TimelessTraces.HTTP do
     end)
   end
 
-  defp send_jaeger_response(conn, data) do
+  defp send_jaeger_response(req, data) do
     total = if is_list(data), do: length(data), else: 0
 
     body =
@@ -609,9 +624,7 @@ defmodule TimelessTraces.HTTP do
       |> :json.encode()
       |> IO.iodata_to_binary()
 
-    conn
-    |> put_resp_content_type("application/json")
-    |> send_resp(200, body)
+    Rocket.Response.send_iodata(req, 200, [{"content-type", "application/json"}], body)
   end
 
   defp default_backup_dir do
@@ -619,15 +632,9 @@ defmodule TimelessTraces.HTTP do
     Path.join([data_dir, "backups", to_string(System.os_time(:second))])
   end
 
-  defp json_error(conn, status, msg) do
-    conn
-    |> put_resp_content_type("application/json")
-    |> send_resp(status, :json.encode(%{error: msg}) |> IO.iodata_to_binary())
-  end
-
   # --- JSON ingest path ---
 
-  defp ingest_json(conn, body) do
+  defp ingest_json(req, body) do
     try do
       case :json.decode(body) do
         %{"resourceSpans" => resource_spans} ->
@@ -637,20 +644,20 @@ defmodule TimelessTraces.HTTP do
             TimelessTraces.Buffer.ingest(spans)
           end
 
-          send_resp(conn, 200, ~s({"partialSuccess":{}}))
+          Rocket.Response.send_resp(req, 200, ~s({"partialSuccess":{}}))
 
         _ ->
-          json_error(conn, 400, "missing resourceSpans field")
+          json_error(req, 400, "missing resourceSpans field")
       end
     rescue
-      _ -> json_error(conn, 400, "invalid JSON")
+      _ -> json_error(req, 400, "invalid JSON")
     end
   end
 
   # --- Protobuf ingest path ---
 
-  defp ingest_protobuf(conn, body) do
-    body = maybe_gunzip(conn, body)
+  defp ingest_protobuf(req, body) do
+    body = maybe_gunzip(req, body)
 
     try do
       msg =
@@ -663,17 +670,17 @@ defmodule TimelessTraces.HTTP do
         TimelessTraces.Buffer.ingest(spans)
       end
 
-      send_resp(conn, 200, ~s({"partialSuccess":{}}))
+      Rocket.Response.send_resp(req, 200, ~s({"partialSuccess":{}}))
     rescue
       e ->
         Logger.warning("Protobuf decode error: #{inspect(e)}")
-        json_error(conn, 400, "invalid protobuf")
+        json_error(req, 400, "invalid protobuf")
     end
   end
 
-  defp maybe_gunzip(conn, body) do
-    case Plug.Conn.get_req_header(conn, "content-encoding") do
-      ["gzip" | _] -> :zlib.gunzip(body)
+  defp maybe_gunzip(req, body) do
+    case Rocket.Request.get_header(req, "content-encoding") do
+      "gzip" -> :zlib.gunzip(body)
       _ -> body
     end
   end

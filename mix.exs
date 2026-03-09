@@ -4,7 +4,7 @@ defmodule TimelessTraces.MixProject do
   def project do
     [
       app: :timeless_traces,
-      version: "1.1.1",
+      version: "1.2.0",
       elixir: "~> 1.18",
       start_permanent: Mix.env() == :prod,
       deps: deps(),
@@ -18,7 +18,7 @@ defmodule TimelessTraces.MixProject do
 
   def application do
     [
-      extra_applications: [:logger],
+      extra_applications: [:logger, :inets, :ssl, :public_key, :crypto],
       mod: {TimelessTraces.Application, []}
     ]
   end
@@ -29,8 +29,8 @@ defmodule TimelessTraces.MixProject do
       {:opentelemetry_api, "~> 1.4"},
       {:opentelemetry, "~> 1.5"},
       {:opentelemetry_exporter, "~> 1.7"},
-      {:bandit, "~> 1.6"},
-      {:plug, "~> 1.16"},
+      {:rocket, github: "awksedgreep/rocket"},
+      {:telemetry, "~> 1.0"},
       {:ex_doc, "~> 0.34", only: :dev, runtime: false},
       {:ex_openzl, "~> 0.4.0"}
     ]

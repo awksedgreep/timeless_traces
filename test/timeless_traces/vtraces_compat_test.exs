@@ -9,8 +9,7 @@ defmodule TimelessTraces.VTracesCompatTest do
   """
   use ExUnit.Case, async: false
 
-  import Plug.Test
-  import Plug.Conn
+  @port 10_429
 
   setup do
     Application.stop(:timeless_traces)
@@ -21,6 +20,9 @@ defmodule TimelessTraces.VTracesCompatTest do
     Application.put_env(:timeless_traces, :http, false)
     Application.ensure_all_started(:timeless_traces)
 
+    start_supervised!({TimelessTraces.HTTP, port: @port})
+    :persistent_term.put({TimelessTraces.HTTP, :bearer_token}, nil)
+
     on_exit(fn ->
       Application.stop(:timeless_traces)
       Application.put_env(:timeless_traces, :storage, :disk)
@@ -29,12 +31,11 @@ defmodule TimelessTraces.VTracesCompatTest do
     :ok
   end
 
-  defp call(conn) do
-    TimelessTraces.HTTP.call(conn, TimelessTraces.HTTP.init([]))
-  end
+  defp get(path), do: TimelessTraces.TestHTTP.get(@port, path)
+  defp post(path, body, opts \\ []), do: TimelessTraces.TestHTTP.post(@port, path, body, opts)
 
-  defp json_body(conn) do
-    :json.decode(conn.resp_body)
+  defp json_body(resp) do
+    :json.decode(resp.body)
   end
 
   defp ingest_realistic_spans do
@@ -153,10 +154,10 @@ defmodule TimelessTraces.VTracesCompatTest do
     test "response has correct Jaeger envelope" do
       %{} = ingest_realistic_spans()
 
-      conn = conn(:get, "/select/jaeger/api/services") |> call()
-      assert conn.status == 200
+      resp = get("/select/jaeger/api/services")
+      assert resp.status == 200
 
-      body = json_body(conn)
+      body = json_body(resp)
 
       # Must have full Jaeger envelope
       assert is_list(body["data"])
@@ -176,10 +177,10 @@ defmodule TimelessTraces.VTracesCompatTest do
     test "response has correct Jaeger envelope" do
       %{} = ingest_realistic_spans()
 
-      conn = conn(:get, "/select/jaeger/api/services/web-api/operations") |> call()
-      assert conn.status == 200
+      resp = get("/select/jaeger/api/services/web-api/operations")
+      assert resp.status == 200
 
-      body = json_body(conn)
+      body = json_body(resp)
 
       # Full Jaeger envelope
       assert is_list(body["data"])
@@ -196,8 +197,8 @@ defmodule TimelessTraces.VTracesCompatTest do
     test "returns operations that include the requested service" do
       %{} = ingest_realistic_spans()
 
-      conn = conn(:get, "/select/jaeger/api/services/dhcp-server/operations") |> call()
-      body = json_body(conn)
+      resp = get("/select/jaeger/api/services/dhcp-server/operations")
+      body = json_body(resp)
 
       assert "dhcpv4.transaction" in body["data"]
     end
@@ -210,17 +211,17 @@ defmodule TimelessTraces.VTracesCompatTest do
     end
 
     test "response has data array of traces", _ctx do
-      conn = conn(:get, "/select/jaeger/api/traces?service=web-api&limit=10") |> call()
-      assert conn.status == 200
+      resp = get("/select/jaeger/api/traces?service=web-api&limit=10")
+      assert resp.status == 200
 
-      body = json_body(conn)
+      body = json_body(resp)
       assert is_list(body["data"])
       assert length(body["data"]) >= 1
     end
 
     test "each trace has required Jaeger fields", _ctx do
-      conn = conn(:get, "/select/jaeger/api/traces?service=web-api&limit=10") |> call()
-      body = json_body(conn)
+      resp = get("/select/jaeger/api/traces?service=web-api&limit=10")
+      body = json_body(resp)
 
       for trace <- body["data"] do
         # traceID is a hex string
@@ -237,8 +238,8 @@ defmodule TimelessTraces.VTracesCompatTest do
     end
 
     test "each span has all required Jaeger fields", ctx do
-      conn = conn(:get, "/select/jaeger/api/traces?service=web-api&limit=10") |> call()
-      body = json_body(conn)
+      resp = get("/select/jaeger/api/traces?service=web-api&limit=10")
+      body = json_body(resp)
 
       trace = Enum.find(body["data"], &(&1["traceID"] == ctx.trace_id_1))
       assert trace != nil
@@ -264,8 +265,8 @@ defmodule TimelessTraces.VTracesCompatTest do
     end
 
     test "timestamps are in microseconds (not nanoseconds)", ctx do
-      conn = conn(:get, "/select/jaeger/api/traces?service=web-api&limit=10") |> call()
-      body = json_body(conn)
+      resp = get("/select/jaeger/api/traces?service=web-api&limit=10")
+      body = json_body(resp)
 
       trace = Enum.find(body["data"], &(&1["traceID"] == ctx.trace_id_1))
       root_span = Enum.find(trace["spans"], &(&1["operationName"] == "GET /api/v1/users"))
@@ -279,8 +280,8 @@ defmodule TimelessTraces.VTracesCompatTest do
     end
 
     test "tags have correct Jaeger format {key, type, value}", ctx do
-      conn = conn(:get, "/select/jaeger/api/traces?service=web-api&limit=10") |> call()
-      body = json_body(conn)
+      resp = get("/select/jaeger/api/traces?service=web-api&limit=10")
+      body = json_body(resp)
 
       trace = Enum.find(body["data"], &(&1["traceID"] == ctx.trace_id_1))
       root_span = Enum.find(trace["spans"], &(&1["operationName"] == "GET /api/v1/users"))
@@ -307,8 +308,8 @@ defmodule TimelessTraces.VTracesCompatTest do
     end
 
     test "integer attribute becomes int64 tag", ctx do
-      conn = conn(:get, "/select/jaeger/api/traces?service=web-api&limit=10") |> call()
-      body = json_body(conn)
+      resp = get("/select/jaeger/api/traces?service=web-api&limit=10")
+      body = json_body(resp)
 
       trace = Enum.find(body["data"], &(&1["traceID"] == ctx.trace_id_1))
       root_span = Enum.find(trace["spans"], &(&1["operationName"] == "GET /api/v1/users"))
@@ -320,8 +321,8 @@ defmodule TimelessTraces.VTracesCompatTest do
     end
 
     test "child span has CHILD_OF reference", ctx do
-      conn = conn(:get, "/select/jaeger/api/traces?service=web-api&limit=10") |> call()
-      body = json_body(conn)
+      resp = get("/select/jaeger/api/traces?service=web-api&limit=10")
+      body = json_body(resp)
 
       trace = Enum.find(body["data"], &(&1["traceID"] == ctx.trace_id_1))
       child_span = Enum.find(trace["spans"], &(&1["operationName"] == "SELECT users"))
@@ -334,8 +335,8 @@ defmodule TimelessTraces.VTracesCompatTest do
     end
 
     test "root span has empty references", ctx do
-      conn = conn(:get, "/select/jaeger/api/traces?service=web-api&limit=10") |> call()
-      body = json_body(conn)
+      resp = get("/select/jaeger/api/traces?service=web-api&limit=10")
+      body = json_body(resp)
 
       trace = Enum.find(body["data"], &(&1["traceID"] == ctx.trace_id_1))
       root_span = Enum.find(trace["spans"], &(&1["operationName"] == "GET /api/v1/users"))
@@ -344,8 +345,8 @@ defmodule TimelessTraces.VTracesCompatTest do
     end
 
     test "processes map has serviceName and tags", ctx do
-      conn = conn(:get, "/select/jaeger/api/traces?service=web-api&limit=10") |> call()
-      body = json_body(conn)
+      resp = get("/select/jaeger/api/traces?service=web-api&limit=10")
+      body = json_body(resp)
 
       trace = Enum.find(body["data"], &(&1["traceID"] == ctx.trace_id_1))
 
@@ -364,8 +365,8 @@ defmodule TimelessTraces.VTracesCompatTest do
     end
 
     test "span events become Jaeger logs with correct format", ctx do
-      conn = conn(:get, "/select/jaeger/api/traces?service=web-api&limit=10") |> call()
-      body = json_body(conn)
+      resp = get("/select/jaeger/api/traces?service=web-api&limit=10")
+      body = json_body(resp)
 
       trace = Enum.find(body["data"], &(&1["traceID"] == ctx.trace_id_1))
       root_span = Enum.find(trace["spans"], &(&1["operationName"] == "GET /api/v1/users"))
@@ -393,8 +394,8 @@ defmodule TimelessTraces.VTracesCompatTest do
     end
 
     test "trace has warnings field (null)", ctx do
-      conn = conn(:get, "/select/jaeger/api/traces?service=web-api&limit=10") |> call()
-      body = json_body(conn)
+      resp = get("/select/jaeger/api/traces?service=web-api&limit=10")
+      body = json_body(resp)
 
       trace = Enum.find(body["data"], &(&1["traceID"] == ctx.trace_id_1))
       assert Map.has_key?(trace, "warnings")
@@ -402,8 +403,8 @@ defmodule TimelessTraces.VTracesCompatTest do
     end
 
     test "each span has warnings field (null)", ctx do
-      conn = conn(:get, "/select/jaeger/api/traces?service=web-api&limit=10") |> call()
-      body = json_body(conn)
+      resp = get("/select/jaeger/api/traces?service=web-api&limit=10")
+      body = json_body(resp)
 
       trace = Enum.find(body["data"], &(&1["traceID"] == ctx.trace_id_1))
 
@@ -414,8 +415,8 @@ defmodule TimelessTraces.VTracesCompatTest do
     end
 
     test "process tags contain resource attributes", ctx do
-      conn = conn(:get, "/select/jaeger/api/traces?service=web-api&limit=10") |> call()
-      body = json_body(conn)
+      resp = get("/select/jaeger/api/traces?service=web-api&limit=10")
+      body = json_body(resp)
 
       trace = Enum.find(body["data"], &(&1["traceID"] == ctx.trace_id_1))
 
@@ -446,8 +447,8 @@ defmodule TimelessTraces.VTracesCompatTest do
     end
 
     test "error status includes status_description tag", ctx do
-      conn = conn(:get, "/select/jaeger/api/traces?service=dhcp-server&limit=10") |> call()
-      body = json_body(conn)
+      resp = get("/select/jaeger/api/traces?service=dhcp-server&limit=10")
+      body = json_body(resp)
 
       trace = Enum.find(body["data"], &(&1["traceID"] == ctx.trace_id_2))
       assert trace != nil
@@ -471,10 +472,10 @@ defmodule TimelessTraces.VTracesCompatTest do
     end
 
     test "returns single trace in data array", ctx do
-      conn = conn(:get, "/select/jaeger/api/traces/#{ctx.trace_id_1}") |> call()
-      assert conn.status == 200
+      resp = get("/select/jaeger/api/traces/#{ctx.trace_id_1}")
+      assert resp.status == 200
 
-      body = json_body(conn)
+      body = json_body(resp)
       assert is_list(body["data"])
       assert length(body["data"]) == 1
 
@@ -483,8 +484,8 @@ defmodule TimelessTraces.VTracesCompatTest do
     end
 
     test "trace contains all spans for that trace ID", ctx do
-      conn = conn(:get, "/select/jaeger/api/traces/#{ctx.trace_id_1}") |> call()
-      body = json_body(conn)
+      resp = get("/select/jaeger/api/traces/#{ctx.trace_id_1}")
+      body = json_body(resp)
 
       trace = hd(body["data"])
       assert length(trace["spans"]) == 2
@@ -494,8 +495,8 @@ defmodule TimelessTraces.VTracesCompatTest do
     end
 
     test "all span traceIDs match the requested trace", ctx do
-      conn = conn(:get, "/select/jaeger/api/traces/#{ctx.trace_id_1}") |> call()
-      body = json_body(conn)
+      resp = get("/select/jaeger/api/traces/#{ctx.trace_id_1}")
+      body = json_body(resp)
 
       trace = hd(body["data"])
 
@@ -505,10 +506,10 @@ defmodule TimelessTraces.VTracesCompatTest do
     end
 
     test "nonexistent trace returns empty spans", _ctx do
-      conn = conn(:get, "/select/jaeger/api/traces/00000000000000000000000000000000") |> call()
-      assert conn.status == 200
+      resp = get("/select/jaeger/api/traces/00000000000000000000000000000000")
+      assert resp.status == 200
 
-      body = json_body(conn)
+      body = json_body(resp)
       assert length(body["data"]) == 1
       trace = hd(body["data"])
       assert trace["spans"] == []
@@ -522,8 +523,8 @@ defmodule TimelessTraces.VTracesCompatTest do
     end
 
     test "service filter works" do
-      conn = conn(:get, "/select/jaeger/api/traces?service=dhcp-server&limit=10") |> call()
-      body = json_body(conn)
+      resp = get("/select/jaeger/api/traces?service=dhcp-server&limit=10")
+      body = json_body(resp)
 
       traces = body["data"]
       assert length(traces) >= 1
@@ -540,19 +541,18 @@ defmodule TimelessTraces.VTracesCompatTest do
     end
 
     test "limit filter works" do
-      conn = conn(:get, "/select/jaeger/api/traces?limit=1") |> call()
-      body = json_body(conn)
+      resp = get("/select/jaeger/api/traces?limit=1")
+      body = json_body(resp)
 
       # Should return at most 1 trace (may group spans into traces)
       assert length(body["data"]) >= 1
     end
 
     test "operation filter works" do
-      conn =
-        conn(:get, "/select/jaeger/api/traces?service=web-api&operation=SELECT+users&limit=10")
-        |> call()
+      resp =
+        get("/select/jaeger/api/traces?service=web-api&operation=SELECT+users&limit=10")
 
-      body = json_body(conn)
+      body = json_body(resp)
       assert length(body["data"]) >= 1
     end
   end
@@ -611,24 +611,22 @@ defmodule TimelessTraces.VTracesCompatTest do
         |> :json.encode()
         |> IO.iodata_to_binary()
 
-      conn =
-        conn(:post, "/insert/opentelemetry/v1/traces", otlp_body)
-        |> put_req_header("content-type", "application/json")
-        |> call()
+      resp =
+        post("/insert/opentelemetry/v1/traces", otlp_body,
+          content_type: "application/json"
+        )
 
-      assert conn.status == 200
+      assert resp.status == 200
       # VictoriaTraces returns {"partialSuccess":{}}
-      resp = :json.decode(conn.resp_body)
-      assert resp["partialSuccess"] == %{}
+      resp_body = :json.decode(resp.body)
+      assert resp_body["partialSuccess"] == %{}
 
       TimelessTraces.flush()
 
       # Now verify the Jaeger query response is valid
-      conn =
-        conn(:get, "/select/jaeger/api/traces/aabbccdd11223344aabbccdd11223344")
-        |> call()
+      resp = get("/select/jaeger/api/traces/aabbccdd11223344aabbccdd11223344")
 
-      body = json_body(conn)
+      body = json_body(resp)
       trace = hd(body["data"])
       span = hd(trace["spans"])
 
