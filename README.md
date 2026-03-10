@@ -1,6 +1,22 @@
-# TimelessTraces
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/logo-dark.svg">
+    <source media="(prefers-color-scheme: light)" srcset="docs/logo-light.svg">
+    <img src="docs/logo-light.svg" width="300" alt="Timeless">
+  </picture>
+</p>
 
-> "I always found it odd that the first thing you do to time series data is squash the timestamp. That's how the name Timeless was born." --Mark Cotner
+<h3 align="center">Embedded OpenTelemetry Span Storage for Elixir</h3>
+
+<p align="center">
+  <a href="https://hex.pm/packages/timeless_traces"><img src="https://img.shields.io/hexpm/v/timeless_traces.svg" alt="Hex.pm"></a>
+  <a href="https://hexdocs.pm/timeless_traces"><img src="https://img.shields.io/badge/docs-hexdocs-blue.svg" alt="Docs"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/hexpm/l/timeless_traces.svg" alt="License"></a>
+</p>
+
+---
+
+> "I found it ironic that the first thing you do to time series data is squash the timestamp. That's how the name Timeless was born." --Mark Cotner
 
 Embedded OpenTelemetry span storage and compression for Elixir applications.
 
