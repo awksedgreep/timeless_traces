@@ -618,7 +618,7 @@ defmodule TimelessTraces.Index do
       :ordered_set,
       :public,
       read_concurrency: true,
-      write_concurrency: true
+      write_concurrency: :auto
     ])
 
     :ets.new(@term_index_table, [
@@ -626,7 +626,7 @@ defmodule TimelessTraces.Index do
       :bag,
       :public,
       read_concurrency: true,
-      write_concurrency: true
+      write_concurrency: :auto
     ])
 
     :ets.new(@trace_index_table, [
@@ -634,7 +634,7 @@ defmodule TimelessTraces.Index do
       :bag,
       :public,
       read_concurrency: true,
-      write_concurrency: true
+      write_concurrency: :auto
     ])
 
     :ets.new(@compression_stats_table, [
@@ -649,7 +649,7 @@ defmodule TimelessTraces.Index do
       :set,
       :public,
       read_concurrency: true,
-      write_concurrency: true
+      write_concurrency: :auto
     ])
   end
 
