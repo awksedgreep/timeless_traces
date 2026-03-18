@@ -215,11 +215,12 @@ defmodule TimelessTracesTest do
       {:ok, %TimelessTraces.Result{total: 3}} = TimelessTraces.query([])
     end
 
-    test "no files created in memory mode" do
+    test "no block files created in memory mode" do
       TimelessTraces.Buffer.ingest([make_span()])
       TimelessTraces.flush()
 
-      refute File.exists?("test/tmp/e2e_should_not_exist")
+      # SQLite index file may exist, but no block files should be written
+      refute File.exists?("test/tmp/e2e_should_not_exist/blocks")
     end
   end
 end

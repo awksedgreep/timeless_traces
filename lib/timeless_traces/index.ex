@@ -3,19 +3,13 @@ defmodule TimelessTraces.Index do
 
   use GenServer
 
+  require Logger
+
   @default_limit 100
   @default_offset 0
 
   # Flush pending index operations after this interval
   @index_flush_interval 100
-
-  @blocks_table :timeless_traces_blocks
-  @term_index_table :timeless_traces_term_index
-  @trace_index_table :timeless_traces_trace_index
-  @compression_stats_table :timeless_traces_compression_stats
-  @block_data_table :timeless_traces_block_data
-
-  @snapshot_threshold 1000
 
   @spec start_link(keyword()) :: GenServer.on_start()
   def start_link(opts) do
@@ -32,87 +26,74 @@ defmodule TimelessTraces.Index do
     GenServer.cast(__MODULE__, {:index_block, block_meta, terms, trace_rows})
   end
 
-  # --- Lock-free read functions (run in caller's process) ---
+  # --- Read functions (use DB reader pool) ---
 
   @spec query(keyword()) :: {:ok, TimelessTraces.Result.t()}
   def query(filters) do
+    db = :persistent_term.get({__MODULE__, :db})
+    storage = :persistent_term.get({__MODULE__, :storage})
+
     {search_filters, pagination} = split_pagination(filters)
     {term_filters, time_filters} = split_filters(search_filters)
     order = Keyword.get(pagination, :order, :desc)
-    block_ids = find_matching_blocks_ets(term_filters, time_filters, order)
-    storage = :persistent_term.get({__MODULE__, :storage})
+    block_ids = find_matching_blocks(db, term_filters, time_filters, order)
 
-    do_query_parallel(block_ids, storage, pagination, search_filters)
+    do_query_parallel(block_ids, db, storage, pagination, search_filters)
   end
 
   @spec trace(String.t()) :: {:ok, [TimelessTraces.Span.t()]}
   def trace(trace_id) do
-    block_ids = trace_block_ids(trace_id)
+    db = :persistent_term.get({__MODULE__, :db})
     storage = :persistent_term.get({__MODULE__, :storage})
 
-    block_info =
-      block_ids
-      |> MapSet.to_list()
-      |> Enum.flat_map(fn bid ->
-        case :ets.lookup(@blocks_table, bid) do
-          [{^bid, file_path, _byte_size, _entry_count, _ts_min, _ts_max, format, _created_at}] ->
-            [{bid, file_path, format}]
+    {:ok, rows} =
+      TimelessTraces.DB.read(
+        db,
+        """
+        SELECT b.block_id, b.file_path, b.format
+        FROM trace_index t
+        JOIN blocks b ON t.block_id = b.block_id
+        WHERE t.trace_id = ?1
+        """,
+        [trace_id]
+      )
 
-          [] ->
-            []
-        end
-      end)
-
-    do_trace_parallel(block_info, storage, trace_id)
+    block_info = Enum.map(rows, fn [bid, fp, fmt] -> {bid, fp, to_format_atom(fmt)} end)
+    do_trace_parallel(block_info, db, storage, trace_id)
   end
 
   @spec stats() :: {:ok, TimelessTraces.Stats.t()}
   def stats do
-    {total_blocks, total_entries, total_bytes, oldest, newest, format_stats} =
-      :ets.foldl(
-        fn {_bid, _fp, byte_size, entry_count, ts_min, ts_max, format, _created_at},
-           {blocks, entries, bytes, old, new, fstats} ->
-          new_old = if old == nil or ts_min < old, do: ts_min, else: old
-          new_new = if new == nil or ts_max > new, do: ts_max, else: new
+    db = :persistent_term.get({__MODULE__, :db})
 
-          fmt_key = Atom.to_string(format)
-          cur = Map.get(fstats, fmt_key, %{blocks: 0, bytes: 0, entries: 0})
+    {:ok, format_rows} =
+      TimelessTraces.DB.read(db, """
+      SELECT format, COUNT(*), COALESCE(SUM(entry_count), 0),
+             COALESCE(SUM(byte_size), 0), MIN(ts_min), MAX(ts_max)
+      FROM blocks GROUP BY format
+      """)
 
-          updated = %{
-            blocks: cur.blocks + 1,
-            bytes: cur.bytes + byte_size,
-            entries: cur.entries + entry_count
-          }
-
-          {blocks + 1, entries + entry_count, bytes + byte_size, new_old, new_new,
-           Map.put(fstats, fmt_key, updated)}
-        end,
-        {0, 0, 0, nil, nil, %{}},
-        @blocks_table
+    {:ok, comp_rows} =
+      TimelessTraces.DB.read(
+        db,
+        "SELECT raw_in, compressed_out, count FROM compression_stats WHERE key = 'lifetime'"
       )
 
-    index_size =
-      try do
-        snapshot_size =
-          case :persistent_term.get({__MODULE__, :snapshot_path}, nil) do
-            nil -> 0
-            path -> file_size(path)
-          end
+    db_path = TimelessTraces.DB.db_path(db)
+    index_size = file_size(db_path) + file_size(db_path <> "-wal") + file_size(db_path <> "-shm")
 
-        log_size =
-          case :persistent_term.get({__MODULE__, :log_path}, nil) do
-            nil -> 0
-            path -> file_size(path)
-          end
-
-        snapshot_size + log_size
-      rescue
-        _ -> 0
-      end
+    {total_blocks, total_entries, total_bytes, oldest, newest, format_stats} =
+      Enum.reduce(format_rows, {0, 0, 0, nil, nil, %{}}, fn
+        [fmt, count, entries, bytes, ts_min, ts_max], {tb, te, tby, old, new, fs} ->
+          new_old = if old == nil or ts_min < old, do: ts_min, else: old
+          new_new = if new == nil or ts_max > new, do: ts_max, else: new
+          updated = %{blocks: count, bytes: bytes, entries: entries}
+          {tb + count, te + entries, tby + bytes, new_old, new_new, Map.put(fs, fmt, updated)}
+      end)
 
     {raw_in, compressed_out, compaction_count} =
-      case :ets.lookup(@compression_stats_table, :lifetime) do
-        [{:lifetime, r, c, n}] -> {r, c, n}
+      case comp_rows do
+        [[r, c, n]] -> {r, c, n}
         _ -> {0, 0, 0}
       end
 
@@ -125,15 +106,15 @@ defmodule TimelessTraces.Index do
        newest_timestamp: newest,
        disk_size: total_bytes,
        index_size: index_size,
-       raw_blocks: format_stats["raw"][:blocks] || 0,
-       raw_bytes: format_stats["raw"][:bytes] || 0,
-       raw_entries: format_stats["raw"][:entries] || 0,
-       zstd_blocks: format_stats["zstd"][:blocks] || 0,
-       zstd_bytes: format_stats["zstd"][:bytes] || 0,
-       zstd_entries: format_stats["zstd"][:entries] || 0,
-       openzl_blocks: format_stats["openzl"][:blocks] || 0,
-       openzl_bytes: format_stats["openzl"][:bytes] || 0,
-       openzl_entries: format_stats["openzl"][:entries] || 0,
+       raw_blocks: (format_stats["raw"] || %{})[:blocks] || 0,
+       raw_bytes: (format_stats["raw"] || %{})[:bytes] || 0,
+       raw_entries: (format_stats["raw"] || %{})[:entries] || 0,
+       zstd_blocks: (format_stats["zstd"] || %{})[:blocks] || 0,
+       zstd_bytes: (format_stats["zstd"] || %{})[:bytes] || 0,
+       zstd_entries: (format_stats["zstd"] || %{})[:entries] || 0,
+       openzl_blocks: (format_stats["openzl"] || %{})[:blocks] || 0,
+       openzl_bytes: (format_stats["openzl"] || %{})[:bytes] || 0,
+       openzl_entries: (format_stats["openzl"] || %{})[:entries] || 0,
        compression_raw_bytes_in: raw_in,
        compression_compressed_bytes_out: compressed_out,
        compaction_count: compaction_count
@@ -142,10 +123,11 @@ defmodule TimelessTraces.Index do
 
   @spec matching_block_ids(keyword()) :: [{integer(), String.t() | nil, :raw | :zstd | :openzl}]
   def matching_block_ids(filters) do
+    db = :persistent_term.get({__MODULE__, :db})
     {search_filters, pagination} = split_pagination(filters)
     {term_filters, time_filters} = split_filters(search_filters)
     order = Keyword.get(pagination, :order, :asc)
-    find_matching_blocks_ets(term_filters, time_filters, order)
+    find_matching_blocks(db, term_filters, time_filters, order)
   end
 
   @spec raw_block_stats() :: %{
@@ -154,96 +136,85 @@ defmodule TimelessTraces.Index do
           oldest_created_at: integer() | nil
         }
   def raw_block_stats do
-    :ets.foldl(
-      fn {_bid, _fp, _bs, entry_count, _tsmin, _tsmax, format, created_at}, acc ->
-        if format == :raw do
-          oldest =
-            if acc.oldest_created_at == nil or created_at < acc.oldest_created_at,
-              do: created_at,
-              else: acc.oldest_created_at
+    db = :persistent_term.get({__MODULE__, :db})
 
-          %{
-            entry_count: acc.entry_count + entry_count,
-            block_count: acc.block_count + 1,
-            oldest_created_at: oldest
-          }
-        else
-          acc
-        end
-      end,
-      %{entry_count: 0, block_count: 0, oldest_created_at: nil},
-      @blocks_table
-    )
+    {:ok, rows} =
+      TimelessTraces.DB.read(db, """
+      SELECT COUNT(*), COALESCE(SUM(entry_count), 0), MIN(created_at)
+      FROM blocks WHERE format = 'raw'
+      """)
+
+    case rows do
+      [[count, entries, oldest]] ->
+        %{entry_count: entries, block_count: count, oldest_created_at: oldest}
+
+      _ ->
+        %{entry_count: 0, block_count: 0, oldest_created_at: nil}
+    end
   end
 
   @spec small_compressed_block_ids(pos_integer()) ::
           [{integer(), String.t() | nil, non_neg_integer(), non_neg_integer()}]
   def small_compressed_block_ids(max_entry_count) do
-    :ets.foldl(
-      fn {bid, fp, bs, ec, ts_min, _tsmax, format, _ca}, acc ->
-        if format != :raw and ec < max_entry_count do
-          [{ts_min, bid, fp, bs, ec} | acc]
-        else
-          acc
-        end
-      end,
-      [],
-      @blocks_table
-    )
-    |> Enum.sort_by(fn {ts_min, _bid, _fp, _bs, _ec} -> ts_min end)
-    |> Enum.map(fn {_ts_min, bid, fp, bs, ec} -> {bid, fp, bs, ec} end)
+    db = :persistent_term.get({__MODULE__, :db})
+
+    {:ok, rows} =
+      TimelessTraces.DB.read(
+        db,
+        """
+        SELECT block_id, file_path, byte_size, entry_count
+        FROM blocks WHERE format != 'raw' AND entry_count < ?1
+        ORDER BY ts_min ASC
+        """,
+        [max_entry_count]
+      )
+
+    Enum.map(rows, fn [bid, fp, bs, ec] -> {bid, fp, bs, ec} end)
   end
 
   @spec raw_block_ids() :: [{integer(), String.t() | nil, non_neg_integer()}]
   def raw_block_ids do
-    :ets.select(@blocks_table, [
-      {{:"$1", :"$2", :"$3", :_, :"$4", :_, :raw, :_}, [], [{{:"$4", :"$1", :"$2", :"$3"}}]}
-    ])
-    |> Enum.sort_by(fn {ts_min, _bid, _fp, _bs} -> ts_min end)
-    |> Enum.map(fn {_ts_min, bid, fp, bs} -> {bid, fp, bs} end)
+    db = :persistent_term.get({__MODULE__, :db})
+
+    {:ok, rows} =
+      TimelessTraces.DB.read(db, """
+      SELECT block_id, file_path, byte_size
+      FROM blocks WHERE format = 'raw'
+      ORDER BY ts_min ASC
+      """)
+
+    Enum.map(rows, fn [bid, fp, bs] -> {bid, fp, bs} end)
   end
 
   @spec distinct_services() :: {:ok, [String.t()]}
   def distinct_services do
-    services =
-      :ets.foldl(
-        fn {term, _bid}, acc ->
-          case term do
-            "service.name:" <> svc -> MapSet.put(acc, svc)
-            _ -> acc
-          end
-        end,
-        MapSet.new(),
-        @term_index_table
-      )
-      |> MapSet.to_list()
-      |> Enum.sort()
+    db = :persistent_term.get({__MODULE__, :db})
 
-    {:ok, services}
+    {:ok, rows} =
+      TimelessTraces.DB.read(
+        db,
+        "SELECT DISTINCT SUBSTR(term, 14) FROM term_index WHERE term LIKE 'service.name:%'"
+      )
+
+    {:ok, rows |> Enum.map(fn [svc] -> svc end) |> Enum.sort()}
   end
 
   @spec distinct_operations(String.t()) :: {:ok, [String.t()]}
   def distinct_operations(service) do
-    service_bids = term_block_ids("service.name:#{service}")
+    db = :persistent_term.get({__MODULE__, :db})
 
-    operations =
-      :ets.foldl(
-        fn {term, bid}, acc ->
-          case term do
-            "name:" <> name ->
-              if MapSet.member?(service_bids, bid), do: MapSet.put(acc, name), else: acc
-
-            _ ->
-              acc
-          end
-        end,
-        MapSet.new(),
-        @term_index_table
+    {:ok, rows} =
+      TimelessTraces.DB.read(
+        db,
+        """
+        SELECT DISTINCT SUBSTR(term, 6) FROM term_index
+        WHERE term LIKE 'name:%'
+        AND block_id IN (SELECT block_id FROM term_index WHERE term = ?1)
+        """,
+        ["service.name:#{service}"]
       )
-      |> MapSet.to_list()
-      |> Enum.sort()
 
-    {:ok, operations}
+    {:ok, rows |> Enum.map(fn [op] -> op end) |> Enum.sort()}
   end
 
   @spec read_block_data(integer()) :: {:ok, [map()]} | {:error, term()}
@@ -366,81 +337,23 @@ defmodule TimelessTraces.Index do
   def init(opts) do
     Process.flag(:trap_exit, true)
     storage = Keyword.get(opts, :storage, :disk)
+    db = Keyword.get(opts, :db, TimelessTraces.DB)
+    data_dir = Keyword.get(opts, :data_dir)
 
-    # Initialize ETS tables
-    init_ets_tables()
-
-    # Store storage mode in persistent_term
     :persistent_term.put({__MODULE__, :storage}, storage)
+    :persistent_term.put({__MODULE__, :db}, db)
 
-    case storage do
-      :memory ->
-        :persistent_term.put({__MODULE__, :snapshot_path}, nil)
-        :persistent_term.put({__MODULE__, :log_path}, nil)
+    # One-time migration from old ETS snapshot
+    if data_dir, do: maybe_migrate_from_ets(db, data_dir)
 
-        {:ok,
-         %{
-           storage: storage,
-           log_ref: nil,
-           log_path: nil,
-           snapshot_path: nil,
-           log_entry_count: 0,
-           snapshot_threshold: @snapshot_threshold,
-           pending: [],
-           flush_timer: nil
-         }}
-
-      :disk ->
-        data_dir = Keyword.fetch!(opts, :data_dir)
-        log_path = Path.join(data_dir, "index.log")
-        snapshot_path = Path.join(data_dir, "index.snapshot")
-
-        :persistent_term.put({__MODULE__, :snapshot_path}, snapshot_path)
-        :persistent_term.put({__MODULE__, :log_path}, log_path)
-
-        # Load snapshot into ETS
-        load_snapshot(snapshot_path)
-
-        # Open disk_log and replay entries after snapshot
-        log_ref = open_disk_log(log_path)
-        log_entry_count = replay_log(log_ref, snapshot_timestamp())
-
-        {:ok,
-         %{
-           storage: storage,
-           log_ref: log_ref,
-           log_path: log_path,
-           snapshot_path: snapshot_path,
-           log_entry_count: log_entry_count,
-           snapshot_threshold: @snapshot_threshold,
-           pending: [],
-           flush_timer: nil
-         }}
-    end
+    {:ok, %{storage: storage, db: db, data_dir: data_dir, pending: [], flush_timer: nil}}
   end
 
   @impl true
   def terminate(_reason, state) do
-    state = flush_pending(state)
-
-    # Write final snapshot and close log
-    if state.storage == :disk and state.log_ref != nil do
-      write_snapshot(state.snapshot_path)
-      :disk_log.sync(state.log_ref)
-      :disk_log.close(state.log_ref)
-    end
-
-    # Clean up persistent_term keys
+    flush_pending(state)
     :persistent_term.erase({__MODULE__, :storage})
-    :persistent_term.erase({__MODULE__, :snapshot_path})
-    :persistent_term.erase({__MODULE__, :log_path})
-
-    # Clean up ETS tables
-    safe_delete_ets(@blocks_table)
-    safe_delete_ets(@term_index_table)
-    safe_delete_ets(@trace_index_table)
-    safe_delete_ets(@compression_stats_table)
-    safe_delete_ets(@block_data_table)
+    :persistent_term.erase({__MODULE__, :db})
   end
 
   # --- handle_call (grouped) ---
@@ -448,83 +361,31 @@ defmodule TimelessTraces.Index do
   @impl true
   def handle_call({:index_block, meta, terms, trace_rows}, _from, state) do
     state = flush_pending(state)
-
-    # Insert into ETS
-    insert_block_ets(meta)
-    insert_index_entries(terms, trace_rows, meta.block_id)
-
-    # Memory mode: store block data in ETS
-    if state.storage == :memory and meta[:data] do
-      :ets.insert(@block_data_table, {meta.block_id, meta[:data]})
-    end
-
-    # Append to log
-    state =
-      append_log(state, {
-        :index_block,
-        System.monotonic_time(),
-        block_meta_to_map(meta),
-        terms,
-        trace_rows
-      })
-
+    do_index_block(state.db, state.storage, meta, terms, trace_rows)
     {:reply, :ok, state}
   end
 
   def handle_call({:delete_before, cutoff}, _from, state) do
     state = flush_pending(state)
-
-    {count, deleted_ids} = do_delete_before_ets(cutoff, state.storage)
-
-    state =
-      if deleted_ids != [] do
-        append_log(state, {:delete_blocks, System.monotonic_time(), deleted_ids})
-      else
-        state
-      end
-
+    count = do_delete_before(state.db, cutoff, state.storage)
     {:reply, count, state}
   end
 
   def handle_call({:delete_over_size, max_bytes}, _from, state) do
     state = flush_pending(state)
-
-    {count, deleted_ids} = do_delete_over_size_ets(max_bytes, state.storage)
-
-    state =
-      if deleted_ids != [] do
-        append_log(state, {:delete_blocks, System.monotonic_time(), deleted_ids})
-      else
-        state
-      end
-
+    count = do_delete_over_size(state.db, max_bytes, state.storage)
     {:reply, count, state}
   end
 
   def handle_call({:delete_by_term_limit, max_entries}, _from, state) do
-    current_size = :ets.info(@term_index_table, :size)
-
-    if current_size <= max_entries do
-      {:reply, 0, state}
-    else
-      state = flush_pending(state)
-
-      {count, deleted_ids} = do_delete_by_term_limit_ets(max_entries, state.storage)
-
-      state =
-        if deleted_ids != [] do
-          append_log(state, {:delete_blocks, System.monotonic_time(), deleted_ids})
-        else
-          state
-        end
-
-      {:reply, count, state}
-    end
+    state = flush_pending(state)
+    count = do_delete_by_term_limit(state.db, max_entries, state.storage)
+    {:reply, count, state}
   end
 
   def handle_call({:read_block_data, block_id}, _from, state) do
     state = flush_pending(state)
-    result = read_block_from_ets(block_id)
+    result = read_block_from_db(state.db, block_id)
     {:reply, result, state}
   end
 
@@ -535,54 +396,68 @@ defmodule TimelessTraces.Index do
       ) do
     state = flush_pending(state)
 
-    # Collect old terms/traces for cache cleanup
-    old_terms = collect_terms_for_blocks_ets(old_ids)
-    old_traces = collect_traces_for_blocks_ets(old_ids)
+    # Get file paths for old blocks before deleting
+    old_file_paths =
+      if old_ids != [] do
+        ph = placeholders(old_ids)
 
-    # Delete old blocks from ETS + disk files
-    delete_blocks_ets(old_ids, state.storage)
-    remove_block_ids_from_index(old_ids, old_terms, old_traces)
+        {:ok, rows} =
+          TimelessTraces.DB.read(state.db, "SELECT file_path FROM blocks WHERE block_id IN (#{ph})", old_ids)
 
-    # Insert new block
-    insert_block_ets(new_meta)
-    insert_index_entries(terms, trace_rows, new_meta.block_id)
+        for [fp] <- rows, is_binary(fp), do: fp
+      else
+        []
+      end
 
-    if state.storage == :memory and new_meta[:data] do
-      :ets.insert(@block_data_table, {new_meta.block_id, new_meta[:data]})
+    {:ok, _} =
+      TimelessTraces.DB.write_transaction(state.db, fn conn ->
+        # Delete old blocks
+        if old_ids != [] do
+          ph = placeholders(old_ids)
+          TimelessTraces.DB.execute(conn, "DELETE FROM term_index WHERE block_id IN (#{ph})", old_ids)
+          TimelessTraces.DB.execute(conn, "DELETE FROM trace_index WHERE block_id IN (#{ph})", old_ids)
+          TimelessTraces.DB.execute(conn, "DELETE FROM block_data WHERE block_id IN (#{ph})", old_ids)
+          TimelessTraces.DB.execute(conn, "DELETE FROM blocks WHERE block_id IN (#{ph})", old_ids)
+        end
+
+        # Insert new block
+        insert_block_sql(conn, new_meta)
+        insert_terms_sql(conn, terms, new_meta.block_id)
+        insert_traces_sql(conn, trace_rows, new_meta.block_id)
+
+        if state.storage == :memory and new_meta[:data] do
+          TimelessTraces.DB.execute(
+            conn,
+            "INSERT OR REPLACE INTO block_data (block_id, data) VALUES (?1, ?2)",
+            [new_meta.block_id, new_meta[:data]]
+          )
+        end
+
+        # Update compression stats
+        {raw_in, compressed_out} = compression_sizes
+        update_compression_stats_sql(conn, raw_in, compressed_out)
+      end)
+
+    # Delete old disk files outside the transaction
+    if state.storage == :disk do
+      Enum.each(old_file_paths, &File.rm/1)
     end
-
-    # Update compression stats
-    {raw_in, compressed_out} = compression_sizes
-    update_compression_stats_ets(raw_in, compressed_out)
-
-    # Append to log
-    state =
-      append_log(state, {
-        :compact_blocks,
-        System.monotonic_time(),
-        old_ids,
-        block_meta_to_map(new_meta),
-        terms,
-        trace_rows,
-        compression_sizes
-      })
 
     {:reply, :ok, state}
   end
 
   def handle_call({:backup, target_path}, _from, state) do
     state = flush_pending(state)
-    result = write_snapshot(target_path)
-    {:reply, result, state}
+
+    case TimelessTraces.DB.backup(state.db, target_path) do
+      {:ok, _} -> {:reply, :ok, state}
+      error -> {:reply, error, state}
+    end
   end
 
   def handle_call(:sync, _from, state) do
     state = flush_pending(state)
-
-    if state.log_ref do
-      :disk_log.sync(state.log_ref)
-    end
-
+    TimelessTraces.DB.write(state.db, "PRAGMA wal_checkpoint(PASSIVE)")
     {:reply, :ok, state}
   end
 
@@ -604,611 +479,235 @@ defmodule TimelessTraces.Index do
     {:noreply, state}
   end
 
-  # --- ETS initialization ---
+  # --- SQL write helpers ---
 
-  defp init_ets_tables do
-    safe_delete_ets(@blocks_table)
-    safe_delete_ets(@term_index_table)
-    safe_delete_ets(@trace_index_table)
-    safe_delete_ets(@compression_stats_table)
-    safe_delete_ets(@block_data_table)
+  defp do_index_block(db, storage, meta, terms, trace_rows) do
+    {:ok, _} =
+      TimelessTraces.DB.write_transaction(db, fn conn ->
+        insert_block_sql(conn, meta)
+        insert_terms_sql(conn, terms, meta.block_id)
+        insert_traces_sql(conn, trace_rows, meta.block_id)
 
-    :ets.new(@blocks_table, [
-      :named_table,
-      :ordered_set,
-      :public,
-      read_concurrency: true,
-      write_concurrency: :auto
-    ])
-
-    :ets.new(@term_index_table, [
-      :named_table,
-      :bag,
-      :public,
-      read_concurrency: true,
-      write_concurrency: :auto
-    ])
-
-    :ets.new(@trace_index_table, [
-      :named_table,
-      :bag,
-      :public,
-      read_concurrency: true,
-      write_concurrency: :auto
-    ])
-
-    :ets.new(@compression_stats_table, [
-      :named_table,
-      :set,
-      :public,
-      read_concurrency: true
-    ])
-
-    :ets.new(@block_data_table, [
-      :named_table,
-      :set,
-      :public,
-      read_concurrency: true,
-      write_concurrency: :auto
-    ])
-  end
-
-  defp safe_delete_ets(table) do
-    try do
-      :ets.delete(table)
-    rescue
-      ArgumentError -> :ok
-    end
-  end
-
-  # --- Snapshot persistence ---
-
-  defp write_snapshot(path) do
-    snapshot = %{
-      version: 1,
-      timestamp: System.monotonic_time(),
-      blocks: :ets.tab2list(@blocks_table),
-      term_index: :ets.tab2list(@term_index_table),
-      trace_index: :ets.tab2list(@trace_index_table),
-      compression_stats: :ets.tab2list(@compression_stats_table),
-      block_data: :ets.tab2list(@block_data_table)
-    }
-
-    binary = :erlang.term_to_binary(snapshot, [:compressed])
-    tmp_path = path <> ".tmp"
-
-    case File.write(tmp_path, binary) do
-      :ok ->
-        File.rename!(tmp_path, path)
-        :ok
-
-      {:error, reason} ->
-        File.rm(tmp_path)
-        {:error, reason}
-    end
-  end
-
-  defp load_snapshot(path) do
-    case File.read(path) do
-      {:ok, binary} ->
-        try do
-          snapshot = :erlang.binary_to_term(binary)
-          :ets.insert(@blocks_table, snapshot.blocks)
-          :ets.insert(@term_index_table, snapshot.term_index)
-          :ets.insert(@trace_index_table, Map.get(snapshot, :trace_index, []))
-          :ets.insert(@compression_stats_table, snapshot.compression_stats)
-          :ets.insert(@block_data_table, Map.get(snapshot, :block_data, []))
-          :persistent_term.put({__MODULE__, :snapshot_ts}, snapshot.timestamp)
-          :ok
-        rescue
-          e ->
-            require Logger
-            Logger.warning("TimelessTraces: corrupt snapshot, starting fresh: #{inspect(e)}")
-            :persistent_term.put({__MODULE__, :snapshot_ts}, :none)
-            :ok
+        if storage == :memory and meta[:data] do
+          TimelessTraces.DB.execute(
+            conn,
+            "INSERT OR REPLACE INTO block_data (block_id, data) VALUES (?1, ?2)",
+            [meta.block_id, meta[:data]]
+          )
         end
-
-      {:error, :enoent} ->
-        :persistent_term.put({__MODULE__, :snapshot_ts}, :none)
-        :ok
-
-      {:error, reason} ->
-        require Logger
-        Logger.warning("TimelessTraces: failed to load snapshot: #{inspect(reason)}")
-        :persistent_term.put({__MODULE__, :snapshot_ts}, :none)
-        :ok
-    end
+      end)
   end
 
-  defp snapshot_timestamp do
-    :persistent_term.get({__MODULE__, :snapshot_ts}, :none)
-  end
-
-  # --- Disk log ---
-
-  defp open_disk_log(log_path) do
-    log_name = :timeless_traces_index_log
-
-    # Close any existing log with this name
-    :disk_log.close(log_name)
-
-    result =
-      :disk_log.open(
-        name: log_name,
-        file: String.to_charlist(log_path),
-        type: :halt,
-        format: :internal
-      )
-
-    case result do
-      {:ok, ref} ->
-        ref
-
-      {:repaired, ref, {:recovered, recovered}, {:badbytes, bad}} ->
-        require Logger
-
-        Logger.warning("disk_log #{log_name} repaired: recovered=#{recovered} badbytes=#{bad}")
-
-        ref
-    end
-  end
-
-  defp replay_log(log_ref, snapshot_ts) do
-    replay_log_chunks(log_ref, :start, snapshot_ts, 0)
-  end
-
-  defp replay_log_chunks(log_ref, cont, snapshot_ts, count) do
-    case :disk_log.chunk(log_ref, cont) do
-      :eof ->
-        count
-
-      {next_cont, terms} ->
-        new_count =
-          Enum.reduce(terms, count, fn term, acc ->
-            ts = elem(term, 1)
-
-            if snapshot_ts == :none or ts > snapshot_ts do
-              apply_log_entry(term)
-              acc + 1
-            else
-              acc
-            end
-          end)
-
-        replay_log_chunks(log_ref, next_cont, snapshot_ts, new_count)
-
-      {next_cont, terms, _bad_bytes} ->
-        new_count =
-          Enum.reduce(terms, count, fn term, acc ->
-            ts = elem(term, 1)
-
-            if snapshot_ts == :none or ts > snapshot_ts do
-              apply_log_entry(term)
-              acc + 1
-            else
-              acc
-            end
-          end)
-
-        replay_log_chunks(log_ref, next_cont, snapshot_ts, new_count)
-    end
-  end
-
-  defp apply_log_entry({:index_block, _ts, meta_map, terms, trace_rows}) do
-    insert_block_ets_from_map(meta_map)
-    insert_index_entries(terms, trace_rows, meta_map.block_id)
-
-    storage = :persistent_term.get({__MODULE__, :storage})
-
-    if storage == :memory and meta_map[:data] do
-      :ets.insert(@block_data_table, {meta_map.block_id, meta_map[:data]})
-    end
-  end
-
-  defp apply_log_entry({:delete_blocks, _ts, block_ids}) do
-    storage = :persistent_term.get({__MODULE__, :storage})
-
-    for id <- block_ids do
-      terms = :ets.match_object(@term_index_table, {:_, id})
-      traces = :ets.match_object(@trace_index_table, {:_, id})
-
-      if storage == :disk do
-        case :ets.lookup(@blocks_table, id) do
-          [{_bid, file_path, _bs, _ec, _tsmin, _tsmax, _fmt, _ca}] when is_binary(file_path) ->
-            File.rm(file_path)
-
-          _ ->
-            :ok
-        end
-      end
-
-      :ets.delete(@blocks_table, id)
-      :ets.delete(@block_data_table, id)
-
-      for {term, block_id} <- terms do
-        :ets.delete_object(@term_index_table, {term, block_id})
-      end
-
-      for {trace_id, block_id} <- traces do
-        :ets.delete_object(@trace_index_table, {trace_id, block_id})
-      end
-    end
-  end
-
-  defp apply_log_entry(
-         {:compact_blocks, _ts, old_ids, new_meta_map, terms, trace_rows, compression_sizes}
-       ) do
-    storage = :persistent_term.get({__MODULE__, :storage})
-
-    # Delete old blocks
-    for id <- old_ids do
-      old_terms = :ets.match_object(@term_index_table, {:_, id})
-      old_traces = :ets.match_object(@trace_index_table, {:_, id})
-
-      if storage == :disk do
-        case :ets.lookup(@blocks_table, id) do
-          [{_bid, file_path, _bs, _ec, _tsmin, _tsmax, _fmt, _ca}] when is_binary(file_path) ->
-            File.rm(file_path)
-
-          _ ->
-            :ok
-        end
-      end
-
-      :ets.delete(@blocks_table, id)
-      :ets.delete(@block_data_table, id)
-
-      for {term, block_id} <- old_terms do
-        :ets.delete_object(@term_index_table, {term, block_id})
-      end
-
-      for {trace_id, block_id} <- old_traces do
-        :ets.delete_object(@trace_index_table, {trace_id, block_id})
-      end
-    end
-
-    # Insert new block
-    insert_block_ets_from_map(new_meta_map)
-    insert_index_entries(terms, trace_rows, new_meta_map.block_id)
-
-    # Update compression stats
-    {raw_in, compressed_out} = compression_sizes
-    update_compression_stats_ets(raw_in, compressed_out)
-  end
-
-  defp apply_log_entry({:update_compression_stats, _ts, raw_in, compressed_out}) do
-    update_compression_stats_ets(raw_in, compressed_out)
-  end
-
-  defp append_log(%{log_ref: nil} = state, _entry), do: state
-
-  defp append_log(state, entry) do
-    :disk_log.log(state.log_ref, entry)
-    new_count = state.log_entry_count + 1
-    state = %{state | log_entry_count: new_count}
-    maybe_snapshot(state)
-  end
-
-  defp maybe_snapshot(%{log_entry_count: count, snapshot_threshold: threshold} = state)
-       when count >= threshold do
-    write_snapshot(state.snapshot_path)
-    :disk_log.truncate(state.log_ref)
-    %{state | log_entry_count: 0}
-  end
-
-  defp maybe_snapshot(state), do: state
-
-  # --- Cache update helpers ---
-
-  defp block_meta_to_map(meta) do
-    %{
-      block_id: meta.block_id,
-      file_path: meta[:file_path],
-      byte_size: meta.byte_size,
-      entry_count: meta.entry_count,
-      ts_min: meta.ts_min,
-      ts_max: meta.ts_max,
-      format: Map.get(meta, :format, :zstd),
-      data: meta[:data]
-    }
-  end
-
-  defp insert_block_ets(meta) do
-    format = Map.get(meta, :format, :zstd)
+  defp insert_block_sql(conn, meta) do
+    format = Map.get(meta, :format, :zstd) |> to_string()
     created_at = System.system_time(:second)
 
-    :ets.insert(@blocks_table, {
-      meta.block_id,
-      meta[:file_path],
-      meta.byte_size,
-      meta.entry_count,
-      meta.ts_min,
-      meta.ts_max,
-      format,
-      created_at
-    })
+    TimelessTraces.DB.execute(
+      conn,
+      "INSERT OR REPLACE INTO blocks (block_id, file_path, byte_size, entry_count, ts_min, ts_max, format, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+      [meta.block_id, meta[:file_path], meta.byte_size, meta.entry_count, meta.ts_min, meta.ts_max, format, created_at]
+    )
   end
 
-  defp insert_block_ets_from_map(meta_map) do
-    format = Map.get(meta_map, :format, :zstd)
-    created_at = System.system_time(:second)
-
-    :ets.insert(@blocks_table, {
-      meta_map.block_id,
-      meta_map[:file_path],
-      meta_map.byte_size,
-      meta_map.entry_count,
-      meta_map.ts_min,
-      meta_map.ts_max,
-      format,
-      created_at
-    })
-  end
-
-  defp insert_index_entries(terms, trace_rows, block_id) do
-    if terms != [] do
-      term_objects = Enum.map(terms, fn term -> {term, block_id} end)
-      :ets.insert(@term_index_table, term_objects)
-    end
-
-    if trace_rows != [] do
-      trace_objects =
-        Enum.map(trace_rows, fn {trace_id, _, _, _, _} -> {trace_id, block_id} end)
-
-      :ets.insert(@trace_index_table, trace_objects)
-    end
-  end
-
-  # --- Lock-free read helpers ---
-
-  defp term_block_ids(term) do
-    @term_index_table
-    |> :ets.lookup(term)
-    |> Enum.map(fn {_term, bid} -> bid end)
-    |> MapSet.new()
-  end
-
-  defp trace_block_ids(trace_id) do
-    @trace_index_table
-    |> :ets.lookup(trace_id)
-    |> Enum.map(fn {_trace_id, bid} -> bid end)
-    |> MapSet.new()
-  end
-
-  defp find_matching_blocks_ets(term_filters, time_filters, order) do
-    terms = build_query_terms(term_filters)
-
-    candidate_bids =
-      case terms do
-        [] ->
-          nil
-
-        _ ->
-          terms
-          |> Enum.map(&term_block_ids/1)
-          |> Enum.reduce(&MapSet.intersection/2)
-      end
-
-    matching =
-      :ets.foldl(
-        fn {bid, fp, _bs, _ec, ts_min, ts_max, fmt, _ca}, acc ->
-          term_match =
-            case candidate_bids do
-              nil -> true
-              bids -> MapSet.member?(bids, bid)
-            end
-
-          time_match =
-            term_match and
-              Enum.all?(time_filters, fn
-                {:since, ts} -> ts_max >= to_nanos(ts)
-                {:until, ts} -> ts_min <= to_nanos(ts)
-              end)
-
-          if term_match and time_match do
-            [{ts_min, bid, fp, fmt} | acc]
-          else
-            acc
-          end
-        end,
-        [],
-        @blocks_table
+  defp insert_terms_sql(conn, terms, block_id) do
+    for term <- terms do
+      TimelessTraces.DB.execute(
+        conn,
+        "INSERT OR IGNORE INTO term_index (term, block_id) VALUES (?1, ?2)",
+        [term, block_id]
       )
-
-    matching
-    |> Enum.sort_by(
-      fn {ts_min, _bid, _fp, _fmt} -> ts_min end,
-      if(order == :asc, do: :asc, else: :desc)
-    )
-    |> Enum.map(fn {_ts_min, bid, fp, fmt} -> {bid, fp, fmt} end)
-  end
-
-  # --- ETS-based deletion helpers ---
-
-  defp collect_terms_for_blocks_ets(block_ids) do
-    bid_set = MapSet.new(block_ids)
-
-    :ets.foldl(
-      fn {term, bid}, acc ->
-        if MapSet.member?(bid_set, bid), do: [{term, bid} | acc], else: acc
-      end,
-      [],
-      @term_index_table
-    )
-  end
-
-  defp collect_traces_for_blocks_ets(block_ids) do
-    bid_set = MapSet.new(block_ids)
-
-    :ets.foldl(
-      fn {trace_id, bid}, acc ->
-        if MapSet.member?(bid_set, bid), do: [{trace_id, bid} | acc], else: acc
-      end,
-      [],
-      @trace_index_table
-    )
-  end
-
-  defp remove_block_ids_from_index(_old_ids, old_terms, old_traces) do
-    for {term, block_id} <- old_terms do
-      :ets.delete_object(@term_index_table, {term, block_id})
-    end
-
-    for {trace_id, block_id} <- old_traces do
-      :ets.delete_object(@trace_index_table, {trace_id, block_id})
     end
   end
 
-  defp delete_blocks_ets(block_ids, storage) do
-    for id <- block_ids do
-      if storage == :disk do
-        case :ets.lookup(@blocks_table, id) do
-          [{_bid, file_path, _bs, _ec, _tsmin, _tsmax, _fmt, _ca}] when is_binary(file_path) ->
-            File.rm(file_path)
-
-          _ ->
-            :ok
-        end
-      end
-
-      :ets.delete(@blocks_table, id)
-      :ets.delete(@block_data_table, id)
-    end
-  end
-
-  defp do_delete_before_ets(cutoff_timestamp, storage) do
-    to_delete =
-      :ets.foldl(
-        fn {bid, _fp, _bs, _ec, _tsmin, ts_max, _fmt, _ca}, acc ->
-          if ts_max < cutoff_timestamp, do: [bid | acc], else: acc
-        end,
-        [],
-        @blocks_table
+  defp insert_traces_sql(conn, trace_rows, block_id) do
+    for {trace_id, _, _, _, _} <- trace_rows do
+      TimelessTraces.DB.execute(
+        conn,
+        "INSERT OR IGNORE INTO trace_index (trace_id, block_id) VALUES (?1, ?2)",
+        [trace_id, block_id]
       )
+    end
+  end
 
-    if to_delete == [] do
-      {0, []}
+  defp update_compression_stats_sql(conn, raw_in, compressed_out) do
+    if raw_in > 0 or compressed_out > 0 do
+      TimelessTraces.DB.execute(
+        conn,
+        """
+        INSERT INTO compression_stats (key, raw_in, compressed_out, count)
+        VALUES ('lifetime', ?1, ?2, 1)
+        ON CONFLICT(key) DO UPDATE SET
+          raw_in = raw_in + excluded.raw_in,
+          compressed_out = compressed_out + excluded.compressed_out,
+          count = count + 1
+        """,
+        [raw_in, compressed_out]
+      )
+    end
+  end
+
+  # --- SQL delete helpers ---
+
+  defp do_delete_before(db, cutoff, storage) do
+    {:ok, rows} =
+      TimelessTraces.DB.read(db, "SELECT block_id, file_path FROM blocks WHERE ts_max < ?1", [cutoff])
+
+    if rows == [] do
+      0
     else
-      old_terms = collect_terms_for_blocks_ets(to_delete)
-      old_traces = collect_traces_for_blocks_ets(to_delete)
-      delete_blocks_ets(to_delete, storage)
-      remove_block_ids_from_index(to_delete, old_terms, old_traces)
-      {length(to_delete), to_delete}
+      block_ids = Enum.map(rows, fn [bid, _fp] -> bid end)
+      file_paths = for [_bid, fp] <- rows, is_binary(fp), do: fp
+      delete_block_set(db, block_ids)
+
+      if storage == :disk do
+        Enum.each(file_paths, &File.rm/1)
+      end
+
+      length(block_ids)
     end
   end
 
-  defp do_delete_over_size_ets(max_bytes, storage) do
-    {total, rows} =
-      :ets.foldl(
-        fn {bid, _fp, byte_size, _ec, ts_min, _tsmax, _fmt, _ca}, {sum, acc} ->
-          {sum + byte_size, [{ts_min, bid, byte_size} | acc]}
-        end,
-        {0, []},
-        @blocks_table
-      )
+  defp do_delete_over_size(db, max_bytes, storage) do
+    {:ok, [[total]]} =
+      TimelessTraces.DB.read(db, "SELECT COALESCE(SUM(byte_size), 0) FROM blocks")
 
     if total <= max_bytes do
-      {0, []}
+      0
     else
-      sorted = Enum.sort_by(rows, fn {ts_min, _bid, _bs} -> ts_min end)
+      {:ok, rows} =
+        TimelessTraces.DB.read(db, "SELECT block_id, file_path, byte_size FROM blocks ORDER BY ts_min ASC")
 
       {to_delete, _} =
-        Enum.reduce_while(sorted, {[], total}, fn {_ts_min, bid, byte_size}, {acc, remaining} ->
+        Enum.reduce_while(rows, {[], total}, fn [bid, fp, bs], {acc, remaining} ->
           if remaining > max_bytes do
-            {:cont, {[bid | acc], remaining - byte_size}}
+            {:cont, {[{bid, fp} | acc], remaining - bs}}
           else
             {:halt, {acc, remaining}}
           end
         end)
 
       if to_delete == [] do
-        {0, []}
+        0
       else
-        old_terms = collect_terms_for_blocks_ets(to_delete)
-        old_traces = collect_traces_for_blocks_ets(to_delete)
-        delete_blocks_ets(to_delete, storage)
-        remove_block_ids_from_index(to_delete, old_terms, old_traces)
-        {length(to_delete), to_delete}
+        block_ids = Enum.map(to_delete, fn {bid, _fp} -> bid end)
+        file_paths = for {_bid, fp} <- to_delete, is_binary(fp), do: fp
+        delete_block_set(db, block_ids)
+
+        if storage == :disk do
+          Enum.each(file_paths, &File.rm/1)
+        end
+
+        length(to_delete)
       end
     end
   end
 
-  defp do_delete_by_term_limit_ets(max_entries, storage) do
-    current_size = :ets.info(@term_index_table, :size)
+  defp do_delete_by_term_limit(db, max_entries, storage) do
+    {:ok, [[current_size]]} = TimelessTraces.DB.read(db, "SELECT COUNT(*) FROM term_index")
 
     if current_size <= max_entries do
-      {0, []}
+      0
     else
-      # Single pass over term_index to build block_id => term_count map
-      term_counts =
-        :ets.foldl(
-          fn {_term, bid}, acc ->
-            Map.update(acc, bid, 1, &(&1 + 1))
-          end,
-          %{},
-          @term_index_table
-        )
-
-      # Single pass over blocks to collect {ts_min, bid} tuples
-      rows =
-        :ets.foldl(
-          fn {bid, _fp, _bs, _ec, ts_min, _tsmax, _fmt, _ca}, acc ->
-            [{ts_min, bid, Map.get(term_counts, bid, 0)} | acc]
-          end,
-          [],
-          @blocks_table
-        )
-        |> Enum.sort_by(fn {ts_min, _bid, _tc} -> ts_min end)
+      {:ok, rows} =
+        TimelessTraces.DB.read(db, """
+        SELECT b.block_id, b.file_path, COALESCE(t.tc, 0) as term_count
+        FROM blocks b
+        LEFT JOIN (SELECT block_id, COUNT(*) as tc FROM term_index GROUP BY block_id) t
+          ON b.block_id = t.block_id
+        ORDER BY b.ts_min ASC
+        """)
 
       {to_delete, _} =
-        Enum.reduce_while(rows, {[], current_size}, fn {_ts_min, bid, term_count},
-                                                       {acc, remaining} ->
+        Enum.reduce_while(rows, {[], current_size}, fn [bid, fp, tc], {acc, remaining} ->
           if remaining > max_entries do
-            {:cont, {[bid | acc], remaining - term_count}}
+            {:cont, {[{bid, fp} | acc], remaining - tc}}
           else
             {:halt, {acc, remaining}}
           end
         end)
 
       if to_delete == [] do
-        {0, []}
+        0
       else
-        old_terms = collect_terms_for_blocks_ets(to_delete)
-        old_traces = collect_traces_for_blocks_ets(to_delete)
-        delete_blocks_ets(to_delete, storage)
-        remove_block_ids_from_index(to_delete, old_terms, old_traces)
-        {length(to_delete), to_delete}
+        block_ids = Enum.map(to_delete, fn {bid, _fp} -> bid end)
+        file_paths = for {_bid, fp} <- to_delete, is_binary(fp), do: fp
+        delete_block_set(db, block_ids)
+
+        if storage == :disk do
+          Enum.each(file_paths, &File.rm/1)
+        end
+
+        length(to_delete)
       end
     end
   end
 
-  defp update_compression_stats_ets(raw_in, compressed_out) do
-    if raw_in > 0 or compressed_out > 0 do
-      case :ets.lookup(@compression_stats_table, :lifetime) do
-        [{:lifetime, old_raw, old_comp, old_count}] ->
-          :ets.insert(@compression_stats_table, {
-            :lifetime,
-            old_raw + raw_in,
-            old_comp + compressed_out,
-            old_count + 1
-          })
+  defp delete_block_set(db, block_ids) do
+    ph = placeholders(block_ids)
+
+    {:ok, _} =
+      TimelessTraces.DB.write_transaction(db, fn conn ->
+        TimelessTraces.DB.execute(conn, "DELETE FROM term_index WHERE block_id IN (#{ph})", block_ids)
+        TimelessTraces.DB.execute(conn, "DELETE FROM trace_index WHERE block_id IN (#{ph})", block_ids)
+        TimelessTraces.DB.execute(conn, "DELETE FROM block_data WHERE block_id IN (#{ph})", block_ids)
+        TimelessTraces.DB.execute(conn, "DELETE FROM blocks WHERE block_id IN (#{ph})", block_ids)
+      end)
+  end
+
+  # --- SQL read helpers ---
+
+  defp find_matching_blocks(db, term_filters, time_filters, order) do
+    terms = build_query_terms(term_filters)
+    order_dir = if order == :asc, do: "ASC", else: "DESC"
+
+    {conditions, params} = build_block_conditions(terms, time_filters)
+    where = if conditions == [], do: "", else: " WHERE " <> Enum.join(conditions, " AND ")
+    sql = "SELECT block_id, file_path, format FROM blocks#{where} ORDER BY ts_min #{order_dir}"
+
+    {:ok, rows} = TimelessTraces.DB.read(db, sql, params)
+    Enum.map(rows, fn [bid, fp, fmt] -> {bid, fp, to_format_atom(fmt)} end)
+  end
+
+  defp build_block_conditions(terms, time_filters) do
+    {conditions, params, idx} =
+      case terms do
+        [] ->
+          {[], [], 1}
 
         _ ->
-          :ets.insert(@compression_stats_table, {:lifetime, raw_in, compressed_out, 1})
+          n = length(terms)
+          ph = Enum.map_join(1..n, ", ", &"?#{&1}")
+
+          clause =
+            "block_id IN (SELECT block_id FROM term_index WHERE term IN (#{ph}) GROUP BY block_id HAVING COUNT(DISTINCT term) = ?#{n + 1})"
+
+          {[clause], terms ++ [n], n + 2}
       end
-    end
+
+    {time_conds, time_params, _} =
+      Enum.reduce(time_filters, {[], [], idx}, fn
+        {:since, ts}, {c, p, i} -> {c ++ ["ts_max >= ?#{i}"], p ++ [to_nanos(ts)], i + 1}
+        {:until, ts}, {c, p, i} -> {c ++ ["ts_min <= ?#{i}"], p ++ [to_nanos(ts)], i + 1}
+      end)
+
+    {conditions ++ time_conds, params ++ time_params}
   end
 
-  defp read_block_from_ets(block_id) do
-    case :ets.lookup(@block_data_table, block_id) do
-      [{^block_id, data}] when is_binary(data) ->
-        format =
-          case :ets.lookup(@blocks_table, block_id) do
-            [{_bid, _fp, _bs, _ec, _tsmin, _tsmax, fmt, _ca}] -> fmt
-            _ -> :zstd
-          end
+  defp read_block_from_db(db, block_id) do
+    {:ok, rows} =
+      TimelessTraces.DB.read(
+        db,
+        """
+        SELECT bd.data, b.format FROM block_data bd
+        JOIN blocks b ON bd.block_id = b.block_id
+        WHERE bd.block_id = ?1
+        """,
+        [block_id]
+      )
 
-        TimelessTraces.Writer.decompress_block(data, format)
+    case rows do
+      [[data, format]] when is_binary(data) ->
+        TimelessTraces.Writer.decompress_block(data, to_format_atom(format))
 
       _ ->
         {:error, :not_found}
@@ -1222,22 +721,21 @@ defmodule TimelessTraces.Index do
   defp flush_pending(%{pending: pending} = state) do
     resolved = Enum.reverse(pending)
 
-    state =
-      Enum.reduce(resolved, state, fn {meta, terms, trace_rows}, acc ->
-        insert_block_ets(meta)
-        insert_index_entries(terms, trace_rows, meta.block_id)
+    {:ok, _} =
+      TimelessTraces.DB.write_transaction(state.db, fn conn ->
+        for {meta, terms, trace_rows} <- resolved do
+          insert_block_sql(conn, meta)
+          insert_terms_sql(conn, terms, meta.block_id)
+          insert_traces_sql(conn, trace_rows, meta.block_id)
 
-        if acc.storage == :memory and meta[:data] do
-          :ets.insert(@block_data_table, {meta.block_id, meta[:data]})
+          if state.storage == :memory and meta[:data] do
+            TimelessTraces.DB.execute(
+              conn,
+              "INSERT OR REPLACE INTO block_data (block_id, data) VALUES (?1, ?2)",
+              [meta.block_id, meta[:data]]
+            )
+          end
         end
-
-        append_log(acc, {
-          :index_block,
-          System.monotonic_time(),
-          block_meta_to_map(meta),
-          terms,
-          trace_rows
-        })
       end)
 
     if state.flush_timer do
@@ -1257,12 +755,12 @@ defmodule TimelessTraces.Index do
   # --- Querying (with early-exit limit) ---
   #
   # Blocks arrive pre-sorted in the requested timestamp order from
-  # find_matching_blocks_ets (newest-first for :desc, oldest-first for :asc).
+  # find_matching_blocks (newest-first for :desc, oldest-first for :asc).
   # We read blocks sequentially (or in parallel batches for disk) and stop
   # as soon as we've accumulated enough filtered entries (offset + limit).
   # This turns an O(all_spans) scan into O(limit) for the common case.
 
-  defp do_query_parallel(block_ids, storage, pagination, search_filters) do
+  defp do_query_parallel(block_ids, db, storage, pagination, search_filters) do
     start_time = System.monotonic_time()
 
     limit = Keyword.get(pagination, :limit, @default_limit)
@@ -1271,10 +769,8 @@ defmodule TimelessTraces.Index do
     need = offset + limit
 
     {collected, blocks_read} =
-      collect_with_early_exit(block_ids, storage, search_filters, need)
+      collect_with_early_exit(block_ids, db, storage, search_filters, need)
 
-    # Entries from each block are already in roughly timestamp order
-    # (within each block), but need a final sort across blocks.
     sorted =
       case order do
         :asc -> Enum.sort_by(collected, & &1.start_time, :asc)
@@ -1300,25 +796,22 @@ defmodule TimelessTraces.Index do
      }}
   end
 
-  # Read blocks sequentially (memory or single disk block) or in parallel
-  # batches (disk, multiple blocks), stopping as soon as we have `need` entries.
-  defp collect_with_early_exit(block_ids, storage, search_filters, need) do
+  defp collect_with_early_exit(block_ids, db, storage, search_filters, need) do
     if storage == :disk and length(block_ids) > 1 do
       collect_parallel_early_exit(block_ids, search_filters, need)
     else
-      collect_sequential_early_exit(block_ids, storage, search_filters, need)
+      collect_sequential_early_exit(block_ids, db, storage, search_filters, need)
     end
   end
 
-  # Sequential: read one block at a time, stop when we have enough.
-  defp collect_sequential_early_exit(block_ids, storage, search_filters, need) do
+  defp collect_sequential_early_exit(block_ids, db, storage, search_filters, need) do
     Enum.reduce_while(block_ids, {[], 0}, fn {block_id, file_path, format}, {acc, count} ->
       format_atom = to_format_atom(format)
 
       read_result =
         case storage do
           :disk -> TimelessTraces.Writer.read_block(file_path, format_atom)
-          :memory -> read_block_data(block_id)
+          :memory -> read_block_from_db(db, block_id)
         end
 
       case read_result do
@@ -1349,7 +842,6 @@ defmodule TimelessTraces.Index do
     end)
   end
 
-  # Parallel: process blocks in batches of scheduler count, check after each batch.
   defp collect_parallel_early_exit(block_ids, search_filters, need) do
     batch_size = System.schedulers_online()
 
@@ -1394,7 +886,7 @@ defmodule TimelessTraces.Index do
     end)
   end
 
-  defp do_trace_parallel(block_info, storage, trace_id) do
+  defp do_trace_parallel(block_info, db, storage, trace_id) do
     spans =
       if storage == :disk and length(block_info) > 1 do
         block_info
@@ -1423,7 +915,7 @@ defmodule TimelessTraces.Index do
           read_result =
             case storage do
               :disk -> TimelessTraces.Writer.read_block(file_path, format_atom)
-              :memory -> read_block_data(block_id)
+              :memory -> read_block_from_db(db, block_id)
             end
 
           case read_result do
@@ -1471,6 +963,84 @@ defmodule TimelessTraces.Index do
       {:attributes, map} -> Enum.map(map, fn {k, v} -> "#{k}:#{v}" end)
       _ -> []
     end)
+  end
+
+  # --- Migration from old ETS snapshot ---
+
+  defp maybe_migrate_from_ets(db, data_dir) do
+    snapshot_path = Path.join(data_dir, "index.snapshot")
+    log_path = Path.join(data_dir, "index.log")
+
+    case File.read(snapshot_path) do
+      {:ok, binary} ->
+        try do
+          snapshot = :erlang.binary_to_term(binary)
+
+          {:ok, _} =
+            TimelessTraces.DB.write_transaction(db, fn conn ->
+              for {block_id, file_path, byte_size, entry_count, ts_min, ts_max, format, created_at} <-
+                    snapshot.blocks do
+                TimelessTraces.DB.execute(
+                  conn,
+                  "INSERT OR IGNORE INTO blocks (block_id, file_path, byte_size, entry_count, ts_min, ts_max, format, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                  [block_id, file_path, byte_size, entry_count, ts_min, ts_max, to_string(format), created_at]
+                )
+              end
+
+              for {term, block_id} <- snapshot.term_index do
+                TimelessTraces.DB.execute(
+                  conn,
+                  "INSERT OR IGNORE INTO term_index (term, block_id) VALUES (?1, ?2)",
+                  [term, block_id]
+                )
+              end
+
+              for {trace_id, block_id} <- Map.get(snapshot, :trace_index, []) do
+                TimelessTraces.DB.execute(
+                  conn,
+                  "INSERT OR IGNORE INTO trace_index (trace_id, block_id) VALUES (?1, ?2)",
+                  [trace_id, block_id]
+                )
+              end
+
+              for {:lifetime, raw_in, compressed_out, count} <- snapshot.compression_stats do
+                TimelessTraces.DB.execute(
+                  conn,
+                  "INSERT OR REPLACE INTO compression_stats (key, raw_in, compressed_out, count) VALUES ('lifetime', ?1, ?2, ?3)",
+                  [raw_in, compressed_out, count]
+                )
+              end
+
+              for {block_id, data} <- Map.get(snapshot, :block_data, []) do
+                TimelessTraces.DB.execute(
+                  conn,
+                  "INSERT OR IGNORE INTO block_data (block_id, data) VALUES (?1, ?2)",
+                  [block_id, data]
+                )
+              end
+            end)
+
+          File.rm(snapshot_path)
+          File.rm(log_path)
+          File.rm(log_path <> ".idx")
+
+          Logger.info(
+            "TimelessTraces: migrated #{length(snapshot.blocks)} blocks from ETS snapshot to SQLite"
+          )
+        rescue
+          e ->
+            Logger.warning("TimelessTraces: failed to migrate from ETS snapshot: #{inspect(e)}")
+        end
+
+      {:error, _} ->
+        :ok
+    end
+  end
+
+  # --- Utilities ---
+
+  defp placeholders(list) do
+    list |> Enum.with_index(1) |> Enum.map_join(", ", fn {_, i} -> "?#{i}" end)
   end
 
   defp to_nanos(%DateTime{} = dt), do: DateTime.to_unix(dt, :nanosecond)
