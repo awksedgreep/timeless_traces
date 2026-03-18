@@ -28,3 +28,4 @@ span_stream-*.tar
 # Environment files
 .env
 .env.*
+test/tmp/
