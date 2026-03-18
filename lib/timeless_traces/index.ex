@@ -402,7 +402,11 @@ defmodule TimelessTraces.Index do
         ph = placeholders(old_ids)
 
         {:ok, rows} =
-          TimelessTraces.DB.read(state.db, "SELECT file_path FROM blocks WHERE block_id IN (#{ph})", old_ids)
+          TimelessTraces.DB.read(
+            state.db,
+            "SELECT file_path FROM blocks WHERE block_id IN (#{ph})",
+            old_ids
+          )
 
         for [fp] <- rows, is_binary(fp), do: fp
       else
@@ -414,9 +418,25 @@ defmodule TimelessTraces.Index do
         # Delete old blocks
         if old_ids != [] do
           ph = placeholders(old_ids)
-          TimelessTraces.DB.execute(conn, "DELETE FROM term_index WHERE block_id IN (#{ph})", old_ids)
-          TimelessTraces.DB.execute(conn, "DELETE FROM trace_index WHERE block_id IN (#{ph})", old_ids)
-          TimelessTraces.DB.execute(conn, "DELETE FROM block_data WHERE block_id IN (#{ph})", old_ids)
+
+          TimelessTraces.DB.execute(
+            conn,
+            "DELETE FROM term_index WHERE block_id IN (#{ph})",
+            old_ids
+          )
+
+          TimelessTraces.DB.execute(
+            conn,
+            "DELETE FROM trace_index WHERE block_id IN (#{ph})",
+            old_ids
+          )
+
+          TimelessTraces.DB.execute(
+            conn,
+            "DELETE FROM block_data WHERE block_id IN (#{ph})",
+            old_ids
+          )
+
           TimelessTraces.DB.execute(conn, "DELETE FROM blocks WHERE block_id IN (#{ph})", old_ids)
         end
 
@@ -505,7 +525,16 @@ defmodule TimelessTraces.Index do
     TimelessTraces.DB.execute(
       conn,
       "INSERT OR REPLACE INTO blocks (block_id, file_path, byte_size, entry_count, ts_min, ts_max, format, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-      [meta.block_id, meta[:file_path], meta.byte_size, meta.entry_count, meta.ts_min, meta.ts_max, format, created_at]
+      [
+        meta.block_id,
+        meta[:file_path],
+        meta.byte_size,
+        meta.entry_count,
+        meta.ts_min,
+        meta.ts_max,
+        format,
+        created_at
+      ]
     )
   end
 
@@ -550,7 +579,9 @@ defmodule TimelessTraces.Index do
 
   defp do_delete_before(db, cutoff, storage) do
     {:ok, rows} =
-      TimelessTraces.DB.read(db, "SELECT block_id, file_path FROM blocks WHERE ts_max < ?1", [cutoff])
+      TimelessTraces.DB.read(db, "SELECT block_id, file_path FROM blocks WHERE ts_max < ?1", [
+        cutoff
+      ])
 
     if rows == [] do
       0
@@ -575,7 +606,10 @@ defmodule TimelessTraces.Index do
       0
     else
       {:ok, rows} =
-        TimelessTraces.DB.read(db, "SELECT block_id, file_path, byte_size FROM blocks ORDER BY ts_min ASC")
+        TimelessTraces.DB.read(
+          db,
+          "SELECT block_id, file_path, byte_size FROM blocks ORDER BY ts_min ASC"
+        )
 
       {to_delete, _} =
         Enum.reduce_while(rows, {[], total}, fn [bid, fp, bs], {acc, remaining} ->
@@ -647,9 +681,24 @@ defmodule TimelessTraces.Index do
 
     {:ok, _} =
       TimelessTraces.DB.write_transaction(db, fn conn ->
-        TimelessTraces.DB.execute(conn, "DELETE FROM term_index WHERE block_id IN (#{ph})", block_ids)
-        TimelessTraces.DB.execute(conn, "DELETE FROM trace_index WHERE block_id IN (#{ph})", block_ids)
-        TimelessTraces.DB.execute(conn, "DELETE FROM block_data WHERE block_id IN (#{ph})", block_ids)
+        TimelessTraces.DB.execute(
+          conn,
+          "DELETE FROM term_index WHERE block_id IN (#{ph})",
+          block_ids
+        )
+
+        TimelessTraces.DB.execute(
+          conn,
+          "DELETE FROM trace_index WHERE block_id IN (#{ph})",
+          block_ids
+        )
+
+        TimelessTraces.DB.execute(
+          conn,
+          "DELETE FROM block_data WHERE block_id IN (#{ph})",
+          block_ids
+        )
+
         TimelessTraces.DB.execute(conn, "DELETE FROM blocks WHERE block_id IN (#{ph})", block_ids)
       end)
   end
@@ -978,12 +1027,22 @@ defmodule TimelessTraces.Index do
 
           {:ok, _} =
             TimelessTraces.DB.write_transaction(db, fn conn ->
-              for {block_id, file_path, byte_size, entry_count, ts_min, ts_max, format, created_at} <-
+              for {block_id, file_path, byte_size, entry_count, ts_min, ts_max, format,
+                   created_at} <-
                     snapshot.blocks do
                 TimelessTraces.DB.execute(
                   conn,
                   "INSERT OR IGNORE INTO blocks (block_id, file_path, byte_size, entry_count, ts_min, ts_max, format, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-                  [block_id, file_path, byte_size, entry_count, ts_min, ts_max, to_string(format), created_at]
+                  [
+                    block_id,
+                    file_path,
+                    byte_size,
+                    entry_count,
+                    ts_min,
+                    ts_max,
+                    to_string(format),
+                    created_at
+                  ]
                 )
               end
 

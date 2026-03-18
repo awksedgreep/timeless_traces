@@ -16,7 +16,8 @@ defmodule TimelessTraces.Application do
     children =
       [
         {Registry, keys: :duplicate, name: TimelessTraces.Registry},
-        {TimelessTraces.DB, name: TimelessTraces.DB, data_dir: data_dir, clean: storage == :memory},
+        {TimelessTraces.DB,
+         name: TimelessTraces.DB, data_dir: data_dir, clean: storage == :memory},
         {TimelessTraces.Index, data_dir: data_dir, storage: storage, db: TimelessTraces.DB},
         {Task.Supervisor, name: TimelessTraces.FlushSupervisor},
         {TimelessTraces.Buffer, data_dir: data_dir},
