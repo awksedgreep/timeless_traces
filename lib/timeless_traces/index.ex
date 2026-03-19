@@ -538,24 +538,24 @@ defmodule TimelessTraces.Index do
     )
   end
 
+  defp insert_terms_sql(_conn, [], _block_id), do: :ok
+
   defp insert_terms_sql(conn, terms, block_id) do
-    for term <- terms do
-      TimelessTraces.DB.execute(
-        conn,
-        "INSERT OR IGNORE INTO term_index (term, block_id) VALUES (?1, ?2)",
-        [term, block_id]
-      )
-    end
+    TimelessTraces.DB.execute_batch(
+      conn,
+      "INSERT OR IGNORE INTO term_index (term, block_id) VALUES (?1, ?2)",
+      Enum.map(terms, &[&1, block_id])
+    )
   end
 
+  defp insert_traces_sql(_conn, [], _block_id), do: :ok
+
   defp insert_traces_sql(conn, trace_rows, block_id) do
-    for {trace_id, _, _, _, _} <- trace_rows do
-      TimelessTraces.DB.execute(
-        conn,
-        "INSERT OR IGNORE INTO trace_index (trace_id, block_id) VALUES (?1, ?2)",
-        [trace_id, block_id]
-      )
-    end
+    TimelessTraces.DB.execute_batch(
+      conn,
+      "INSERT OR IGNORE INTO trace_index (trace_id, block_id) VALUES (?1, ?2)",
+      Enum.map(trace_rows, fn {trace_id, _, _, _, _} -> [trace_id, block_id] end)
+    )
   end
 
   defp update_compression_stats_sql(conn, raw_in, compressed_out) do
