@@ -769,21 +769,69 @@ defmodule TimelessTraces.Index do
 
   defp flush_pending(%{pending: pending} = state) do
     resolved = Enum.reverse(pending)
+    created_at = System.system_time(:second)
+
+    # Collect all params across all pending blocks for batched inserts
+    {block_params_list, term_params_list, trace_params_list, data_params_list} =
+      Enum.reduce(resolved, {[], [], [], []}, fn {meta, terms, trace_rows}, {bp, tp, trp, dp} ->
+        format = Map.get(meta, :format, :zstd) |> to_string()
+
+        block_row = [
+          meta.block_id,
+          meta[:file_path],
+          meta.byte_size,
+          meta.entry_count,
+          meta.ts_min,
+          meta.ts_max,
+          format,
+          created_at
+        ]
+
+        term_rows = Enum.map(terms, &[&1, meta.block_id])
+
+        trace_rows_params =
+          Enum.map(trace_rows, fn {trace_id, _, _, _, _} -> [trace_id, meta.block_id] end)
+
+        data_rows =
+          if state.storage == :memory and meta[:data] do
+            [[meta.block_id, meta[:data]]]
+          else
+            []
+          end
+
+        {[block_row | bp], term_rows ++ tp, trace_rows_params ++ trp, data_rows ++ dp}
+      end)
 
     {:ok, _} =
       TimelessTraces.DB.write_transaction(state.db, fn conn ->
-        for {meta, terms, trace_rows} <- resolved do
-          insert_block_sql(conn, meta)
-          insert_terms_sql(conn, terms, meta.block_id)
-          insert_traces_sql(conn, trace_rows, meta.block_id)
+        TimelessTraces.DB.execute_batch(
+          conn,
+          "INSERT OR REPLACE INTO blocks (block_id, file_path, byte_size, entry_count, ts_min, ts_max, format, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+          Enum.reverse(block_params_list)
+        )
 
-          if state.storage == :memory and meta[:data] do
-            TimelessTraces.DB.execute(
-              conn,
-              "INSERT OR REPLACE INTO block_data (block_id, data) VALUES (?1, ?2)",
-              [meta.block_id, meta[:data]]
-            )
-          end
+        if term_params_list != [] do
+          TimelessTraces.DB.execute_batch(
+            conn,
+            "INSERT OR IGNORE INTO term_index (term, block_id) VALUES (?1, ?2)",
+            term_params_list
+          )
+        end
+
+        if trace_params_list != [] do
+          TimelessTraces.DB.execute_batch(
+            conn,
+            "INSERT OR IGNORE INTO trace_index (trace_id, block_id) VALUES (?1, ?2)",
+            trace_params_list
+          )
+        end
+
+        if data_params_list != [] do
+          TimelessTraces.DB.execute_batch(
+            conn,
+            "INSERT OR REPLACE INTO block_data (block_id, data) VALUES (?1, ?2)",
+            data_params_list
+          )
         end
       end)
 
