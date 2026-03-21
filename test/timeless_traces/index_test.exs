@@ -155,6 +155,63 @@ defmodule TimelessTraces.IndexTest do
       assert Enum.all?(trace_spans, &(&1.trace_id == "trace-abc"))
     end
 
+    test "retrieves traces stored with packed hex trace ids" do
+      trace_id = "aabbccdd11223344556677889900aabb"
+
+      spans = [
+        make_span(%{trace_id: trace_id, span_id: "root", parent_span_id: nil, name: "root"}),
+        make_span(%{trace_id: trace_id, span_id: "child", parent_span_id: "root", name: "child"})
+      ]
+
+      {:ok, meta} = TimelessTraces.Writer.write_block(spans, :memory, :raw)
+
+      :ok =
+        (fn ->
+           {terms, trace_rows} = TimelessTraces.Index.precompute(spans)
+           TimelessTraces.Index.index_block(meta, terms, trace_rows)
+         end).()
+
+      {:ok, trace_spans} = TimelessTraces.Index.trace(trace_id)
+      assert length(trace_spans) == 2
+      assert Enum.all?(trace_spans, &(&1.trace_id == trace_id))
+    end
+
+    test "retrieves traces from legacy text trace index rows" do
+      trace_id = "ffeeddccbbaa99887766554433221100"
+
+      spans = [
+        make_span(%{trace_id: trace_id, span_id: "root", parent_span_id: nil, name: "root"}),
+        make_span(%{trace_id: trace_id, span_id: "child", parent_span_id: "root", name: "child"})
+      ]
+
+      {:ok, meta} = TimelessTraces.Writer.write_block(spans, :memory, :raw)
+
+      :ok =
+        (fn ->
+           {terms, trace_rows} = TimelessTraces.Index.precompute(spans)
+           TimelessTraces.Index.index_block(meta, terms, trace_rows)
+         end).()
+
+      db = :persistent_term.get({TimelessTraces.Index, :db})
+
+      {:ok, _} =
+        TimelessTraces.DB.write_transaction(db, fn conn ->
+          TimelessTraces.DB.execute(conn, "DELETE FROM trace_index WHERE block_id = ?1", [
+            meta.block_id
+          ])
+
+          TimelessTraces.DB.execute(
+            conn,
+            "INSERT INTO trace_index (trace_id, block_id) VALUES (?1, ?2)",
+            [trace_id, meta.block_id]
+          )
+        end)
+
+      {:ok, trace_spans} = TimelessTraces.Index.trace(trace_id)
+      assert length(trace_spans) == 2
+      assert Enum.all?(trace_spans, &(&1.trace_id == trace_id))
+    end
+
     test "returns empty list for unknown trace" do
       {:ok, spans} = TimelessTraces.Index.trace("nonexistent-trace")
       assert spans == []

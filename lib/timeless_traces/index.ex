@@ -45,6 +45,16 @@ defmodule TimelessTraces.Index do
   def trace(trace_id) do
     db = :persistent_term.get({__MODULE__, :db})
     storage = :persistent_term.get({__MODULE__, :storage})
+    trace_keys = trace_lookup_keys(trace_id)
+
+    {where_sql, params} =
+      case trace_keys do
+        [single] ->
+          {"t.trace_id = ?1", [single]}
+
+        [first, second] ->
+          {"t.trace_id IN (?1, ?2)", [first, second]}
+      end
 
     {:ok, rows} =
       TimelessTraces.DB.read(
@@ -53,9 +63,9 @@ defmodule TimelessTraces.Index do
         SELECT b.block_id, b.file_path, b.format
         FROM trace_index t
         JOIN blocks b ON t.block_id = b.block_id
-        WHERE t.trace_id = ?1
+        WHERE #{where_sql}
         """,
-        [trace_id]
+        params
       )
 
     block_info = Enum.map(rows, fn [bid, fp, fmt] -> {bid, fp, to_format_atom(fmt)} end)
@@ -477,7 +487,7 @@ defmodule TimelessTraces.Index do
 
   def handle_call(:sync, _from, state) do
     state = flush_pending(state)
-    TimelessTraces.DB.write(state.db, "PRAGMA wal_checkpoint(PASSIVE)")
+    TimelessTraces.DB.write(state.db, "PRAGMA wal_checkpoint(TRUNCATE)")
     {:reply, :ok, state}
   end
 
@@ -554,9 +564,29 @@ defmodule TimelessTraces.Index do
     TimelessTraces.DB.execute_batch(
       conn,
       "INSERT OR IGNORE INTO trace_index (trace_id, block_id) VALUES (?1, ?2)",
-      Enum.map(trace_rows, fn {trace_id, _, _, _, _} -> [trace_id, block_id] end)
+      Enum.map(trace_rows, fn {trace_id, _, _, _, _} -> [pack_trace_id(trace_id), block_id] end)
     )
   end
+
+  defp trace_lookup_keys(trace_id) do
+    packed = pack_trace_id(trace_id)
+
+    if packed == trace_id do
+      [trace_id]
+    else
+      [packed, trace_id]
+    end
+  end
+
+  defp pack_trace_id(trace_id) when is_binary(trace_id) do
+    if byte_size(trace_id) == 32 and trace_id =~ ~r/\A[0-9a-f]{32}\z/ do
+      Base.decode16!(trace_id, case: :lower)
+    else
+      trace_id
+    end
+  end
+
+  defp pack_trace_id(trace_id), do: trace_id
 
   defp update_compression_stats_sql(conn, raw_in, compressed_out) do
     if raw_in > 0 or compressed_out > 0 do
@@ -790,7 +820,9 @@ defmodule TimelessTraces.Index do
         term_rows = Enum.map(terms, &[&1, meta.block_id])
 
         trace_rows_params =
-          Enum.map(trace_rows, fn {trace_id, _, _, _, _} -> [trace_id, meta.block_id] end)
+          Enum.map(trace_rows, fn {trace_id, _, _, _, _} ->
+            [pack_trace_id(trace_id), meta.block_id]
+          end)
 
         data_rows =
           if state.storage == :memory and meta[:data] do
@@ -1106,7 +1138,7 @@ defmodule TimelessTraces.Index do
                 TimelessTraces.DB.execute(
                   conn,
                   "INSERT OR IGNORE INTO trace_index (trace_id, block_id) VALUES (?1, ?2)",
-                  [trace_id, block_id]
+                  [pack_trace_id(trace_id), block_id]
                 )
               end
 
