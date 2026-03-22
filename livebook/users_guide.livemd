@@ -87,6 +87,9 @@ library for Elixir. It plugs into the OTel SDK as a span exporter, stores
 spans locally with zstd or OpenZL compression (~10x), indexes them in ETS,
 and exposes a Jaeger-compatible HTTP API for trace visualization.
 
+The persisted trace index stores packed binary trace IDs for normal 32-character
+hex IDs, which keeps the on-disk index smaller without changing the public API.
+
 ### Add the Dependency
 
 <!-- livebook:{"force_markdown":true} -->

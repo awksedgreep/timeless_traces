@@ -140,6 +140,8 @@ Retrieve all spans in a trace, sorted by start time:
 
 This uses the trace index for fast lookup -- only blocks known to contain spans for that trace are read.
 
+On disk, `trace_index` stores packed binary trace IDs for 32-character hex values to reduce index size. Lookups remain backward-compatible with older text rows during migration.
+
 ## Service and operation discovery
 
 ```elixir

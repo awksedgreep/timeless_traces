@@ -170,7 +170,7 @@ flowchart LR
     subgraph "ETS (Hot Cache)"
         BT["blocks<br/><i>ordered_set</i><br/>block_id → metadata"]
         TI["term_index<br/><i>bag</i><br/>term → block_id"]
-        TR["trace_index<br/><i>bag</i><br/>trace_id → block_id"]
+        TR["trace_index<br/><i>bag</i><br/>packed trace_id → block_id"]
     end
 
     subgraph "Persistence"
@@ -244,7 +244,7 @@ skipping the term index entirely:
 
 ```mermaid
 flowchart LR
-    TID["trace_id"] --> ETS["trace_index ETS<br/>trace_id → block_ids"]
+    TID["trace_id"] --> ETS["trace_index ETS<br/>packed trace_id → block_ids"]
     ETS --> READ["Read only those blocks"]
     READ --> FILTER["Filter spans by trace_id"]
     FILTER --> SORT["Sort by start_time"]

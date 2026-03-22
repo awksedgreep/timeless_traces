@@ -78,7 +78,7 @@ All index state lives in ETS tables — the authoritative source of truth at run
 |-------|------|---------|
 | `timeless_traces_blocks` | ordered_set | Block metadata (block_id → file_path, byte_size, entry_count, ts_min, ts_max, format, created_at) |
 | `timeless_traces_term_index` | bag | Term → block_id mapping |
-| `timeless_traces_trace_index` | bag | trace_id → block_id mapping |
+| `timeless_traces_trace_index` | bag | packed trace_id → block_id mapping (with legacy text-row compatibility) |
 | `timeless_traces_compression_stats` | set | Compression statistics |
 | `timeless_traces_block_data` | set | In-memory block data (memory storage mode only) |
 
@@ -107,6 +107,8 @@ Queries use these terms to identify which blocks contain relevant spans, avoidin
 ### Trace index
 
 The trace index maps each trace ID to the blocks that contain its spans. This enables fast trace lookup -- `TimelessTraces.trace(trace_id)` reads only the blocks that contain spans for that trace.
+
+For 32-character hex trace IDs, TimelessTraces stores a packed 16-byte binary form in `trace_index` instead of the original text. Query lookup accepts the normal hex string and transparently probes both the packed form and legacy text rows, so existing datasets continue to work during migration.
 
 ## Read path
 

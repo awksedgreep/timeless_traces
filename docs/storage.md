@@ -9,7 +9,7 @@ Spans are stored in **blocks** -- batches of spans written together and indexed 
 - A batch of serialized spans (typically 500-2000)
 - Block metadata: block_id, byte_size, entry_count, timestamp range (ts_min, ts_max), format
 - An inverted index of terms for fast querying
-- Trace index entries mapping trace IDs to the block
+- Trace index entries mapping packed trace IDs to the block
 
 ## Block formats
 
@@ -40,7 +40,7 @@ Columnar format with [OpenZL](https://github.com/nicholasgasior/ex_openzl) compr
 | duration | u64 packed | Duration (nanoseconds) |
 | kind | u8 packed | Span kind (0-4) |
 | status | u8 packed | Status (0-2) |
-| trace_id | length-prefixed strings | Trace IDs |
+| trace_id | length-prefixed strings | Trace IDs in the block payload |
 | span_id | length-prefixed strings | Span IDs |
 | parent_span_id | length-prefixed strings | Parent span IDs |
 | name | length-prefixed strings | Span names |
@@ -125,6 +125,8 @@ data_dir/
 ```
 
 Block filenames are 12-digit zero-padded block IDs with format-specific extensions.
+
+The separate `trace_index` persists 32-character hex trace IDs in packed 16-byte binary form to keep the index smaller. Older text rows are still readable during lookup.
 
 ## Memory storage mode
 

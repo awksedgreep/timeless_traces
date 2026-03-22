@@ -20,7 +20,7 @@
 
 Embedded OpenTelemetry span storage and compression for Elixir applications.
 
-TimelessTraces receives spans directly from the OpenTelemetry Erlang SDK (no HTTP, no protobuf), compresses them with two-tier raw/OpenZL block storage (~10x compression), and indexes them in ETS for lock-free trace-level and span-level queries. Zero external infrastructure required.
+TimelessTraces receives spans directly from the OpenTelemetry Erlang SDK (no HTTP, no protobuf), compresses them with two-tier raw/OpenZL block storage (~10x compression), and indexes them in ETS for lock-free trace-level and span-level queries. The trace index stores packed binary trace IDs on disk to keep the index compact while remaining backward-compatible with legacy text rows. Zero external infrastructure required.
 
 Part of the embedded observability stack:
 - [timeless_metrics](https://github.com/awksedgreep/timeless_metrics) - numeric time series compression
@@ -146,6 +146,7 @@ OTel SDK → Exporter → Buffer → Writer (raw) → ETS Index → disk log
 - **Index** stores block metadata + inverted term index + trace index in ETS, persisted via snapshots + disk log
 - **Compactor** merges raw blocks into compressed blocks (zstd or OpenZL columnar)
 - **Retention** enforces age and size limits
+- **Sync** flushes pending index batches and runs `wal_checkpoint(TRUNCATE)` to compact the index DB and WAL together
 
 ### Storage Modes
 
