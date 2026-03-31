@@ -897,7 +897,7 @@ defmodule TimelessTraces.Index do
     order = Keyword.get(pagination, :order, :desc)
     need = offset + limit
 
-    {collected, blocks_read} =
+    {collected, total, blocks_read} =
       collect_with_early_exit(block_ids, db, storage, search_filters, need)
 
     sorted =
@@ -906,7 +906,6 @@ defmodule TimelessTraces.Index do
         :desc -> Enum.sort_by(collected, & &1.start_time, :desc)
       end
 
-    total = length(sorted)
     page = sorted |> Enum.drop(offset) |> Enum.take(limit)
     duration = System.monotonic_time() - start_time
 
@@ -934,7 +933,7 @@ defmodule TimelessTraces.Index do
   end
 
   defp collect_sequential_early_exit(block_ids, db, storage, search_filters, need) do
-    Enum.reduce_while(block_ids, {[], 0}, fn {block_id, file_path, format}, {acc, count} ->
+    Enum.reduce(block_ids, {[], 0, 0}, fn {block_id, file_path, format}, {acc, total, count} ->
       format_atom = to_format_atom(format)
 
       read_result =
@@ -950,14 +949,12 @@ defmodule TimelessTraces.Index do
             |> TimelessTraces.Filter.filter(search_filters)
             |> Enum.map(&TimelessTraces.Span.from_map/1)
 
-          new_acc = acc ++ filtered
+          new_total = total + length(filtered)
           new_count = count + 1
+          remaining = max(need - length(acc), 0)
+          new_acc = if remaining > 0, do: acc ++ Enum.take(filtered, remaining), else: acc
 
-          if length(new_acc) >= need do
-            {:halt, {new_acc, new_count}}
-          else
-            {:cont, {new_acc, new_count}}
-          end
+          {new_acc, new_total, new_count}
 
         {:error, reason} ->
           TimelessTraces.Telemetry.event(
@@ -966,7 +963,7 @@ defmodule TimelessTraces.Index do
             %{file_path: file_path, reason: reason}
           )
 
-          {:cont, {acc, count + 1}}
+          {acc, total, count + 1}
       end
     end)
   end
@@ -976,7 +973,7 @@ defmodule TimelessTraces.Index do
 
     block_ids
     |> Enum.chunk_every(batch_size)
-    |> Enum.reduce_while({[], 0}, fn batch, {acc, count} ->
+    |> Enum.reduce({[], 0, 0}, fn batch, {acc, total, count} ->
       batch_results =
         batch
         |> Task.async_stream(
@@ -1004,14 +1001,12 @@ defmodule TimelessTraces.Index do
         )
         |> Enum.flat_map(fn {:ok, entries} -> entries end)
 
-      new_acc = acc ++ batch_results
+      new_total = total + length(batch_results)
       new_count = count + length(batch)
+      remaining = max(need - length(acc), 0)
+      new_acc = if remaining > 0, do: acc ++ Enum.take(batch_results, remaining), else: acc
 
-      if length(new_acc) >= need do
-        {:halt, {new_acc, new_count}}
-      else
-        {:cont, {new_acc, new_count}}
-      end
+      {new_acc, new_total, new_count}
     end)
   end
 
