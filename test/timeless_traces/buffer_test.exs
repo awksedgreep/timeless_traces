@@ -71,9 +71,8 @@ defmodule TimelessTraces.BufferTest do
       spans = for _ <- 1..10, do: make_span()
       TimelessTraces.Buffer.ingest(spans)
 
-      # Give the Buffer GenServer time to process the auto-flush cast
-      Process.sleep(100)
-      # Drain Index pending writes so lock-free query sees the data
+      # Auto-flush dispatch is asynchronous; flush() is the completion boundary.
+      TimelessTraces.Buffer.flush()
       TimelessTraces.Index.sync()
 
       {:ok, %TimelessTraces.Result{total: total}} = TimelessTraces.Index.query([])

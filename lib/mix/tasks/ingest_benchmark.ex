@@ -3,6 +3,7 @@ defmodule Mix.Tasks.TimelessTraces.IngestBenchmark do
   use Mix.Task
 
   @shortdoc "Benchmark span ingestion throughput (Buffer → Writer → Index)"
+  @shard_scenarios [1, 2, 4, 8]
 
   @impl true
   def run(_args) do
@@ -10,10 +11,7 @@ defmodule Mix.Tasks.TimelessTraces.IngestBenchmark do
     blocks_dir = Path.join(data_dir, "blocks")
     File.mkdir_p!(blocks_dir)
 
-    Application.put_env(:timeless_traces, :data_dir, data_dir)
-    Application.put_env(:timeless_traces, :storage, :disk)
-    # Disable compaction during benchmark
-    Application.put_env(:timeless_traces, :compaction_interval, 600_000)
+    configure_app(data_dir)
     Mix.Task.run("app.start")
 
     IO.puts("=== TimelessTraces Ingestion Benchmark ===\n")
@@ -49,9 +47,7 @@ defmodule Mix.Tasks.TimelessTraces.IngestBenchmark do
     IO.puts("--- Phase 2: Writer + Index (sync) ---")
     idx_dir = Path.join(data_dir, "idx_bench")
     File.mkdir_p!(Path.join(idx_dir, "blocks"))
-    Application.stop(:timeless_traces)
-    Application.put_env(:timeless_traces, :data_dir, idx_dir)
-    Application.ensure_all_started(:timeless_traces)
+    restart_traces(idx_dir)
 
     {idx_us, idx_blocks} =
       :timer.tc(fn ->
@@ -79,10 +75,7 @@ defmodule Mix.Tasks.TimelessTraces.IngestBenchmark do
     # Phase 3: Full pipeline (Buffer.ingest → flush → Writer → async Index)
     IO.puts("--- Phase 3: Full pipeline (Buffer.ingest → Writer → Index) ---")
     pipe_dir = Path.join(data_dir, "pipe_bench")
-    File.mkdir_p!(Path.join(pipe_dir, "blocks"))
-    Application.stop(:timeless_traces)
-    Application.put_env(:timeless_traces, :data_dir, pipe_dir)
-    Application.ensure_all_started(:timeless_traces)
+    restart_traces(pipe_dir)
 
     {pipe_us, _} =
       :timer.tc(fn ->
@@ -105,6 +98,39 @@ defmodule Mix.Tasks.TimelessTraces.IngestBenchmark do
     IO.puts("  Wall time: #{fmt_ms(pipe_us)}")
     IO.puts("  Throughput: #{fmt_number(round(pipe_eps))} spans/sec\n")
 
+    IO.puts("--- Phase 3b: Full pipeline by shard count ---")
+
+    shard_results =
+      Enum.map(@shard_scenarios, fn shard_count ->
+        shard_dir = Path.join(data_dir, "pipe_shards_#{shard_count}")
+        restart_traces(shard_dir, ingest_shard_count: shard_count)
+
+        {us, _} =
+          :timer.tc(fn ->
+            spans
+            |> Enum.chunk_every(100)
+            |> Enum.each(&TimelessTraces.Buffer.ingest/1)
+
+            TimelessTraces.Buffer.flush()
+            TimelessTraces.Index.sync()
+          end)
+
+        eps = span_count / (us / 1_000_000)
+        {:ok, shard_stats} = TimelessTraces.Index.stats()
+
+        {shard_count, us, eps, shard_stats.total_entries}
+      end)
+
+    Enum.each(shard_results, fn {shard_count, us, eps, total_entries} ->
+      IO.puts(
+        "  shards=#{String.pad_leading(Integer.to_string(shard_count), 2)}  " <>
+          "#{fmt_ms(us)}  #{fmt_number(round(eps))} spans/sec  " <>
+          "#{fmt_number(total_entries)} indexed"
+      )
+    end)
+
+    IO.puts("")
+
     # Summary
     IO.puts("=== Summary ===")
     IO.puts("  Writer only:      #{fmt_number(round(writer_eps))} spans/sec")
@@ -113,6 +139,23 @@ defmodule Mix.Tasks.TimelessTraces.IngestBenchmark do
 
     Application.stop(:timeless_traces)
     File.rm_rf!(data_dir)
+  end
+
+  defp configure_app(data_dir, overrides \\ []) do
+    File.mkdir_p!(Path.join(data_dir, "blocks"))
+    Application.put_env(:timeless_traces, :data_dir, data_dir)
+    Application.put_env(:timeless_traces, :storage, :disk)
+    Application.put_env(:timeless_traces, :compaction_interval, 600_000)
+
+    Enum.each(overrides, fn {key, value} ->
+      Application.put_env(:timeless_traces, key, value)
+    end)
+  end
+
+  defp restart_traces(data_dir, overrides \\ []) do
+    Application.stop(:timeless_traces)
+    configure_app(data_dir, overrides)
+    Application.ensure_all_started(:timeless_traces)
   end
 
   defp generate_spans(count) do

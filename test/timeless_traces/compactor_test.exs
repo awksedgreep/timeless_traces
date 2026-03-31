@@ -14,6 +14,7 @@ defmodule TimelessTraces.CompactorTest do
     Application.put_env(:timeless_traces, :retention_max_size, nil)
     Application.put_env(:timeless_traces, :compaction_threshold, 10)
     Application.put_env(:timeless_traces, :compaction_max_raw_age, 60)
+    Application.put_env(:timeless_traces, :ingest_shard_count, 1)
     Application.ensure_all_started(:timeless_traces)
 
     on_exit(fn ->
@@ -22,6 +23,7 @@ defmodule TimelessTraces.CompactorTest do
       Application.put_env(:timeless_traces, :storage, :disk)
       Application.put_env(:timeless_traces, :compaction_threshold, 500)
       Application.put_env(:timeless_traces, :compaction_max_raw_age, 60)
+      Application.delete_env(:timeless_traces, :ingest_shard_count)
     end)
 
     :ok
