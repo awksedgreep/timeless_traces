@@ -175,7 +175,7 @@ defmodule TimelessTraces.Buffer do
     state.buffer == [] and state.in_flight == 0 and :queue.is_empty(state.pending_batches)
   end
 
-  defp do_flush(buffer, data_dir, opts \\ [])
+  defp do_flush(buffer, data_dir, opts)
   defp do_flush([], _data_dir, _opts), do: :ok
 
   defp do_flush(buffer, data_dir, opts) do
