@@ -26,6 +26,11 @@ defmodule TimelessTraces.Index do
     GenServer.cast(__MODULE__, {:index_block, block_meta, terms, trace_rows})
   end
 
+  @spec reconcile_missing_block(integer(), String.t() | nil) :: :ok
+  def reconcile_missing_block(block_id, file_path) do
+    GenServer.cast(__MODULE__, {:reconcile_missing_block, block_id, file_path})
+  end
+
   # --- Read functions (use DB reader pool) ---
 
   @spec query(keyword()) :: {:ok, TimelessTraces.Result.t()}
@@ -500,6 +505,16 @@ defmodule TimelessTraces.Index do
     {:noreply, state}
   end
 
+  @impl true
+  def handle_cast({:reconcile_missing_block, block_id, file_path}, state) do
+    state = flush_pending(state)
+    delete_block_set(state.db, [block_id])
+
+    Logger.info("TimelessTraces: pruned missing block metadata for #{file_path || block_id}")
+
+    {:noreply, state}
+  end
+
   # --- handle_info ---
 
   @impl true
@@ -956,11 +971,22 @@ defmodule TimelessTraces.Index do
 
           {new_acc, new_total, new_count}
 
+        {:error, :enoent} ->
+          reconcile_missing_block(block_id, file_path)
+
+          TimelessTraces.Telemetry.event(
+            [:timeless_traces, :block, :missing],
+            %{},
+            %{block_id: block_id, file_path: file_path}
+          )
+
+          {acc, total, count + 1}
+
         {:error, reason} ->
           TimelessTraces.Telemetry.event(
             [:timeless_traces, :block, :error],
             %{},
-            %{file_path: file_path, reason: reason}
+            %{block_id: block_id, file_path: file_path, reason: reason}
           )
 
           {acc, total, count + 1}
@@ -977,7 +1003,7 @@ defmodule TimelessTraces.Index do
       batch_results =
         batch
         |> Task.async_stream(
-          fn {_block_id, file_path, format} ->
+          fn {block_id, file_path, format} ->
             format_atom = to_format_atom(format)
 
             case TimelessTraces.Writer.read_block(file_path, format_atom) do
@@ -986,11 +1012,22 @@ defmodule TimelessTraces.Index do
                 |> TimelessTraces.Filter.filter(search_filters)
                 |> Enum.map(&TimelessTraces.Span.from_map/1)
 
+              {:error, :enoent} ->
+                reconcile_missing_block(block_id, file_path)
+
+                TimelessTraces.Telemetry.event(
+                  [:timeless_traces, :block, :missing],
+                  %{},
+                  %{block_id: block_id, file_path: file_path}
+                )
+
+                []
+
               {:error, reason} ->
                 TimelessTraces.Telemetry.event(
                   [:timeless_traces, :block, :error],
                   %{},
-                  %{file_path: file_path, reason: reason}
+                  %{block_id: block_id, file_path: file_path, reason: reason}
                 )
 
                 []
@@ -1015,7 +1052,7 @@ defmodule TimelessTraces.Index do
       if storage == :disk and length(block_info) > 1 do
         block_info
         |> Task.async_stream(
-          fn {_block_id, file_path, format} ->
+          fn {block_id, file_path, format} ->
             format_atom = to_format_atom(format)
 
             case TimelessTraces.Writer.read_block(file_path, format_atom) do
@@ -1023,6 +1060,10 @@ defmodule TimelessTraces.Index do
                 entries
                 |> Enum.filter(fn e -> e.trace_id == trace_id end)
                 |> Enum.map(&TimelessTraces.Span.from_map/1)
+
+              {:error, :enoent} ->
+                reconcile_missing_block(block_id, file_path)
+                []
 
               {:error, _} ->
                 []
@@ -1047,6 +1088,10 @@ defmodule TimelessTraces.Index do
               entries
               |> Enum.filter(fn e -> e.trace_id == trace_id end)
               |> Enum.map(&TimelessTraces.Span.from_map/1)
+
+            {:error, :enoent} ->
+              reconcile_missing_block(block_id, file_path)
+              []
 
             {:error, _} ->
               []

@@ -82,7 +82,7 @@ defmodule TimelessTraces.Writer do
 
     block_id = System.unique_integer([:positive, :monotonic])
     filename = "#{String.pad_leading(Integer.to_string(block_id), 12, "0")}.#{ext}"
-    file_path = Path.join([data_dir, "blocks", filename])
+    file_path = Path.expand(Path.join([data_dir, "blocks", filename]))
 
     case File.write(file_path, data) do
       :ok ->
@@ -156,6 +156,9 @@ defmodule TimelessTraces.Writer do
     case File.read(file_path) do
       {:ok, data} ->
         decompress_block(data, format)
+
+      {:error, :enoent} ->
+        {:error, :enoent}
 
       {:error, reason} ->
         Logger.warning("TimelessTraces: cannot read block #{file_path}: #{inspect(reason)}")
