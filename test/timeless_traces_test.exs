@@ -89,6 +89,29 @@ defmodule TimelessTracesTest do
       assert hd(servers).kind == :server
     end
 
+    test "query by host.name attribute filter" do
+      spans = [
+        make_span(%{
+          name: "host-a",
+          attributes: %{"http.method" => "GET", "service.name" => "api", "host.name" => "web-01"}
+        }),
+        make_span(%{
+          name: "host-b",
+          attributes: %{"http.method" => "GET", "service.name" => "api", "host.name" => "web-02"}
+        })
+      ]
+
+      TimelessTraces.Buffer.ingest(spans)
+      TimelessTraces.flush()
+
+      {:ok, %TimelessTraces.Result{entries: results, total: 1}} =
+        TimelessTraces.query(attributes: %{"host.name" => "web-01"})
+
+      assert length(results) == 1
+      assert hd(results).name == "host-a"
+      assert hd(results).attributes["host.name"] == "web-01"
+    end
+
     test "query with duration filters" do
       now = System.system_time(:nanosecond)
 
@@ -176,6 +199,24 @@ defmodule TimelessTracesTest do
 
       assert length(page2) == 5
       assert hd(page1).span_id != hd(page2).span_id
+    end
+
+    test "pagination can skip exact totals" do
+      spans = for i <- 1..20, do: make_span(%{name: "span-fast-#{i}"})
+      TimelessTraces.Buffer.ingest(spans)
+      TimelessTraces.flush()
+
+      {:ok, %TimelessTraces.Result{entries: page1, has_more: has_more, limit: 5}} =
+        TimelessTraces.query(limit: 5, count_total: false)
+
+      assert length(page1) == 5
+      assert has_more
+
+      {:ok, %TimelessTraces.Result{entries: page4, has_more: has_more_last, offset: 15}} =
+        TimelessTraces.query(limit: 5, offset: 15, count_total: false)
+
+      assert length(page4) == 5
+      refute has_more_last
     end
 
     test "stats/0 returns aggregate data" do
