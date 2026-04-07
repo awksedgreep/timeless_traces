@@ -141,6 +141,65 @@ defmodule TimelessTraces.CompactorTest do
       assert Enum.all?(post_spans, &(&1.trace_id == trace_id))
     end
 
+    test "count_total false matches exact pages across compacted and raw blocks" do
+      service_name = "compact-page-#{System.unique_integer([:positive])}"
+
+      for block <- 1..4 do
+        spans =
+          for item <- 1..3 do
+            seq = (block - 1) * 3 + item
+
+            make_span(%{
+              name: "compact-page-#{seq}",
+              start_time: seq * 1_000,
+              end_time: seq * 1_000 + 100,
+              duration_ns: 100,
+              attributes: %{"service.name" => service_name, "host.name" => "compact-host"}
+            })
+          end
+
+        TimelessTraces.Buffer.ingest(spans)
+        TimelessTraces.flush()
+      end
+
+      Application.put_env(:timeless_traces, :compaction_threshold, 1)
+      assert :ok = TimelessTraces.Compactor.compact_now()
+      Application.put_env(:timeless_traces, :compaction_threshold, 10)
+
+      for block <- 5..6 do
+        spans =
+          for item <- 1..3 do
+            seq = (block - 1) * 3 + item
+
+            make_span(%{
+              name: "compact-page-#{seq}",
+              start_time: seq * 1_000,
+              end_time: seq * 1_000 + 100,
+              duration_ns: 100,
+              attributes: %{"service.name" => service_name, "host.name" => "compact-host"}
+            })
+          end
+
+        TimelessTraces.Buffer.ingest(spans)
+        TimelessTraces.flush()
+      end
+
+      pagination = [
+        limit: 4,
+        offset: 4,
+        order: :desc,
+        attributes: %{"service.name" => service_name}
+      ]
+
+      {:ok, %TimelessTraces.Result{entries: exact_entries, total: 18}} =
+        TimelessTraces.query(pagination)
+
+      {:ok, %TimelessTraces.Result{entries: fast_entries, total: 9, has_more: true}} =
+        TimelessTraces.query(Keyword.put(pagination, :count_total, false))
+
+      assert Enum.map(fast_entries, & &1.name) == Enum.map(exact_entries, & &1.name)
+    end
+
     test "noop when below threshold" do
       TimelessTraces.Buffer.ingest([make_span()])
       TimelessTraces.flush()

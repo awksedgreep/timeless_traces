@@ -136,7 +136,8 @@ defmodule TimelessTraces.Index do
      }}
   end
 
-  @spec matching_block_ids(keyword()) :: [{integer(), String.t() | nil, :raw | :zstd | :openzl}]
+  @spec matching_block_ids(keyword()) ::
+          [{integer(), String.t() | nil, :raw | :zstd | :openzl, integer(), integer()}]
   def matching_block_ids(filters) do
     db = :persistent_term.get({__MODULE__, :db})
     {search_filters, pagination} = split_pagination(filters)
@@ -758,10 +759,15 @@ defmodule TimelessTraces.Index do
 
     {conditions, params} = build_block_conditions(terms, time_filters)
     where = if conditions == [], do: "", else: " WHERE " <> Enum.join(conditions, " AND ")
-    sql = "SELECT block_id, file_path, format FROM blocks#{where} ORDER BY ts_min #{order_dir}"
+
+    sql =
+      "SELECT block_id, file_path, format, ts_min, ts_max FROM blocks#{where} ORDER BY ts_min #{order_dir}"
 
     {:ok, rows} = TimelessTraces.DB.read(db, sql, params)
-    Enum.map(rows, fn [bid, fp, fmt] -> {bid, fp, to_format_atom(fmt)} end)
+
+    Enum.map(rows, fn [bid, fp, fmt, ts_min, ts_max] ->
+      {bid, fp, to_format_atom(fmt), ts_min, ts_max}
+    end)
   end
 
   defp build_block_conditions(terms, time_filters) do
@@ -914,10 +920,19 @@ defmodule TimelessTraces.Index do
     order = Keyword.get(pagination, :order, :desc)
     count_total = Keyword.get(pagination, :count_total, true)
     need = offset + limit
-    collect_need = if count_total, do: need, else: need + 1
+    full_collection? = overlapping_blocks?(block_ids)
+    collect_need = if full_collection?, do: :all, else: if(count_total, do: need, else: need + 1)
 
     {collected, total, blocks_read} =
-      collect_with_early_exit(block_ids, db, storage, search_filters, collect_need, count_total)
+      collect_with_early_exit(
+        block_ids,
+        db,
+        storage,
+        search_filters,
+        collect_need,
+        count_total,
+        order
+      )
 
     sorted =
       case order do
@@ -949,16 +964,32 @@ defmodule TimelessTraces.Index do
      }}
   end
 
-  defp collect_with_early_exit(block_ids, db, storage, search_filters, need, count_total) do
+  defp collect_with_early_exit(block_ids, db, storage, search_filters, need, count_total, order) do
     if storage == :disk and length(block_ids) > 1 do
-      collect_parallel_early_exit(block_ids, search_filters, need, count_total)
+      collect_parallel_early_exit(block_ids, search_filters, need, count_total, order)
     else
-      collect_sequential_early_exit(block_ids, db, storage, search_filters, need, count_total)
+      collect_sequential_early_exit(
+        block_ids,
+        db,
+        storage,
+        search_filters,
+        need,
+        count_total,
+        order
+      )
     end
   end
 
-  defp collect_sequential_early_exit(block_ids, db, storage, search_filters, need, count_total) do
-    Enum.reduce_while(block_ids, {[], 0, 0}, fn {block_id, file_path, format},
+  defp collect_sequential_early_exit(
+         block_ids,
+         db,
+         storage,
+         search_filters,
+         need,
+         count_total,
+         order
+       ) do
+    Enum.reduce_while(block_ids, {[], 0, 0}, fn {block_id, file_path, format, _ts_min, _ts_max},
                                                 {acc, total, count} ->
       format_atom = to_format_atom(format)
 
@@ -974,15 +1005,15 @@ defmodule TimelessTraces.Index do
             entries
             |> TimelessTraces.Filter.filter(search_filters)
             |> Enum.map(&TimelessTraces.Span.from_map/1)
+            |> sort_spans(order)
 
           new_total = total + length(filtered)
           new_count = count + 1
-          remaining = max(need - length(acc), 0)
-          new_acc = if remaining > 0, do: acc ++ Enum.take(filtered, remaining), else: acc
+          new_acc = append_entries(acc, filtered, need)
 
           result = {new_acc, new_total, new_count}
 
-          if count_total or length(new_acc) < need do
+          if count_total or keep_collecting?(new_acc, need) do
             {:cont, result}
           else
             {:halt, result}
@@ -1011,7 +1042,7 @@ defmodule TimelessTraces.Index do
     end)
   end
 
-  defp collect_parallel_early_exit(block_ids, search_filters, need, count_total) do
+  defp collect_parallel_early_exit(block_ids, search_filters, need, count_total, order) do
     batch_size = System.schedulers_online()
 
     block_ids
@@ -1020,7 +1051,7 @@ defmodule TimelessTraces.Index do
       batch_results =
         batch
         |> Task.async_stream(
-          fn {block_id, file_path, format} ->
+          fn {block_id, file_path, format, _ts_min, _ts_max} ->
             format_atom = to_format_atom(format)
 
             case TimelessTraces.Writer.read_block(file_path, format_atom) do
@@ -1054,20 +1085,56 @@ defmodule TimelessTraces.Index do
           ordered: false
         )
         |> Enum.flat_map(fn {:ok, entries} -> entries end)
+        |> sort_spans(order)
 
       new_total = total + length(batch_results)
       new_count = count + length(batch)
-      remaining = max(need - length(acc), 0)
-      new_acc = if remaining > 0, do: acc ++ Enum.take(batch_results, remaining), else: acc
+      new_acc = append_entries(acc, batch_results, need)
 
       result = {new_acc, new_total, new_count}
 
-      if count_total or length(new_acc) < need do
+      if count_total or keep_collecting?(new_acc, need) do
         {:cont, result}
       else
         {:halt, result}
       end
     end)
+  end
+
+  defp sort_spans(entries, :asc), do: Enum.sort_by(entries, & &1.start_time, :asc)
+  defp sort_spans(entries, :desc), do: Enum.sort_by(entries, & &1.start_time, :desc)
+
+  defp append_entries(acc, filtered, :all), do: acc ++ filtered
+
+  defp append_entries(acc, filtered, need) when is_integer(need) do
+    remaining = max(need - length(acc), 0)
+    if remaining > 0, do: acc ++ Enum.take(filtered, remaining), else: acc
+  end
+
+  defp keep_collecting?(_acc, :all), do: true
+  defp keep_collecting?(acc, need), do: length(acc) < need
+
+  defp overlapping_blocks?([]), do: false
+  defp overlapping_blocks?([_single]), do: false
+
+  defp overlapping_blocks?(blocks) do
+    {_prev_min, _prev_max, overlap?} =
+      Enum.reduce_while(blocks, {nil, nil, false}, fn
+        {_bid, _fp, _fmt, ts_min, ts_max}, {nil, nil, false} ->
+          {:cont, {ts_min, ts_max, false}}
+
+        {_bid, _fp, _fmt, ts_min, ts_max}, {_prev_min, prev_max, false} ->
+          if ts_min <= prev_max do
+            {:halt, {ts_min, ts_max, true}}
+          else
+            {:cont, {ts_min, max(prev_max, ts_max), false}}
+          end
+
+        _, state ->
+          {:halt, state}
+      end)
+
+    overlap?
   end
 
   defp do_trace_parallel(block_info, db, storage, trace_id) do

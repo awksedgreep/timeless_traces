@@ -69,4 +69,52 @@ defmodule TimelessTraces.MissingBlockTest do
 
     assert TimelessTraces.Index.matching_block_ids([]) == []
   end
+
+  test "query skips missing blocks and preserves surviving page slices" do
+    service_name = "missing-page-#{System.unique_integer([:positive])}"
+
+    spans =
+      for idx <- 1..6 do
+        make_span(%{
+          name: "missing-page-#{idx}",
+          start_time: idx * 1_000,
+          end_time: idx * 1_000 + 100,
+          duration_ns: 100,
+          attributes: %{"service.name" => service_name, "host.name" => "missing-host"}
+        })
+      end
+
+    {first_half, second_half} = Enum.split(spans, 3)
+
+    {:ok, meta1} =
+      TimelessTraces.Writer.write_block(first_half, TimelessTraces.Config.data_dir(), :raw)
+
+    {terms1, trace_rows1} = TimelessTraces.Index.precompute(first_half)
+    :ok = TimelessTraces.Index.index_block(meta1, terms1, trace_rows1)
+
+    {:ok, meta2} =
+      TimelessTraces.Writer.write_block(second_half, TimelessTraces.Config.data_dir(), :raw)
+
+    {terms2, trace_rows2} = TimelessTraces.Index.precompute(second_half)
+    :ok = TimelessTraces.Index.index_block(meta2, terms2, trace_rows2)
+    TimelessTraces.Index.sync()
+
+    File.rm!(meta1.file_path)
+
+    filters = [order: :asc, attributes: %{"service.name" => service_name}]
+
+    {:ok, %TimelessTraces.Result{entries: exact_entries, total: 3}} =
+      TimelessTraces.query([limit: 3] ++ filters)
+
+    {:ok, %TimelessTraces.Result{entries: fast_entries, total: 3, has_more: false}} =
+      TimelessTraces.query([limit: 3, count_total: false] ++ filters)
+
+    assert Enum.map(exact_entries, & &1.name) == [
+             "missing-page-4",
+             "missing-page-5",
+             "missing-page-6"
+           ]
+
+    assert Enum.map(fast_entries, & &1.name) == Enum.map(exact_entries, & &1.name)
+  end
 end

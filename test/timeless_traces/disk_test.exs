@@ -135,5 +135,121 @@ defmodule TimelessTraces.DiskTest do
       assert length(errors) == 1
       assert hd(errors).status == :error
     end
+
+    test "full page walk is stable across multiple disk blocks" do
+      spans =
+        for idx <- 1..24 do
+          make_span(%{
+            name: "disk-span-#{idx}",
+            start_time: idx * 100_000,
+            end_time: idx * 100_000 + 1_000,
+            attributes: %{"service.name" => "disk-pager", "host.name" => "trace-host"}
+          })
+        end
+
+      spans
+      |> Enum.chunk_every(4)
+      |> Enum.each(fn chunk ->
+        TimelessTraces.Buffer.ingest(chunk)
+        TimelessTraces.flush()
+      end)
+
+      {:ok, %TimelessTraces.Result{entries: all_entries, total: 24}} =
+        TimelessTraces.query(
+          limit: 24,
+          order: :desc,
+          attributes: %{"service.name" => "disk-pager"}
+        )
+
+      expected_names = Enum.map(all_entries, & &1.name)
+      page_size = 5
+
+      paged_names =
+        0..4
+        |> Enum.flat_map(fn page_index ->
+          offset = page_index * page_size
+
+          {:ok,
+           %TimelessTraces.Result{
+             entries: entries,
+             has_more: has_more,
+             total: reported_total,
+             offset: ^offset,
+             limit: ^page_size
+           }} =
+            TimelessTraces.query(
+              limit: page_size,
+              offset: offset,
+              order: :desc,
+              count_total: false,
+              attributes: %{"service.name" => "disk-pager"}
+            )
+
+          expected_count = min(page_size, max(length(expected_names) - offset, 0))
+
+          assert length(entries) == expected_count
+
+          assert Enum.map(entries, & &1.name) ==
+                   Enum.slice(expected_names, offset, expected_count)
+
+          assert has_more == offset + expected_count < length(expected_names)
+
+          expected_total =
+            if has_more do
+              offset + expected_count + 1
+            else
+              length(expected_names)
+            end
+
+          assert reported_total == expected_total
+
+          Enum.map(entries, & &1.name)
+        end)
+
+      assert paged_names == expected_names
+      assert Enum.uniq(paged_names) == paged_names
+    end
+
+    test "count_total true and false return identical entries for the same disk page" do
+      spans =
+        for idx <- 1..12 do
+          make_span(%{
+            name: "disk-compare-#{idx}",
+            start_time: idx * 1_000_000,
+            end_time: idx * 1_000_000 + 100,
+            attributes: %{"service.name" => "disk-compare", "host.name" => "trace-host"}
+          })
+        end
+
+      spans
+      |> Enum.chunk_every(3)
+      |> Enum.each(fn chunk ->
+        TimelessTraces.Buffer.ingest(chunk)
+        TimelessTraces.flush()
+      end)
+
+      pagination = [
+        limit: 4,
+        offset: 4,
+        order: :desc,
+        attributes: %{"service.name" => "disk-compare"}
+      ]
+
+      {:ok, %TimelessTraces.Result{entries: exact_entries, total: exact_total, has_more: true}} =
+        TimelessTraces.query(pagination)
+
+      {:ok,
+       %TimelessTraces.Result{
+         entries: fast_entries,
+         total: fast_total,
+         has_more: fast_has_more
+       }} =
+        TimelessTraces.query(Keyword.put(pagination, :count_total, false))
+
+      assert Enum.map(fast_entries, & &1.name) == Enum.map(exact_entries, & &1.name)
+      assert fast_has_more
+      assert exact_total == 12
+      assert fast_total == 9
+    end
   end
 end
