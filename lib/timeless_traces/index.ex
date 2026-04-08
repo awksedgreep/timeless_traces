@@ -332,6 +332,14 @@ defmodule TimelessTraces.Index do
         svc -> ["service.name:#{svc}"]
       end
 
+    resource_terms =
+      (span.resource || %{})
+      |> Enum.flat_map(fn
+        {"host", v} -> ["host:#{v}"]
+        {"host.name", v} -> ["host.name:#{v}"]
+        _ -> []
+      end)
+
     attr_terms =
       (span.attributes || %{})
       |> Enum.flat_map(fn
@@ -346,7 +354,7 @@ defmodule TimelessTraces.Index do
         _ -> []
       end)
 
-    base_terms ++ service_term ++ attr_terms
+    base_terms ++ service_term ++ resource_terms ++ attr_terms
   end
 
   # --- GenServer callbacks ---

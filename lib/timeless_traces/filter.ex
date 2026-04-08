@@ -43,7 +43,7 @@ defmodule TimelessTraces.Filter do
 
       {:attributes, map} ->
         Enum.all?(map, fn {k, v} ->
-          Map.get(span.attributes, to_string(k)) == to_string(v)
+          get_attribute_value(span, k) == to_string(v)
         end)
 
       _ ->
@@ -55,6 +55,15 @@ defmodule TimelessTraces.Filter do
     Map.get(span.attributes, "service.name") ||
       Map.get(span.resource, "service.name") ||
       get_in(span, [Access.key(:resource, %{}), Access.key("service.name")])
+  end
+
+  defp get_attribute_value(span, key) do
+    key = to_string(key)
+
+    Map.get(span.attributes || %{}, key) ||
+      Map.get(span.resource || %{}, key) ||
+      get_in(span, [Access.key(:attributes, %{}), Access.key(key)]) ||
+      get_in(span, [Access.key(:resource, %{}), Access.key(key)])
   end
 
   defp to_nanos(%DateTime{} = dt), do: DateTime.to_unix(dt, :nanosecond)

@@ -112,6 +112,31 @@ defmodule TimelessTracesTest do
       assert hd(results).attributes["host.name"] == "web-01"
     end
 
+    test "query by host.name matches resource attributes" do
+      spans = [
+        make_span(%{
+          name: "resource-host-a",
+          attributes: %{"http.method" => "GET", "service.name" => "api"},
+          resource: %{"service.name" => "api", "host.name" => "web-01"}
+        }),
+        make_span(%{
+          name: "resource-host-b",
+          attributes: %{"http.method" => "GET", "service.name" => "api"},
+          resource: %{"service.name" => "api", "host.name" => "web-02"}
+        })
+      ]
+
+      TimelessTraces.Buffer.ingest(spans)
+      TimelessTraces.flush()
+
+      {:ok, %TimelessTraces.Result{entries: results, total: 1}} =
+        TimelessTraces.query(attributes: %{"host.name" => "web-01"})
+
+      assert length(results) == 1
+      assert hd(results).name == "resource-host-a"
+      assert hd(results).resource["host.name"] == "web-01"
+    end
+
     test "query with duration filters" do
       now = System.system_time(:nanosecond)
 
@@ -239,6 +264,75 @@ defmodule TimelessTracesTest do
       TimelessTraces.Buffer.ingest([span])
 
       assert_receive {:timeless_traces, :span, %TimelessTraces.Span{name: "live-span"}}, 1000
+
+      TimelessTraces.unsubscribe()
+    end
+
+    test "live subscription honors host.name attribute filters" do
+      TimelessTraces.subscribe(attributes: %{"host.name" => "vpn"})
+
+      matching =
+        make_span(%{
+          name: "vpn-live-span",
+          attributes: %{
+            "http.method" => "GET",
+            "service.name" => "api",
+            "host.name" => "vpn"
+          }
+        })
+
+      non_matching =
+        make_span(%{
+          name: "laptop-live-span",
+          attributes: %{
+            "http.method" => "GET",
+            "service.name" => "api",
+            "host.name" => "MacBook-Pro"
+          }
+        })
+
+      TimelessTraces.Buffer.ingest([matching, non_matching])
+
+      assert_receive {:timeless_traces, :span, %TimelessTraces.Span{name: "vpn-live-span"}}, 1000
+
+      refute_receive {:timeless_traces, :span, %TimelessTraces.Span{name: "laptop-live-span"}},
+                     200
+
+      TimelessTraces.unsubscribe()
+    end
+
+    test "live subscription honors host.name resource filters" do
+      TimelessTraces.subscribe(attributes: %{"host.name" => "vpn"})
+
+      matching =
+        make_span(%{
+          name: "vpn-resource-live-span",
+          attributes: %{
+            "http.method" => "GET",
+            "service.name" => "api"
+          },
+          resource: %{"service.name" => "api", "host.name" => "vpn"}
+        })
+
+      non_matching =
+        make_span(%{
+          name: "laptop-resource-live-span",
+          attributes: %{
+            "http.method" => "GET",
+            "service.name" => "api"
+          },
+          resource: %{"service.name" => "api", "host.name" => "MacBook-Pro"}
+        })
+
+      TimelessTraces.Buffer.ingest([matching, non_matching])
+
+      assert_receive {:timeless_traces, :span,
+                      %TimelessTraces.Span{name: "vpn-resource-live-span"}},
+                     1000
+
+      refute_receive {:timeless_traces, :span,
+                      %TimelessTraces.Span{name: "laptop-resource-live-span"}},
+                     200
 
       TimelessTraces.unsubscribe()
     end

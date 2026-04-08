@@ -262,22 +262,6 @@ defmodule TimelessTraces.Buffer do
   defp matches_subscription?(_span, []), do: true
 
   defp matches_subscription?(span, opts) do
-    Enum.all?(opts, fn
-      {:name, name} ->
-        span.name == name
-
-      {:kind, kind} ->
-        span.kind == kind
-
-      {:status, status} ->
-        span.status == status
-
-      {:service, service} ->
-        Map.get(span.attributes, "service.name") == service ||
-          Map.get(span.resource || %{}, "service.name") == service
-
-      _ ->
-        true
-    end)
+    TimelessTraces.Filter.matches?(span, opts)
   end
 end
