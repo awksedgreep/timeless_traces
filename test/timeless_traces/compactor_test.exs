@@ -396,7 +396,7 @@ defmodule TimelessTraces.CompactorTest do
 
       # Create more small raw blocks and compact them individually
       for _ <- 1..4 do
-        TimelessTraces.Buffer.ingest([make_span()])
+        TimelessTraces.Buffer.ingest(for _ <- 1..4, do: make_span())
         TimelessTraces.flush()
       end
 
@@ -420,10 +420,10 @@ defmodule TimelessTraces.CompactorTest do
 
       {:ok, stats_after} = TimelessTraces.stats()
       assert stats_after.total_blocks < blocks_before_merge
-      assert stats_after.total_entries == 54
+      assert stats_after.total_entries == 66
 
       # All entries still queryable
-      {:ok, %TimelessTraces.Result{total: 54}} = TimelessTraces.query([])
+      {:ok, %TimelessTraces.Result{total: 66}} = TimelessTraces.query([])
     end
 
     test "returns :noop when not enough small blocks" do
@@ -462,7 +462,9 @@ defmodule TimelessTraces.CompactorTest do
           name: "child",
           start_time: now + 10_000_000,
           end_time: now + 50_000_000
-        })
+        }),
+        make_span(),
+        make_span()
       ])
 
       TimelessTraces.flush()
@@ -470,7 +472,7 @@ defmodule TimelessTraces.CompactorTest do
 
       # Create more separate compact cycles to get multiple compressed blocks
       for _ <- 1..3 do
-        TimelessTraces.Buffer.ingest([make_span()])
+        TimelessTraces.Buffer.ingest(for _ <- 1..4, do: make_span())
         TimelessTraces.flush()
         assert :ok = TimelessTraces.Compactor.compact_now()
       end
@@ -501,6 +503,8 @@ defmodule TimelessTraces.CompactorTest do
       for _ <- 1..4 do
         TimelessTraces.Buffer.ingest([
           make_span(%{name: "GET /api", status: :ok}),
+          make_span(%{name: "POST /submit", status: :error}),
+          make_span(%{name: "GET /api", status: :ok}),
           make_span(%{name: "POST /submit", status: :error})
         ])
 
@@ -519,10 +523,10 @@ defmodule TimelessTraces.CompactorTest do
 
       # Filtered query should still work
       {:ok, %TimelessTraces.Result{total: total_errors}} = TimelessTraces.query(status: :error)
-      assert total_errors >= 4
+      assert total_errors >= 8
 
       {:ok, %TimelessTraces.Result{total: total}} = TimelessTraces.query([])
-      assert total == 8
+      assert total == 16
     end
   end
 
@@ -554,7 +558,7 @@ defmodule TimelessTraces.CompactorTest do
 
       # Create more small blocks and compact again
       for _ <- 1..4 do
-        TimelessTraces.Buffer.ingest([make_span()])
+        TimelessTraces.Buffer.ingest(for _ <- 1..4, do: make_span())
         TimelessTraces.flush()
       end
 
@@ -573,9 +577,9 @@ defmodule TimelessTraces.CompactorTest do
 
       {:ok, stats_after} = TimelessTraces.stats()
       assert stats_after.total_blocks < blocks_before
-      assert stats_after.total_entries == 34
+      assert stats_after.total_entries == 46
 
-      {:ok, %TimelessTraces.Result{total: 34}} = TimelessTraces.query([])
+      {:ok, %TimelessTraces.Result{total: 46}} = TimelessTraces.query([])
     end
   end
 end
