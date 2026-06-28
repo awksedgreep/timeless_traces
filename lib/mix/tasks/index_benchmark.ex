@@ -151,14 +151,9 @@ defmodule Mix.Tasks.TimelessTraces.IndexBenchmark do
     for i <- 1..@block_count do
       chunk = generate_chunk(base_ts, i)
 
-      case TimelessTraces.Writer.write_block(chunk, :memory, :raw) do
-        {:ok, meta} ->
-          {terms, trace_rows} = TimelessTraces.Index.precompute(chunk)
-          TimelessTraces.Index.index_block(meta, terms, trace_rows)
-
-        _ ->
-          :ok
-      end
+      {:ok, meta} = TimelessTraces.Writer.write_block(chunk, :memory, :raw)
+      {terms, trace_rows} = TimelessTraces.Index.precompute(chunk)
+      TimelessTraces.Index.index_block(meta, terms, trace_rows)
     end
   end
 

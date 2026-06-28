@@ -9,7 +9,7 @@ defmodule TimelessTraces.VTracesCompatTest do
   """
   use ExUnit.Case, async: false
 
-  @port 10_429
+  @port 31_029
 
   setup do
     Application.stop(:timeless_traces)
@@ -32,7 +32,7 @@ defmodule TimelessTraces.VTracesCompatTest do
   end
 
   defp get(path), do: TimelessTraces.TestHTTP.get(@port, path)
-  defp post(path, body, opts \\ []), do: TimelessTraces.TestHTTP.post(@port, path, body, opts)
+  defp post(path, body, opts), do: TimelessTraces.TestHTTP.post(@port, path, body, opts)
 
   defp json_body(resp) do
     :json.decode(resp.body)

@@ -4,13 +4,14 @@ defmodule TimelessTraces.MixProject do
   def project do
     [
       app: :timeless_traces,
-      version: "1.3.10",
+      version: "1.3.11",
       elixir: "~> 1.18",
       start_permanent: Mix.env() == :prod,
       deps: deps(),
       description: "Embedded OpenTelemetry span storage and compression for Elixir applications.",
       source_url: "https://github.com/awksedgreep/timeless_traces",
       homepage_url: "https://github.com/awksedgreep/timeless_traces",
+      test_ignore_filters: [&String.starts_with?(&1, "test/support/")],
       package: package(),
       docs: docs()
     ]

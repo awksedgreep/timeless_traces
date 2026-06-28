@@ -118,8 +118,8 @@ defmodule TimelessTraces.Span do
   def normalize_attributes(_), do: %{}
 
   defp normalize_attr_value(v) when is_binary(v), do: v
+  defp normalize_attr_value(v) when is_boolean(v), do: v
   defp normalize_attr_value(v) when is_atom(v), do: Atom.to_string(v)
   defp normalize_attr_value(v) when is_number(v), do: v
-  defp normalize_attr_value(v) when is_boolean(v), do: v
   defp normalize_attr_value(v), do: inspect(v)
 end

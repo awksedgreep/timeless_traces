@@ -80,7 +80,7 @@ defmodule TimelessTraces.WriterTest do
       spans = make_spans(3)
       assert {:ok, meta} = TimelessTraces.Writer.write_block(spans, :memory, :raw)
       assert meta.file_path == nil
-      assert meta.data != nil
+      assert is_binary(meta.data)
       assert meta.entry_count == 3
     end
 
@@ -88,7 +88,7 @@ defmodule TimelessTraces.WriterTest do
       spans = make_spans(4)
       assert {:ok, meta} = TimelessTraces.Writer.write_block(spans, :memory, :openzl)
       assert meta.file_path == nil
-      assert meta.data != nil
+      assert is_binary(meta.data)
       assert meta.entry_count == 4
       assert meta.format == :openzl
     end

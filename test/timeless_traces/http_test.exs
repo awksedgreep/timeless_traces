@@ -1,7 +1,7 @@
 defmodule TimelessTraces.HTTPTest do
   use ExUnit.Case, async: false
 
-  @port 10_428
+  @port 31_028
 
   setup do
     Application.stop(:timeless_traces)
@@ -25,7 +25,7 @@ defmodule TimelessTraces.HTTPTest do
 
   defp get(path), do: TimelessTraces.TestHTTP.get(@port, path)
   defp get(path, opts), do: TimelessTraces.TestHTTP.get(@port, path, opts)
-  defp post(path, body, opts \\ []), do: TimelessTraces.TestHTTP.post(@port, path, body, opts)
+  defp post(path, body, opts), do: TimelessTraces.TestHTTP.post(@port, path, body, opts)
 
   defp json_body(resp) do
     :json.decode(resp.body)
@@ -35,7 +35,7 @@ defmodule TimelessTraces.HTTPTest do
     term |> :json.encode() |> IO.iodata_to_binary()
   end
 
-  defp make_span(overrides \\ %{}) do
+  defp make_span(overrides) do
     now = System.system_time(:nanosecond)
 
     Map.merge(

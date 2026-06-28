@@ -463,14 +463,9 @@ defmodule TimelessTraces.PersistenceTest do
 
       spans = Enum.map(1..10, fn i -> make_span(%{name: "mem-#{i}"}) end)
 
-      case TimelessTraces.Writer.write_block(spans, :memory, :raw) do
-        {:ok, meta} ->
-          {terms, trace_rows} = TimelessTraces.Index.precompute(spans)
-          TimelessTraces.Index.index_block(meta, terms, trace_rows)
-
-        _ ->
-          flunk("Failed to write memory block")
-      end
+      {:ok, meta} = TimelessTraces.Writer.write_block(spans, :memory, :raw)
+      {terms, trace_rows} = TimelessTraces.Index.precompute(spans)
+      TimelessTraces.Index.index_block(meta, terms, trace_rows)
 
       TimelessTraces.Index.sync()
 

@@ -330,7 +330,7 @@ defmodule TimelessTraces.Index do
              Map.get(span.resource || %{}, "service.name") do
         nil -> []
         svc -> ["service.name:#{svc}"]
-      end
+    end
 
     resource_terms =
       (span.resource || %{})
@@ -341,7 +341,7 @@ defmodule TimelessTraces.Index do
       end)
 
     attr_terms =
-      (span.attributes || %{})
+      span.attributes
       |> Enum.flat_map(fn
         {"host", v} -> ["host:#{v}"]
         {"host.name", v} -> ["host.name:#{v}"]
