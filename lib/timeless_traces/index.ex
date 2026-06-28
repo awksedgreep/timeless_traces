@@ -330,7 +330,7 @@ defmodule TimelessTraces.Index do
              Map.get(span.resource || %{}, "service.name") do
         nil -> []
         svc -> ["service.name:#{svc}"]
-    end
+      end
 
     resource_terms =
       (span.resource || %{})
