@@ -41,6 +41,33 @@ defmodule TimelessTraces.IndexTest do
     )
   end
 
+  describe "ordered range overlap detection" do
+    test "does not flag descending adjacent ranges as overlapping" do
+      blocks = [
+        {3, nil, :raw, 30, 39},
+        {2, nil, :raw, 20, 29},
+        {1, nil, :raw, 10, 19}
+      ]
+
+      refute TimelessTraces.Index.ordered_ranges_overlap?(blocks, :desc)
+    end
+
+    test "flags real overlap in either order" do
+      asc_blocks = [
+        {1, nil, :raw, 10, 25},
+        {2, nil, :raw, 20, 29}
+      ]
+
+      desc_blocks = [
+        {2, nil, :raw, 20, 29},
+        {1, nil, :raw, 10, 25}
+      ]
+
+      assert TimelessTraces.Index.ordered_ranges_overlap?(asc_blocks, :asc)
+      assert TimelessTraces.Index.ordered_ranges_overlap?(desc_blocks, :desc)
+    end
+  end
+
   describe "index_block and query" do
     test "indexes and retrieves spans" do
       spans = [make_span(), make_span(%{name: "HTTP POST", status: :error})]

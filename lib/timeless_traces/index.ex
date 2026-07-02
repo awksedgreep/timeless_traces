@@ -146,6 +146,9 @@ defmodule TimelessTraces.Index do
     find_matching_blocks(db, term_filters, time_filters, order)
   end
 
+  @doc false
+  def ordered_ranges_overlap?(blocks, order), do: overlapping_blocks?(blocks, order)
+
   @spec raw_block_stats() :: %{
           entry_count: integer(),
           block_count: integer(),
@@ -928,7 +931,7 @@ defmodule TimelessTraces.Index do
     order = Keyword.get(pagination, :order, :desc)
     count_total = Keyword.get(pagination, :count_total, true)
     need = offset + limit
-    full_collection? = overlapping_blocks?(block_ids)
+    full_collection? = overlapping_blocks?(block_ids, order)
     collect_need = if full_collection?, do: :all, else: if(count_total, do: need, else: need + 1)
 
     {collected, total, blocks_read} =
@@ -948,8 +951,14 @@ defmodule TimelessTraces.Index do
         :desc -> Enum.sort_by(collected, & &1.start_time, :desc)
       end
 
-    has_more = length(sorted) > need
     page = sorted |> Enum.take(need) |> Enum.drop(offset) |> Enum.take(limit)
+
+    has_more =
+      if count_total do
+        total > offset + length(page)
+      else
+        length(sorted) > need
+      end
 
     reported_total =
       if count_total, do: total, else: offset + length(page) + if(has_more, do: 1, else: 0)
@@ -1122,17 +1131,17 @@ defmodule TimelessTraces.Index do
   defp keep_collecting?(_acc, :all), do: true
   defp keep_collecting?(acc, need), do: length(acc) < need
 
-  defp overlapping_blocks?([]), do: false
-  defp overlapping_blocks?([_single]), do: false
+  defp overlapping_blocks?([], _order), do: false
+  defp overlapping_blocks?([_single], _order), do: false
 
-  defp overlapping_blocks?(blocks) do
+  defp overlapping_blocks?(blocks, order) do
     {_prev_min, _prev_max, overlap?} =
       Enum.reduce_while(blocks, {nil, nil, false}, fn
         {_bid, _fp, _fmt, ts_min, ts_max}, {nil, nil, false} ->
           {:cont, {ts_min, ts_max, false}}
 
-        {_bid, _fp, _fmt, ts_min, ts_max}, {_prev_min, prev_max, false} ->
-          if ts_min <= prev_max do
+        {_bid, _fp, _fmt, ts_min, ts_max}, {prev_min, prev_max, false} ->
+          if intervals_overlap?(order, ts_min, ts_max, prev_min, prev_max) do
             {:halt, {ts_min, ts_max, true}}
           else
             {:cont, {ts_min, max(prev_max, ts_max), false}}
@@ -1144,6 +1153,9 @@ defmodule TimelessTraces.Index do
 
     overlap?
   end
+
+  defp intervals_overlap?(:asc, ts_min, _ts_max, _prev_min, prev_max), do: ts_min <= prev_max
+  defp intervals_overlap?(:desc, _ts_min, ts_max, prev_min, _prev_max), do: ts_max >= prev_min
 
   defp do_trace_parallel(block_info, db, storage, trace_id) do
     spans =
