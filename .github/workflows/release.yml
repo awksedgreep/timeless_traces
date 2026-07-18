@@ -7,7 +7,7 @@ on:
 
 jobs:
   publish:
-    name: Publish to Hex
+    name: Validate and publish
     runs-on: ubuntu-latest
 
     strategy:
@@ -47,3 +47,8 @@ jobs:
 
       - name: Check formatting
         run: mix format --check-formatted
+
+      - name: Publish to Hex
+        run: mix hex.publish --yes
+        env:
+          HEX_API_KEY: ${{ secrets.HEX_API_KEY }}
