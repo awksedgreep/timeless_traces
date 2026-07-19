@@ -41,30 +41,47 @@ defmodule TimelessTraces.IndexTest do
     )
   end
 
-  describe "ordered range overlap detection" do
-    test "does not flag descending adjacent ranges as overlapping" do
-      blocks = [
-        {3, nil, :raw, 30, 39},
-        {2, nil, :raw, 20, 29},
-        {1, nil, :raw, 10, 19}
-      ]
+  describe "pagination with overlapping block time ranges" do
+    # The waterline collector must return globally correct pages even
+    # when block time ranges overlap (spans arrive by trace, not by
+    # time). This replaces the old overlap-detection + full-collection
+    # escalation.
+    test "limit queries return the globally newest spans across overlapping blocks" do
+      old_batch =
+        for i <- 1..10 do
+          make_span(%{
+            trace_id: "t-old-#{i}",
+            name: "op.old",
+            start_time: 1_000_000_000 + i * 10,
+            end_time: 1_000_000_000 + i * 10 + 5,
+            duration_ns: 5
+          })
+        end
 
-      refute TimelessTraces.Index.ordered_ranges_overlap?(blocks, :desc)
-    end
+      interleaved_batch =
+        for i <- 1..10 do
+          make_span(%{
+            trace_id: "t-new-#{i}",
+            name: "op.new",
+            start_time: 1_000_000_000 + i * 10 + 5,
+            end_time: 1_000_000_000 + i * 10 + 9,
+            duration_ns: 4
+          })
+        end
 
-    test "flags real overlap in either order" do
-      asc_blocks = [
-        {1, nil, :raw, 10, 25},
-        {2, nil, :raw, 20, 29}
-      ]
+      TimelessTraces.Buffer.ingest(old_batch)
+      :ok = TimelessTraces.flush()
+      TimelessTraces.Buffer.ingest(interleaved_batch)
+      :ok = TimelessTraces.flush()
+      TimelessTraces.Index.sync()
 
-      desc_blocks = [
-        {2, nil, :raw, 20, 29},
-        {1, nil, :raw, 10, 25}
-      ]
+      {:ok, %{entries: page}} = TimelessTraces.query(limit: 4, count_total: false)
 
-      assert TimelessTraces.Index.ordered_ranges_overlap?(asc_blocks, :asc)
-      assert TimelessTraces.Index.ordered_ranges_overlap?(desc_blocks, :desc)
+      # Globally newest four spans regardless of which block holds them
+      starts = Enum.map(page, & &1.start_time)
+      assert starts == Enum.sort(starts, :desc)
+      assert hd(starts) == 1_000_000_000 + 10 * 10 + 5
+      assert Enum.map(page, &to_string(&1.name)) == ["op.new", "op.old", "op.new", "op.old"]
     end
   end
 

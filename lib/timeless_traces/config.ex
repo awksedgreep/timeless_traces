@@ -26,6 +26,18 @@ defmodule TimelessTraces.Config do
     Application.get_env(:timeless_traces, :query_timeout, 30_000)
   end
 
+  # Parallel block decompressions per query. Half the cores by default so
+  # scan-heavy queries, the flush pipeline, and the compactor can't
+  # mutually starve each other under sustained ingest.
+  @spec query_concurrency() :: pos_integer()
+  def query_concurrency do
+    Application.get_env(
+      :timeless_traces,
+      :query_concurrency,
+      max(div(System.schedulers_online(), 2), 1)
+    )
+  end
+
   # 7 days in seconds
   @default_retention_max_age 7 * 86_400
 

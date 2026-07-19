@@ -181,7 +181,7 @@ defmodule TimelessTraces.HTTP do
         {params, _} = Rocket.Request.query_params(req)
         filters = build_trace_search_filters(params)
 
-        case TimelessTraces.query(filters) do
+        case TimelessTraces.query([{:count_total, false} | filters]) do
           {:ok, %{entries: spans}} ->
             traces = group_spans_to_jaeger_traces(spans)
             send_jaeger_response(req, traces)

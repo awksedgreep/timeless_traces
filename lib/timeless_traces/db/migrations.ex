@@ -111,7 +111,21 @@ defmodule TimelessTraces.DB.Migrations do
     run_from(conn, 1)
   end
 
-  defp run_from(_conn, 1), do: :ok
+  defp run_from(conn, 1) do
+    execute(conn, "BEGIN")
+
+    # Per-term entry counts let term+time queries answer totals from the
+    # index instead of decompressing blocks. Legacy rows keep 0 =
+    # "unknown — scan the block".
+    execute(conn, "ALTER TABLE term_index ADD COLUMN entry_count INTEGER NOT NULL DEFAULT 0")
+
+    set_version(conn, 2)
+    execute(conn, "COMMIT")
+
+    run_from(conn, 2)
+  end
+
+  defp run_from(_conn, 2), do: :ok
 
   defp execute(conn, sql, params \\ []) do
     execute_with_retry(conn, sql, params, @max_retries)

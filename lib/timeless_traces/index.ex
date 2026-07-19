@@ -146,9 +146,6 @@ defmodule TimelessTraces.Index do
     find_matching_blocks(db, term_filters, time_filters, order)
   end
 
-  @doc false
-  def ordered_ranges_overlap?(blocks, order), do: overlapping_blocks?(blocks, order)
-
   @spec raw_block_stats() :: %{
           entry_count: integer(),
           block_count: integer(),
@@ -285,20 +282,20 @@ defmodule TimelessTraces.Index do
   def sync, do: GenServer.call(__MODULE__, :sync, TimelessTraces.Config.query_timeout())
 
   @doc false
-  @spec precompute([map()]) :: {[String.t()], [tuple()]}
+  @spec precompute([map()]) :: {%{String.t() => pos_integer()}, [tuple()]}
   def precompute(entries) do
-    {terms_set, traces_map} =
-      Enum.reduce(entries, {MapSet.new(), %{}}, fn span, {terms_acc, traces_acc} ->
-        span_terms = extract_span_terms(span)
-        new_terms = Enum.reduce(span_terms, terms_acc, &MapSet.put(&2, &1))
+    {terms, traces_map} =
+      Enum.reduce(entries, {%{}, %{}}, fn span, {terms_acc, traces_acc} ->
+        new_terms =
+          span
+          |> extract_span_terms()
+          |> Enum.reduce(terms_acc, &Map.update(&2, &1, 1, fn c -> c + 1 end))
 
         new_traces =
           Map.update(traces_acc, span.trace_id, [span], fn spans -> [span | spans] end)
 
         {new_terms, new_traces}
       end)
-
-    terms = MapSet.to_list(terms_set)
 
     trace_rows =
       Enum.map(traces_map, fn {trace_id, spans} ->
@@ -577,14 +574,27 @@ defmodule TimelessTraces.Index do
     )
   end
 
-  defp insert_terms_sql(_conn, [], _block_id), do: :ok
-
   defp insert_terms_sql(conn, terms, block_id) do
-    TimelessTraces.DB.execute_batch(
-      conn,
-      "INSERT OR IGNORE INTO term_index (term, block_id) VALUES (?1, ?2)",
-      Enum.map(terms, &[&1, block_id])
-    )
+    case term_rows(terms, block_id) do
+      [] ->
+        :ok
+
+      rows ->
+        TimelessTraces.DB.execute_batch(
+          conn,
+          "INSERT OR REPLACE INTO term_index (term, block_id, entry_count) VALUES (?1, ?2, ?3)",
+          rows
+        )
+    end
+  end
+
+  # Accepts the %{term => count} map from precompute/1; plain term lists
+  # (legacy callers/tests) get entry_count 0, meaning "unknown — scan".
+  defp term_rows(terms, block_id) do
+    Enum.map(terms, fn
+      {term, count} -> [term, block_id, count]
+      term when is_binary(term) -> [term, block_id, 0]
+    end)
   end
 
   defp insert_traces_sql(_conn, [], _block_id), do: :ok
@@ -766,13 +776,18 @@ defmodule TimelessTraces.Index do
 
   defp find_matching_blocks(db, term_filters, time_filters, order) do
     terms = build_query_terms(term_filters)
-    order_dir = if order == :asc, do: "ASC", else: "DESC"
+
+    # Order by the bound that limits what a block can still contribute:
+    # descending queries walk ts_max DESC (a block holds nothing newer
+    # than its ts_max), ascending walk ts_min ASC. This is what makes the
+    # waterline early-exit correct even when block time ranges overlap.
+    order_sql = if order == :asc, do: "ts_min ASC", else: "ts_max DESC"
 
     {conditions, params} = build_block_conditions(terms, time_filters)
     where = if conditions == [], do: "", else: " WHERE " <> Enum.join(conditions, " AND ")
 
     sql =
-      "SELECT block_id, file_path, format, ts_min, ts_max FROM blocks#{where} ORDER BY ts_min #{order_dir}"
+      "SELECT block_id, file_path, format, ts_min, ts_max FROM blocks#{where} ORDER BY #{order_sql}"
 
     {:ok, rows} = TimelessTraces.DB.read(db, sql, params)
 
@@ -851,7 +866,7 @@ defmodule TimelessTraces.Index do
           created_at
         ]
 
-        term_rows = Enum.map(terms, &[&1, meta.block_id])
+        term_rows = term_rows(terms, meta.block_id)
 
         trace_rows_params =
           Enum.map(trace_rows, fn {trace_id, _, _, _, _} ->
@@ -879,7 +894,7 @@ defmodule TimelessTraces.Index do
         if term_params_list != [] do
           TimelessTraces.DB.execute_batch(
             conn,
-            "INSERT OR IGNORE INTO term_index (term, block_id) VALUES (?1, ?2)",
+            "INSERT OR REPLACE INTO term_index (term, block_id, entry_count) VALUES (?1, ?2, ?3)",
             term_params_list
           )
         end
@@ -931,19 +946,20 @@ defmodule TimelessTraces.Index do
     order = Keyword.get(pagination, :order, :desc)
     count_total = Keyword.get(pagination, :count_total, true)
     need = offset + limit
-    full_collection? = overlapping_blocks?(block_ids, order)
-    collect_need = if full_collection?, do: :all, else: if(count_total, do: need, else: need + 1)
 
-    {collected, total, blocks_read} =
-      collect_with_early_exit(
-        block_ids,
-        db,
-        storage,
-        search_filters,
-        collect_need,
-        count_total,
-        order
-      )
+    # Exact totals require reading every matching block. Otherwise the
+    # waterline collector stops as soon as no remaining block's time
+    # range can intrude on the assembled page — correct pagination even
+    # with overlapping blocks, without the old escalate-to-full-scan.
+    {collected, total, blocks_read, halted_early} =
+      if count_total do
+        {c, t, b} =
+          collect_with_early_exit(block_ids, db, storage, search_filters, :all, true, order)
+
+        {c, t, b, false}
+      else
+        collect_with_waterline(block_ids, db, storage, search_filters, need, order)
+      end
 
     sorted =
       case order do
@@ -957,7 +973,7 @@ defmodule TimelessTraces.Index do
       if count_total do
         total > offset + length(page)
       else
-        length(sorted) > need
+        length(sorted) > need or halted_early
       end
 
     reported_total =
@@ -979,6 +995,102 @@ defmodule TimelessTraces.Index do
        offset: offset,
        has_more: has_more
      }}
+  end
+
+  # Bounded page collection that stays correct with overlapping block
+  # time ranges. Blocks arrive ordered by their contribution bound
+  # (ts_max DESC for :desc, ts_min ASC for :asc). We merge each block's
+  # matches into a running top-(need+1), and once that is full, halt as
+  # soon as the next block's bound cannot beat the page cutoff — no
+  # later block can either, by the ordering. Returns
+  # {entries, 0, blocks_read, halted_early}.
+  defp collect_with_waterline(block_ids, db, storage, search_filters, need, order) do
+    keep = need + 1
+    batch_size = TimelessTraces.Config.query_concurrency()
+
+    {acc, blocks_read, halted} =
+      block_ids
+      |> Enum.chunk_every(max(batch_size, 1))
+      |> Enum.reduce_while({[], 0, false}, fn batch, {acc, count, _halted} ->
+        if length(acc) >= keep and batch_beyond_cutoff?(batch, acc, need, order) do
+          {:halt, {acc, count, true}}
+        else
+          batch_results =
+            batch
+            |> Task.async_stream(
+              fn {block_id, file_path, format, _ts_min, _ts_max} ->
+                read_and_filter(db, storage, block_id, file_path, format, search_filters)
+              end,
+              max_concurrency: max(batch_size, 1),
+              ordered: false
+            )
+            |> Enum.flat_map(fn {:ok, entries} -> entries end)
+
+          acc =
+            (acc ++ batch_results)
+            |> sort_spans(order)
+            |> Enum.take(keep)
+
+          {:cont, {acc, count + length(batch), false}}
+        end
+      end)
+
+    {acc, 0, blocks_read, halted}
+  end
+
+  # The batch is ordered by contribution bound; its first block carries
+  # the best bound. If even that cannot reach the page cutoff, nothing
+  # from here on can change the page.
+  defp batch_beyond_cutoff?([{_bid, _fp, _fmt, ts_min, ts_max} | _], acc, need, order) do
+    case Enum.at(acc, max(need - 1, 0)) do
+      nil ->
+        false
+
+      cutoff_span ->
+        case order do
+          :desc -> ts_max < cutoff_span.start_time
+          :asc -> ts_min > cutoff_span.start_time
+        end
+    end
+  end
+
+  defp batch_beyond_cutoff?([], _acc, _need, _order), do: true
+
+  defp read_and_filter(db, storage, block_id, file_path, format, search_filters) do
+    format_atom = to_format_atom(format)
+
+    read_result =
+      case storage do
+        :disk -> TimelessTraces.Writer.read_block(file_path, format_atom)
+        :memory -> read_block_from_db(db, block_id)
+      end
+
+    case read_result do
+      {:ok, entries} ->
+        entries
+        |> TimelessTraces.Filter.filter(search_filters)
+        |> Enum.map(&TimelessTraces.Span.from_map/1)
+
+      {:error, :enoent} ->
+        reconcile_missing_block(block_id, file_path)
+
+        TimelessTraces.Telemetry.event(
+          [:timeless_traces, :block, :missing],
+          %{},
+          %{block_id: block_id, file_path: file_path}
+        )
+
+        []
+
+      {:error, reason} ->
+        TimelessTraces.Telemetry.event(
+          [:timeless_traces, :block, :error],
+          %{},
+          %{block_id: block_id, file_path: file_path, reason: reason}
+        )
+
+        []
+    end
   end
 
   defp collect_with_early_exit(block_ids, db, storage, search_filters, need, count_total, order) do
@@ -1060,7 +1172,7 @@ defmodule TimelessTraces.Index do
   end
 
   defp collect_parallel_early_exit(block_ids, search_filters, need, count_total, order) do
-    batch_size = System.schedulers_online()
+    batch_size = TimelessTraces.Config.query_concurrency()
 
     block_ids
     |> Enum.chunk_every(batch_size)
@@ -1131,32 +1243,6 @@ defmodule TimelessTraces.Index do
   defp keep_collecting?(_acc, :all), do: true
   defp keep_collecting?(acc, need), do: length(acc) < need
 
-  defp overlapping_blocks?([], _order), do: false
-  defp overlapping_blocks?([_single], _order), do: false
-
-  defp overlapping_blocks?(blocks, order) do
-    {_prev_min, _prev_max, overlap?} =
-      Enum.reduce_while(blocks, {nil, nil, false}, fn
-        {_bid, _fp, _fmt, ts_min, ts_max}, {nil, nil, false} ->
-          {:cont, {ts_min, ts_max, false}}
-
-        {_bid, _fp, _fmt, ts_min, ts_max}, {prev_min, prev_max, false} ->
-          if intervals_overlap?(order, ts_min, ts_max, prev_min, prev_max) do
-            {:halt, {ts_min, ts_max, true}}
-          else
-            {:cont, {ts_min, max(prev_max, ts_max), false}}
-          end
-
-        _, state ->
-          {:halt, state}
-      end)
-
-    overlap?
-  end
-
-  defp intervals_overlap?(:asc, ts_min, _ts_max, _prev_min, prev_max), do: ts_min <= prev_max
-  defp intervals_overlap?(:desc, _ts_min, ts_max, prev_min, _prev_max), do: ts_max >= prev_min
-
   defp do_trace_parallel(block_info, db, storage, trace_id) do
     spans =
       if storage == :disk and length(block_info) > 1 do
@@ -1179,7 +1265,7 @@ defmodule TimelessTraces.Index do
                 []
             end
           end,
-          max_concurrency: System.schedulers_online(),
+          max_concurrency: TimelessTraces.Config.query_concurrency(),
           ordered: false
         )
         |> Enum.flat_map(fn {:ok, entries} -> entries end)
