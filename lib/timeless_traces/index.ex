@@ -161,16 +161,16 @@ defmodule TimelessTraces.Index do
 
     {:ok, rows} =
       TimelessTraces.DB.read(db, """
-      SELECT COUNT(*), COALESCE(SUM(entry_count), 0), MIN(created_at)
+      SELECT COUNT(*), COALESCE(SUM(entry_count), 0), COALESCE(SUM(byte_size), 0), MIN(created_at)
       FROM blocks WHERE format = 'raw'
       """)
 
     case rows do
-      [[count, entries, oldest]] ->
-        %{entry_count: entries, block_count: count, oldest_created_at: oldest}
+      [[count, entries, bytes, oldest]] ->
+        %{entry_count: entries, block_count: count, total_bytes: bytes, oldest_created_at: oldest}
 
       _ ->
-        %{entry_count: 0, block_count: 0, oldest_created_at: nil}
+        %{entry_count: 0, block_count: 0, total_bytes: 0, oldest_created_at: nil}
     end
   end
 
@@ -193,18 +193,19 @@ defmodule TimelessTraces.Index do
     Enum.map(rows, fn [bid, fp, bs, ec] -> {bid, fp, bs, ec} end)
   end
 
-  @spec raw_block_ids() :: [{integer(), String.t() | nil, non_neg_integer()}]
+  @spec raw_block_ids() ::
+          [{integer(), String.t() | nil, non_neg_integer(), non_neg_integer()}]
   def raw_block_ids do
     db = :persistent_term.get({__MODULE__, :db})
 
     {:ok, rows} =
       TimelessTraces.DB.read(db, """
-      SELECT block_id, file_path, byte_size
+      SELECT block_id, file_path, byte_size, entry_count
       FROM blocks WHERE format = 'raw'
       ORDER BY ts_min ASC
       """)
 
-    Enum.map(rows, fn [bid, fp, bs] -> {bid, fp, bs} end)
+    Enum.map(rows, fn [bid, fp, bs, ec] -> {bid, fp, bs, ec} end)
   end
 
   @spec distinct_services() :: {:ok, [String.t()]}
@@ -269,11 +270,20 @@ defmodule TimelessTraces.Index do
           {non_neg_integer(), non_neg_integer()}
         ) :: :ok
   def compact_blocks(old_block_ids, new_meta, new_entries, compression_sizes \\ {0, 0}) do
-    {terms, trace_rows} = precompute(new_entries)
+    compact_blocks_multi(old_block_ids, [{new_meta, new_entries}], compression_sizes)
+  end
+
+  @spec compact_blocks_multi([integer()], [{map(), [map()]}], {integer(), integer()}) :: :ok
+  def compact_blocks_multi(old_block_ids, new_blocks, compression_sizes) do
+    precomputed =
+      Enum.map(new_blocks, fn {meta, entries} ->
+        {terms, trace_rows} = precompute(entries)
+        {meta, terms, trace_rows}
+      end)
 
     GenServer.call(
       __MODULE__,
-      {:compact_blocks, old_block_ids, new_meta, terms, trace_rows, compression_sizes},
+      {:compact_blocks, old_block_ids, precomputed, compression_sizes},
       60_000
     )
   end
@@ -421,7 +431,7 @@ defmodule TimelessTraces.Index do
   end
 
   def handle_call(
-        {:compact_blocks, old_ids, new_meta, terms, trace_rows, compression_sizes},
+        {:compact_blocks, old_ids, new_blocks, compression_sizes},
         _from,
         state
       ) do
@@ -471,18 +481,20 @@ defmodule TimelessTraces.Index do
           TimelessTraces.DB.execute(conn, "DELETE FROM blocks WHERE block_id IN (#{ph})", old_ids)
         end
 
-        # Insert new block
-        insert_block_sql(conn, new_meta)
-        insert_terms_sql(conn, terms, new_meta.block_id)
-        insert_traces_sql(conn, trace_rows, new_meta.block_id)
+        # Insert new blocks
+        Enum.each(new_blocks, fn {new_meta, terms, trace_rows} ->
+          insert_block_sql(conn, new_meta)
+          insert_terms_sql(conn, terms, new_meta.block_id)
+          insert_traces_sql(conn, trace_rows, new_meta.block_id)
 
-        if state.storage == :memory and new_meta[:data] do
-          TimelessTraces.DB.execute(
-            conn,
-            "INSERT OR REPLACE INTO block_data (block_id, data) VALUES (?1, ?2)",
-            [new_meta.block_id, new_meta[:data]]
-          )
-        end
+          if state.storage == :memory and new_meta[:data] do
+            TimelessTraces.DB.execute(
+              conn,
+              "INSERT OR REPLACE INTO block_data (block_id, data) VALUES (?1, ?2)",
+              [new_meta.block_id, new_meta[:data]]
+            )
+          end
+        end)
 
         # Update compression stats
         {raw_in, compressed_out} = compression_sizes

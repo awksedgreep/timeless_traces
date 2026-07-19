@@ -50,6 +50,14 @@ defmodule TimelessTraces.Config do
     Application.get_env(:timeless_traces, :ingest_backpressure_timeout, 60_000)
   end
 
+  # Compression level used when raw debt is past half the ingest limit:
+  # trade a little ratio for much higher compaction throughput so the
+  # backlog drains before backpressure has to engage.
+  @spec compaction_pressure_level() :: 1..22
+  def compaction_pressure_level do
+    Application.get_env(:timeless_traces, :compaction_pressure_level, 3)
+  end
+
   # Parallel block decompressions per query. Half the cores by default so
   # scan-heavy queries, the flush pipeline, and the compactor can't
   # mutually starve each other under sustained ingest.

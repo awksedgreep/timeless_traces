@@ -38,7 +38,8 @@ defmodule TimelessTraces.Compactor do
 
   @impl true
   def handle_call(:compact_now, _from, state) do
-    result = maybe_compact(state)
+    result = drain_compact(state)
+    update_raw_debt_gauge()
     {:reply, result, %{state | idle_cycles: 0}}
   end
 
@@ -51,18 +52,40 @@ defmodule TimelessTraces.Compactor do
   def handle_info(:compaction_check, state) do
     compact_result = maybe_compact(state)
     merge_result = maybe_merge_compact(state)
+    update_raw_debt_gauge()
 
-    state =
-      if compact_result == :noop and merge_result == :noop do
-        %{state | idle_cycles: state.idle_cycles + 1}
-      else
-        %{state | idle_cycles: 0}
-      end
+    cond do
+      compact_result == :more ->
+        # Raw debt remains — keep compacting continuously, no idle wait.
+        schedule(0)
+        {:noreply, %{state | idle_cycles: 0}}
 
-    max_backoff = TimelessTraces.Config.compaction_max_backoff()
-    next_interval = min(state.base_interval * Bitwise.bsl(1, state.idle_cycles), max_backoff)
-    schedule(next_interval)
-    {:noreply, state}
+      compact_result == :noop and merge_result == :noop ->
+        state = %{state | idle_cycles: state.idle_cycles + 1}
+        max_backoff = TimelessTraces.Config.compaction_max_backoff()
+        next_interval = min(state.base_interval * Bitwise.bsl(1, state.idle_cycles), max_backoff)
+        schedule(next_interval)
+        {:noreply, state}
+
+      true ->
+        schedule(state.base_interval)
+        {:noreply, %{state | idle_cycles: 0}}
+    end
+  end
+
+  defp update_raw_debt_gauge do
+    stats = TimelessTraces.Index.raw_block_stats()
+    TimelessTraces.IngestPressure.set_raw_debt(stats.total_bytes)
+    stats
+  end
+
+  # Manual compaction keeps its "compact everything" semantics by looping
+  # bounded passes until the backlog is gone.
+  defp drain_compact(state) do
+    case maybe_compact(state) do
+      :more -> drain_compact(state)
+      other -> other
+    end
   end
 
   defp schedule(interval) do
@@ -81,18 +104,27 @@ defmodule TimelessTraces.Compactor do
         stats.block_count > 0
 
     if stats.entry_count >= threshold or age_exceeded do
-      do_compact(state)
+      do_compact(state, stats)
     else
       :noop
     end
   end
 
-  defp do_compact(state) do
+  defp do_compact(state, stats) do
     start_time = System.monotonic_time()
-    raw_blocks = TimelessTraces.Index.raw_block_ids()
+    concurrency = System.schedulers_online()
+    output_target = TimelessTraces.Config.merge_compaction_target_size()
+
+    # Bounded pass: one output block per core. Reading the entire raw
+    # backlog into memory at once is an OOM hazard when the compactor is
+    # behind; the scheduler loops passes back-to-back (:more) instead.
+    entry_budget = concurrency * output_target
+
+    {raw_blocks, leftover} =
+      take_by_entry_budget(TimelessTraces.Index.raw_block_ids(), entry_budget)
 
     all_entries =
-      Enum.flat_map(raw_blocks, fn {block_id, file_path, _bs} ->
+      Enum.flat_map(raw_blocks, fn {block_id, file_path, _bs, _ec} ->
         read_result =
           case state.storage do
             :disk -> TimelessTraces.Writer.read_block(file_path, :raw)
@@ -110,27 +142,47 @@ defmodule TimelessTraces.Compactor do
     else
       sorted = Enum.sort_by(all_entries, & &1.start_time)
 
-      # Sum per-entry ETF sizes (logical size before compression)
-      raw_bytes =
-        Enum.reduce(sorted, 0, fn entry, acc -> acc + byte_size(:erlang.term_to_binary(entry)) end)
+      # Logical size before compression: the raw blocks' on-disk sizes
+      # (ETF of the span lists) — no per-entry re-serialization.
+      raw_bytes = Enum.reduce(raw_blocks, 0, fn {_bid, _fp, bs, _ec}, acc -> acc + bs end)
 
       write_target = if state.storage == :memory, do: :memory, else: state.data_dir
+      write_opts = compaction_write_opts(stats.total_bytes)
+      chunks = Enum.chunk_every(sorted, output_target)
 
-      case TimelessTraces.Writer.write_block(
-             sorted,
-             write_target,
-             TimelessTraces.Config.compaction_format()
-           ) do
-        {:ok, new_meta} ->
+      new_blocks =
+        chunks
+        |> Task.async_stream(
+          fn chunk ->
+            case TimelessTraces.Writer.write_block(
+                   chunk,
+                   write_target,
+                   TimelessTraces.Config.compaction_format(),
+                   write_opts
+                 ) do
+              {:ok, meta} -> {meta, chunk}
+              _error -> nil
+            end
+          end,
+          max_concurrency: concurrency,
+          ordered: false,
+          timeout: 120_000
+        )
+        |> Enum.flat_map(fn
+          {:ok, nil} -> []
+          {:ok, pair} -> [pair]
+        end)
+
+      case new_blocks do
+        [] ->
+          Logger.warning("TimelessTraces: compaction failed: all chunks errored")
+          :noop
+
+        new_blocks ->
           old_ids = Enum.map(raw_blocks, &elem(&1, 0))
-          compressed_bytes = new_meta.byte_size
+          total_bytes = Enum.reduce(new_blocks, 0, fn {meta, _c}, acc -> acc + meta.byte_size end)
 
-          TimelessTraces.Index.compact_blocks(
-            old_ids,
-            new_meta,
-            sorted,
-            {raw_bytes, compressed_bytes}
-          )
+          TimelessTraces.Index.compact_blocks_multi(old_ids, new_blocks, {raw_bytes, total_bytes})
 
           duration = System.monotonic_time() - start_time
 
@@ -140,16 +192,12 @@ defmodule TimelessTraces.Compactor do
               duration: duration,
               raw_blocks: length(raw_blocks),
               entry_count: length(sorted),
-              byte_size: new_meta.byte_size
+              byte_size: total_bytes
             },
             %{}
           )
 
-          :ok
-
-        {:error, reason} ->
-          Logger.error("TimelessTraces: compaction write failed: #{inspect(reason)}")
-          :noop
+          if leftover, do: :more, else: :ok
       end
     end
   rescue
@@ -159,6 +207,29 @@ defmodule TimelessTraces.Compactor do
       )
 
       :noop
+  end
+
+  defp take_by_entry_budget(blocks, budget) do
+    {taken_rev, _spent, leftover} =
+      Enum.reduce(blocks, {[], 0, false}, fn
+        {_bid, _fp, _bs, ec} = block, {taken, spent, false} when spent < budget ->
+          {[block | taken], spent + ec, false}
+
+        _block, {taken, spent, _} ->
+          {taken, spent, true}
+      end)
+
+    {Enum.reverse(taken_rev), leftover}
+  end
+
+  # Under heavy raw debt, trade compression ratio for throughput so the
+  # backlog drains before ingest backpressure has to engage.
+  defp compaction_write_opts(raw_debt_bytes) do
+    if raw_debt_bytes > div(TimelessTraces.Config.ingest_raw_debt_limit(), 2) do
+      [level: TimelessTraces.Config.compaction_pressure_level()]
+    else
+      []
+    end
   end
 
   # --- Merge compaction ---
@@ -243,8 +314,9 @@ defmodule TimelessTraces.Compactor do
     else
       sorted = Enum.sort_by(all_entries, & &1.start_time)
 
-      raw_bytes =
-        Enum.reduce(sorted, 0, fn entry, acc -> acc + byte_size(:erlang.term_to_binary(entry)) end)
+      # Logical (uncompressed ETF) size for compression stats — one
+      # whole-list serialization, not one per span.
+      raw_bytes = byte_size(:erlang.term_to_binary(sorted))
 
       write_target = if state.storage == :memory, do: :memory, else: state.data_dir
 
