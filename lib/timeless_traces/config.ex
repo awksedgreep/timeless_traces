@@ -26,6 +26,30 @@ defmodule TimelessTraces.Config do
     Application.get_env(:timeless_traces, :query_timeout, 30_000)
   end
 
+  # Spans queued per shard (buffer + pending batches + in-flight work up
+  # to index durability) above which batch ingest paces producers to the
+  # durable drain rate. Sized to absorb bursts at full speed.
+  @spec ingest_soft_watermark() :: pos_integer()
+  def ingest_soft_watermark do
+    Application.get_env(:timeless_traces, :ingest_soft_watermark, 50_000)
+  end
+
+  # Raw (uncompacted) block bytes on disk above which batch ingest also
+  # paces, letting the compactor catch up. The compactor maintains the
+  # gauge.
+  @spec ingest_raw_debt_limit() :: pos_integer()
+  def ingest_raw_debt_limit do
+    Application.get_env(:timeless_traces, :ingest_raw_debt_limit, 2_000_000_000)
+  end
+
+  # How long a paced producer waits for drain capacity before accepting
+  # anyway (with a loud error). Only reachable when the pipeline has
+  # stalled outright.
+  @spec ingest_backpressure_timeout() :: pos_integer()
+  def ingest_backpressure_timeout do
+    Application.get_env(:timeless_traces, :ingest_backpressure_timeout, 60_000)
+  end
+
   # Parallel block decompressions per query. Half the cores by default so
   # scan-heavy queries, the flush pipeline, and the compactor can't
   # mutually starve each other under sustained ingest.

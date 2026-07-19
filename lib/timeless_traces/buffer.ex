@@ -23,15 +23,49 @@ defmodule TimelessTraces.Buffer do
     GenServer.start_link(__MODULE__, opts, name: name)
   end
 
+  @backpressure_poll_ms 20
+
   @spec ingest([map()]) :: :ok
   def ingest(spans) when is_list(spans) do
     spans
     |> Enum.group_by(&TimelessTraces.BufferShard.shard_for/1)
     |> Enum.each(fn {shard, shard_spans} ->
+      if TimelessTraces.IngestPressure.overloaded?(shard) do
+        # Above the watermark the producer blocks here until the drain
+        # (write + index) frees capacity. Nothing is dropped or refused.
+        TimelessTraces.Telemetry.event(
+          [:timeless_traces, :ingest, :backpressure],
+          %{span_count: length(shard_spans)},
+          %{shard: shard}
+        )
+
+        wait_for_capacity(shard, TimelessTraces.Config.ingest_backpressure_timeout())
+      end
+
+      TimelessTraces.IngestPressure.add(shard, length(shard_spans))
       GenServer.cast(TimelessTraces.BufferShard.name(shard), {:ingest, shard_spans})
     end)
 
     :ok
+  end
+
+  defp wait_for_capacity(shard, timeout_left) when timeout_left <= 0 do
+    # Drain has stalled outright (e.g. dead disk). Accept anyway — losing
+    # spans during normal operation is not acceptable — but say so loudly.
+    Logger.error(
+      "TimelessTraces: ingest backpressure wait timed out on shard #{shard}; accepting anyway"
+    )
+
+    :ok
+  end
+
+  defp wait_for_capacity(shard, timeout_left) do
+    if TimelessTraces.IngestPressure.overloaded?(shard) do
+      Process.sleep(@backpressure_poll_ms)
+      wait_for_capacity(shard, timeout_left - @backpressure_poll_ms)
+    else
+      :ok
+    end
   end
 
   @spec flush() :: :ok
@@ -50,14 +84,20 @@ defmodule TimelessTraces.Buffer do
   @impl true
   def init(opts) do
     data_dir = Keyword.fetch!(opts, :data_dir)
+    shard = Keyword.fetch!(opts, :shard)
     interval = TimelessTraces.Config.flush_interval()
     schedule_flush(interval)
+
+    # A restart drops whatever was in the mailbox/state; the producer-side
+    # gauge must not carry those phantom spans forward.
+    TimelessTraces.IngestPressure.reset(shard)
 
     {:ok,
      %{
        buffer: [],
        buffer_size: 0,
        data_dir: data_dir,
+       shard: shard,
        flush_interval: interval,
        in_flight: 0,
        pending_batches: :queue.new(),
@@ -84,6 +124,7 @@ defmodule TimelessTraces.Buffer do
     state =
       if state.buffer != [] do
         do_flush(state.buffer, state.data_dir, sync: true)
+        TimelessTraces.IngestPressure.sub(state.shard, state.buffer_size)
         %{state | buffer: [], buffer_size: 0}
       else
         state
@@ -152,10 +193,11 @@ defmodule TimelessTraces.Buffer do
 
   defp start_flush_task(state, entries) do
     data_dir = state.data_dir
+    shard = state.shard
     caller = self()
 
     Task.Supervisor.start_child(TimelessTraces.FlushSupervisor, fn ->
-      do_flush_work(entries, data_dir)
+      do_flush_work(entries, data_dir, shard: shard)
       send(caller, {:flush_done, make_ref()})
     end)
 
@@ -180,7 +222,7 @@ defmodule TimelessTraces.Buffer do
     do_flush_work(entries, data_dir, opts)
   end
 
-  defp do_flush_work(entries, data_dir, opts \\ []) do
+  defp do_flush_work(entries, data_dir, opts) do
     start_time = System.monotonic_time()
 
     write_target = if TimelessTraces.Config.storage() == :memory, do: :memory, else: data_dir
@@ -192,7 +234,12 @@ defmodule TimelessTraces.Buffer do
         if Keyword.get(opts, :sync, false) do
           TimelessTraces.Index.index_block(block_meta, terms, trace_rows)
         else
-          TimelessTraces.Index.index_block_async(block_meta, terms, trace_rows)
+          TimelessTraces.Index.index_block_async(
+            block_meta,
+            terms,
+            trace_rows,
+            Keyword.get(opts, :shard)
+          )
         end
 
         duration = System.monotonic_time() - start_time
@@ -209,6 +256,7 @@ defmodule TimelessTraces.Buffer do
 
       {:error, reason} ->
         Logger.error("TimelessTraces: failed to write block: #{inspect(reason)}")
+        credit_gauge_on_drop(opts, entries)
 
         TimelessTraces.Telemetry.event(
           [:timeless_traces, :flush, :error],
@@ -222,11 +270,22 @@ defmodule TimelessTraces.Buffer do
         "TimelessTraces: flush crashed: #{Exception.format(:error, e, __STACKTRACE__)}"
       )
 
+      credit_gauge_on_drop(opts, entries)
+
       TimelessTraces.Telemetry.event(
         [:timeless_traces, :flush, :error],
         %{entry_count: length(entries)},
         %{reason: e}
       )
+  end
+
+  # Dropped spans must still release their gauge reservation or the
+  # watermark ratchets shut over time.
+  defp credit_gauge_on_drop(opts, entries) do
+    case Keyword.get(opts, :shard) do
+      nil -> :ok
+      shard -> TimelessTraces.IngestPressure.sub(shard, length(entries))
+    end
   end
 
   defp schedule_flush(interval) do

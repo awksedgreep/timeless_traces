@@ -21,9 +21,14 @@ defmodule TimelessTraces.Index do
     GenServer.call(__MODULE__, {:index_block, block_meta, terms, trace_rows})
   end
 
-  @spec index_block_async(TimelessTraces.Writer.block_meta(), [String.t()], [tuple()]) :: :ok
-  def index_block_async(block_meta, terms, trace_rows) do
-    GenServer.cast(__MODULE__, {:index_block, block_meta, terms, trace_rows})
+  # `shard`, when given, is credited back to the ingest-pressure gauge
+  # once the block row lands in SQLite — the gauge covers a span's whole
+  # journey (shard mailbox, flush task, index mailbox), not just the part
+  # before the disk write.
+  @spec index_block_async(TimelessTraces.Writer.block_meta(), term(), [tuple()], integer() | nil) ::
+          :ok
+  def index_block_async(block_meta, terms, trace_rows, shard \\ nil) do
+    GenServer.cast(__MODULE__, {:index_block, block_meta, terms, trace_rows, shard})
   end
 
   @spec reconcile_missing_block(integer(), String.t() | nil) :: :ok
@@ -510,8 +515,8 @@ defmodule TimelessTraces.Index do
   # --- handle_cast ---
 
   @impl true
-  def handle_cast({:index_block, meta, terms, trace_rows}, state) do
-    pending = [{meta, terms, trace_rows} | state.pending]
+  def handle_cast({:index_block, meta, terms, trace_rows, shard}, state) do
+    pending = [{meta, terms, trace_rows, shard} | state.pending]
     state = schedule_index_flush(%{state | pending: pending})
     {:noreply, state}
   end
@@ -852,7 +857,8 @@ defmodule TimelessTraces.Index do
 
     # Collect all params across all pending blocks for batched inserts
     {block_params_list, term_params_list, trace_params_list, data_params_list} =
-      Enum.reduce(resolved, {[], [], [], []}, fn {meta, terms, trace_rows}, {bp, tp, trp, dp} ->
+      Enum.reduce(resolved, {[], [], [], []}, fn {meta, terms, trace_rows, _shard},
+                                                 {bp, tp, trp, dp} ->
         format = Map.get(meta, :format, :zstd) |> to_string()
 
         block_row = [
@@ -915,6 +921,15 @@ defmodule TimelessTraces.Index do
           )
         end
       end)
+
+    # Spans are durable and visible now — credit the ingest gauge.
+    Enum.each(resolved, fn
+      {meta, _terms, _trace_rows, shard} when is_integer(shard) ->
+        TimelessTraces.IngestPressure.sub(shard, meta.entry_count)
+
+      _ ->
+        :ok
+    end)
 
     if state.flush_timer do
       Process.cancel_timer(state.flush_timer)

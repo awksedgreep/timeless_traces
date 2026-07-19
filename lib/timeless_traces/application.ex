@@ -13,6 +13,8 @@ defmodule TimelessTraces.Application do
       File.mkdir_p!(blocks_dir)
     end
 
+    TimelessTraces.IngestPressure.install(TimelessTraces.BufferShard.count())
+
     children =
       [
         {Registry, keys: :duplicate, name: TimelessTraces.Registry},
