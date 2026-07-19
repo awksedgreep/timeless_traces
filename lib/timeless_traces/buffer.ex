@@ -27,6 +27,10 @@ defmodule TimelessTraces.Buffer do
 
   @spec ingest([map()]) :: :ok
   def ingest(spans) when is_list(spans) do
+    # Producer-side tail insert makes spans queryable the moment this
+    # function returns, independent of shard mailbox latency.
+    TimelessTraces.HotTail.insert_many(spans)
+
     spans
     |> Enum.group_by(&TimelessTraces.BufferShard.shard_for/1)
     |> Enum.each(fn {shard, shard_spans} ->

@@ -50,6 +50,29 @@ defmodule TimelessTraces.Config do
     Application.get_env(:timeless_traces, :ingest_backpressure_timeout, 60_000)
   end
 
+  # Queryable hot tail: recent spans served from memory. The lag is the
+  # partition point between tail and disk (must comfortably exceed
+  # flush_interval + index flush); window/max_entries bound memory.
+  @spec hot_tail?() :: boolean()
+  def hot_tail? do
+    Application.get_env(:timeless_traces, :hot_tail, true)
+  end
+
+  @spec hot_tail_lag_ms() :: pos_integer()
+  def hot_tail_lag_ms do
+    Application.get_env(:timeless_traces, :hot_tail_lag_ms, 5_000)
+  end
+
+  @spec hot_tail_window_seconds() :: pos_integer()
+  def hot_tail_window_seconds do
+    Application.get_env(:timeless_traces, :hot_tail_window_seconds, 30)
+  end
+
+  @spec hot_tail_max_entries() :: pos_integer()
+  def hot_tail_max_entries do
+    Application.get_env(:timeless_traces, :hot_tail_max_entries, 250_000)
+  end
+
   # Compression level used when raw debt is past half the ingest limit:
   # trade a little ratio for much higher compaction throughput so the
   # backlog drains before backpressure has to engage.

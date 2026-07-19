@@ -45,10 +45,67 @@ defmodule TimelessTraces.Index do
 
     {search_filters, pagination} = split_pagination(filters)
     {term_filters, time_filters} = split_filters(search_filters)
-    order = Keyword.get(pagination, :order, :desc)
-    block_ids = find_matching_blocks(db, term_filters, time_filters, order)
 
-    do_query_parallel(block_ids, db, storage, pagination, search_filters)
+    # Partition at the hot-tail boundary: memory serves start_time >=
+    # boundary, disk serves older — exact union, no dedup.
+    boundary = TimelessTraces.HotTail.boundary()
+
+    {tail_entries, tail_total, disk_time_filters} =
+      tail_partition(search_filters, time_filters, boundary, pagination)
+
+    do_query_parallel(db, storage, term_filters, disk_time_filters, pagination, search_filters,
+      tail_entries: tail_entries,
+      tail_total: tail_total,
+      boundary: boundary
+    )
+  end
+
+  # Page entries always come from a bounded walk (never a full-tail
+  # materialization); an exact total, when requested, is a chunked count.
+  defp tail_partition(search_filters, time_filters, boundary, pagination) do
+    since_ns = time_filter_value(time_filters, :since)
+    until_ns = time_filter_value(time_filters, :until)
+    tail_since = max(since_ns || boundary, boundary)
+    out_of_range = until_ns != nil and until_ns < boundary
+
+    tail_entries =
+      if out_of_range do
+        []
+      else
+        limit = Keyword.get(pagination, :limit, @default_limit)
+        offset = Keyword.get(pagination, :offset, @default_offset)
+        order = Keyword.get(pagination, :order, :desc)
+
+        TimelessTraces.HotTail.take(
+          search_filters,
+          tail_since,
+          until_ns,
+          order,
+          offset + limit + 1
+        )
+      end
+
+    tail_total =
+      cond do
+        out_of_range -> 0
+        not Keyword.get(pagination, :count_total, true) -> length(tail_entries)
+        true -> TimelessTraces.HotTail.count_matching(search_filters, tail_since, until_ns)
+      end
+
+    disk_time_filters =
+      time_filters
+      |> Keyword.delete(:until)
+      |> Keyword.put(:until, min(until_ns || boundary - 1, boundary - 1))
+
+    {tail_entries, tail_total, disk_time_filters}
+  end
+
+  defp time_filter_value(time_filters, key) do
+    case Keyword.get(time_filters, key) do
+      nil -> nil
+      %DateTime{} = dt -> DateTime.to_unix(dt, :nanosecond)
+      ts when is_integer(ts) -> ts
+    end
   end
 
   @spec trace(String.t()) :: {:ok, [TimelessTraces.Span.t()]}
@@ -79,7 +136,17 @@ defmodule TimelessTraces.Index do
       )
 
     block_info = Enum.map(rows, fn [bid, fp, fmt] -> {bid, fp, to_format_atom(fmt)} end)
-    do_trace_parallel(block_info, db, storage, trace_id)
+
+    with {:ok, disk_spans} <- do_trace_parallel(block_info, db, storage, trace_id) do
+      # A trace's spans can straddle the tail/disk boundary; merge with
+      # span_id dedup (identical spans on both sides).
+      tail_spans =
+        trace_id
+        |> TimelessTraces.HotTail.trace_spans()
+        |> Enum.map(&TimelessTraces.Span.from_map/1)
+
+      {:ok, Enum.uniq_by(disk_spans ++ tail_spans, & &1.span_id)}
+    end
   end
 
   @spec stats() :: {:ok, TimelessTraces.Stats.t()}
@@ -669,6 +736,8 @@ defmodule TimelessTraces.Index do
         cutoff
       ])
 
+    TimelessTraces.HotTail.prune_before(cutoff)
+
     if rows == [] do
       0
     else
@@ -694,13 +763,13 @@ defmodule TimelessTraces.Index do
       {:ok, rows} =
         TimelessTraces.DB.read(
           db,
-          "SELECT block_id, file_path, byte_size FROM blocks ORDER BY ts_min ASC"
+          "SELECT block_id, file_path, byte_size, ts_max FROM blocks ORDER BY ts_min ASC"
         )
 
       {to_delete, _} =
-        Enum.reduce_while(rows, {[], total}, fn [bid, fp, bs], {acc, remaining} ->
+        Enum.reduce_while(rows, {[], total}, fn [bid, fp, bs, ts_max], {acc, remaining} ->
           if remaining > max_bytes do
-            {:cont, {[{bid, fp} | acc], remaining - bs}}
+            {:cont, {[{bid, fp, ts_max} | acc], remaining - bs}}
           else
             {:halt, {acc, remaining}}
           end
@@ -709,9 +778,11 @@ defmodule TimelessTraces.Index do
       if to_delete == [] do
         0
       else
-        block_ids = Enum.map(to_delete, fn {bid, _fp} -> bid end)
-        file_paths = for {_bid, fp} <- to_delete, is_binary(fp), do: fp
+        block_ids = Enum.map(to_delete, fn {bid, _fp, _ts} -> bid end)
+        file_paths = for {_bid, fp, _ts} <- to_delete, is_binary(fp), do: fp
+        max_ts = to_delete |> Enum.map(fn {_bid, _fp, ts} -> ts end) |> Enum.max()
         delete_block_set(db, block_ids)
+        TimelessTraces.HotTail.prune_before(max_ts + 1)
 
         if storage == :disk do
           Enum.each(file_paths, &File.rm/1)
@@ -965,7 +1036,15 @@ defmodule TimelessTraces.Index do
   # as soon as we've accumulated enough filtered entries (offset + limit).
   # This turns an O(all_spans) scan into O(limit) for the common case.
 
-  defp do_query_parallel(block_ids, db, storage, pagination, search_filters) do
+  defp do_query_parallel(
+         db,
+         storage,
+         term_filters,
+         disk_time_filters,
+         pagination,
+         search_filters,
+         opts
+       ) do
     start_time = System.monotonic_time()
 
     limit = Keyword.get(pagination, :limit, @default_limit)
@@ -974,26 +1053,62 @@ defmodule TimelessTraces.Index do
     count_total = Keyword.get(pagination, :count_total, true)
     need = offset + limit
 
+    tail_sorted =
+      opts
+      |> Keyword.get(:tail_entries, [])
+      |> Enum.map(&TimelessTraces.Span.from_map/1)
+      |> sort_spans(order)
+
+    tail_total = Keyword.get(opts, :tail_total, length(tail_sorted))
+    boundary = Keyword.fetch!(opts, :boundary)
+    disk_search_filters = [{:until, boundary - 1} | search_filters]
+
+    # For :desc the tail (all newer than any disk span) fills the page
+    # first; only the remainder needs disk reads.
+    disk_need =
+      if count_total or order == :asc do
+        need
+      else
+        max(need + 1 - length(tail_sorted), 0)
+      end
+
     # Exact totals require reading every matching block. Otherwise the
     # waterline collector stops as soon as no remaining block's time
     # range can intrude on the assembled page — correct pagination even
     # with overlapping blocks, without the old escalate-to-full-scan.
-    {collected, total, blocks_read, halted_early} =
-      if count_total do
-        {c, t, b} =
-          collect_with_early_exit(block_ids, db, storage, search_filters, :all, true, order)
+    {collected, disk_total, blocks_read, halted_early} =
+      cond do
+        disk_need == 0 and not count_total ->
+          {[], 0, 0, true}
 
-        {c, t, b, false}
-      else
-        collect_with_waterline(block_ids, db, storage, search_filters, need, order)
+        count_total ->
+          block_ids = find_matching_blocks(db, term_filters, disk_time_filters, order)
+
+          {c, t, b} =
+            collect_with_early_exit(
+              block_ids,
+              db,
+              storage,
+              disk_search_filters,
+              :all,
+              true,
+              order
+            )
+
+          {c, t, b, false}
+
+        true ->
+          block_ids = find_matching_blocks(db, term_filters, disk_time_filters, order)
+          collect_with_waterline(block_ids, db, storage, disk_search_filters, disk_need, order)
       end
 
     sorted =
       case order do
-        :asc -> Enum.sort_by(collected, & &1.start_time, :asc)
-        :desc -> Enum.sort_by(collected, & &1.start_time, :desc)
+        :asc -> Enum.sort_by(collected ++ tail_sorted, & &1.start_time, :asc)
+        :desc -> Enum.sort_by(tail_sorted ++ collected, & &1.start_time, :desc)
       end
 
+    total = disk_total + tail_total
     page = sorted |> Enum.take(need) |> Enum.drop(offset) |> Enum.take(limit)
 
     has_more =

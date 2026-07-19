@@ -24,7 +24,7 @@ defmodule TimelessTraces.Application do
         {Task.Supervisor, name: TimelessTraces.FlushSupervisor},
         {TimelessTraces.Compactor, data_dir: data_dir, storage: storage},
         {TimelessTraces.Retention, []}
-      ] ++ buffer_shards(data_dir) ++ http_child()
+      ] ++ hot_tail_child() ++ buffer_shards(data_dir) ++ http_child()
 
     opts = [strategy: :one_for_one, name: TimelessTraces.Supervisor]
     Supervisor.start_link(children, opts)
@@ -36,6 +36,10 @@ defmodule TimelessTraces.Application do
       true -> [{TimelessTraces.HTTP, []}]
       opts when is_list(opts) -> [{TimelessTraces.HTTP, opts}]
     end
+  end
+
+  defp hot_tail_child do
+    if TimelessTraces.Config.hot_tail?(), do: [{TimelessTraces.HotTail, []}], else: []
   end
 
   defp buffer_shards(data_dir) do
