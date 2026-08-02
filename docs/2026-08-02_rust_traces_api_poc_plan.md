@@ -1,7 +1,7 @@
 # Rust traces API POC plan
 
 Date: 2026-08-02
-Status: Sessions 0–4 complete; Session 5 ready on `poc/rust-telemetry-data-plane`
+Status: Sessions 0–5 complete; Session 6 ready on `poc/rust-telemetry-data-plane`
 
 This POC tests the same process boundary that succeeded for logs and metrics:
 Rust owns the telemetry HTTP/data plane, while Elixir/Phoenix owns product
@@ -358,28 +358,35 @@ and leave the same reader reusable. Results are recorded in
 
 Apply changes only when Session 4 counters identify the work:
 
-- [ ] Port the logs stable-snapshot pattern to traces: capture candidate block
+- [x] Port the logs stable-snapshot pattern to traces: capture candidate block
       locations and buffer generation under the transition guard, then release
       the guard before safe payload reads, decode, filtering, and JSON work.
-- [ ] Teach traces `xBestIndex`/engine queries exact
+- [x] Teach traces `xBestIndex`/engine queries exact
       `ORDER BY start_ts ASC|DESC LIMIT/OFFSET` intent where SQLite rechecks
       cannot invalidate the bounded prefix.
-- [ ] Prevent whole-result materialization in the traces cursor. Stream blocks
+- [x] Prevent whole-result materialization in the traces cursor. Stream blocks
       or return a versioned packed frame; reject any design retaining
       database-sized payload/result copies.
-- [ ] Add native trace-search, duration/attribute filtering, scalar count, or
+- [x] Add native trace-search, duration/attribute filtering, scalar count, or
       discovery primitives only for measured expensive shapes and expose them
       to direct SQLite/libSQL users.
-- [ ] Evaluate per-block duration aggregates for bucket/overview queries only
+- [x] Evaluate per-block duration aggregates for bucket/overview queries only
       if the existing decode-bound `timeless_trace_buckets` path is material.
-- [ ] Preserve writer fairness already shared from logs and prove forced
+- [x] Preserve writer fairness already shared from logs and prove forced
       flush/optimize/prune publication interleavings remain exact.
-- [ ] Repeat isolated shapes and mixed one/two-query workloads after each
+- [x] Repeat isolated shapes and mixed one/two-query workloads after each
       change; keep or revert independently.
 
-Exit criterion: query CPU no longer blocks writer progress, row-returning
-queries have bounded result memory, scalar queries never construct rowsets,
-and mixed HWM is suitable for an embedded service.
+Exit criterion: satisfied. The public traces cursor streams one block at a
+time, exact ordered limits retain only `LIMIT + OFFSET`, discovery is metadata-
+native, duration filters run inside the engine, and exact bucket percentiles
+retain duration vectors rather than rich span rowsets. Stable snapshots release
+the writer gate before decode/JSON CPU. Fixed 800K read time fell 5.42× and HWM
+fell 70.88%; a 0/1/2-query mixed run sustained 326K/328K/318K durable spans/s.
+Per-block duration aggregates were rejected because the measured API duration
+shape still requires exact row filtering and the public bucket contract also
+requires per-service error counts plus exact p50/p95/p99. Results are recorded
+in `bench/results/2026-08-02_traces_api_session5.md`.
 
 ## Session 6 — Elixir control-plane seam and process isolation
 
