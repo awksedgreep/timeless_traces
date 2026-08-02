@@ -5,6 +5,16 @@ defmodule TimelessTraces.Application do
 
   @impl true
   def start(_type, _args) do
+    opts = [strategy: :one_for_one, name: TimelessTraces.Supervisor]
+    Supervisor.start_link(configured_children(), opts)
+  end
+
+  @doc false
+  def configured_children(owner \\ Application.get_env(:timeless_traces, :owner, :embedded))
+
+  def configured_children(:external), do: []
+
+  def configured_children(:embedded) do
     storage = TimelessTraces.Config.storage()
     data_dir = TimelessTraces.Config.data_dir()
 
@@ -16,19 +26,19 @@ defmodule TimelessTraces.Application do
     TimelessTraces.IngestPressure.install(TimelessTraces.BufferShard.count())
     TimelessTraces.DataPlaneStats.install()
 
-    children =
-      [
-        {Registry, keys: :duplicate, name: TimelessTraces.Registry},
-        {TimelessTraces.DB,
-         name: TimelessTraces.DB, data_dir: data_dir, clean: storage == :memory},
-        {TimelessTraces.Index, data_dir: data_dir, storage: storage, db: TimelessTraces.DB},
-        {Task.Supervisor, name: TimelessTraces.FlushSupervisor},
-        {TimelessTraces.Compactor, data_dir: data_dir, storage: storage},
-        {TimelessTraces.Retention, []}
-      ] ++ hot_tail_child() ++ buffer_shards(data_dir) ++ http_child()
+    [
+      {Registry, keys: :duplicate, name: TimelessTraces.Registry},
+      {TimelessTraces.DB, name: TimelessTraces.DB, data_dir: data_dir, clean: storage == :memory},
+      {TimelessTraces.Index, data_dir: data_dir, storage: storage, db: TimelessTraces.DB},
+      {Task.Supervisor, name: TimelessTraces.FlushSupervisor},
+      {TimelessTraces.Compactor, data_dir: data_dir, storage: storage},
+      {TimelessTraces.Retention, []}
+    ] ++ hot_tail_child() ++ buffer_shards(data_dir) ++ http_child()
+  end
 
-    opts = [strategy: :one_for_one, name: TimelessTraces.Supervisor]
-    Supervisor.start_link(children, opts)
+  def configured_children(owner) do
+    raise ArgumentError,
+          "invalid :timeless_traces :owner #{inspect(owner)}; expected :embedded or :external"
   end
 
   defp http_child do

@@ -38,6 +38,8 @@ defmodule TimelessTraces.Span do
         }
 
   @spec from_map(map()) :: t()
+  def from_map(%__MODULE__{} = span), do: span
+
   def from_map(map) when is_map(map) do
     start_time = map[:start_time] || map["start_time"]
     end_time = map[:end_time] || map["end_time"]

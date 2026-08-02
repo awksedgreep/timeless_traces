@@ -84,6 +84,36 @@ defmodule TimelessTraces.PersistenceTest do
   # ----------------------------------------------------------------
 
   describe "graceful restart recovery" do
+    test "a relocated store rebases block ownership before reads or retention" do
+      relocated = @data_dir <> "_relocated"
+      File.rm_rf!(relocated)
+      on_exit(fn -> File.rm_rf!(relocated) end)
+
+      start_app()
+      trace_id = "00112233445566778899aabbccddeeff"
+
+      {:ok, meta, _terms, _trace_rows} =
+        ingest_spans([make_span(%{trace_id: trace_id, name: "relocated owner"})])
+
+      TimelessTraces.Index.sync()
+      stop_app()
+      File.cp_r!(@data_dir, relocated)
+
+      original_block = meta.file_path
+      relocated_block = Path.join([relocated, "blocks", Path.basename(original_block)])
+      assert File.regular?(original_block)
+      assert File.regular?(relocated_block)
+
+      start_app(data_dir: relocated)
+
+      assert {:ok, [%TimelessTraces.Span{name: "relocated owner"}]} =
+               TimelessTraces.Index.trace(trace_id)
+
+      assert TimelessTraces.Index.delete_blocks_before(System.system_time(:nanosecond) + 1) >= 1
+      assert File.regular?(original_block)
+      refute File.exists?(relocated_block)
+    end
+
     test "data survives app restart via SQLite" do
       start_app()
 

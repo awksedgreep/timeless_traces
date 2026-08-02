@@ -4,6 +4,27 @@ defmodule TimelessTraces.SpanTest do
   alias TimelessTraces.Span
 
   describe "from_map/1" do
+    test "is idempotent for an already decoded rich span" do
+      span = %Span{
+        trace_id: "00112233445566778899aabbccddeeff",
+        span_id: "0102030405060708",
+        parent_span_id: nil,
+        name: "decoded",
+        kind: :server,
+        start_time: 10,
+        end_time: 20,
+        duration_ns: 10,
+        status: :error,
+        status_message: "failure",
+        attributes: %{"retryable" => true},
+        events: [%{"name" => "exception"}],
+        resource: %{"service.name" => "api"},
+        instrumentation_scope: %{"name" => "test", "version" => "1"}
+      }
+
+      assert Span.from_map(span) === span
+    end
+
     test "creates span from atom-keyed map" do
       span =
         Span.from_map(%{
