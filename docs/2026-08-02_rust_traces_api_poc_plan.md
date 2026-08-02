@@ -1,7 +1,7 @@
 # Rust traces API POC plan
 
 Date: 2026-08-02
-Status: Sessions 0–1 complete; Session 2 ready on `poc/rust-telemetry-data-plane`
+Status: Sessions 0–2 complete; Session 3 ready on `poc/rust-telemetry-data-plane`
 
 This POC tests the same process boundary that succeeded for logs and metrics:
 Rust owns the telemetry HTTP/data plane, while Elixir/Phoenix owns product
@@ -286,24 +286,26 @@ compatibility, and crash evidence, are recorded in
 
 ## Session 2 — Build the descriptive Rust server shell
 
-- [ ] Add `poc/timeless-traces-api`; do not create `timeless-api` or share
+- [x] Add `poc/timeless-traces-api`; do not create `timeless-api` or share
       metrics/logs route modules prematurely.
-- [ ] Load the extension, create/connect one traces vtab, and use the same
+- [x] Load the extension, create/connect one traces vtab, and use the same
       vtab arguments/retention contract as direct callers.
-- [ ] Start one ordered writer and a configurable bounded reader pool, with two
+- [x] Start one ordered writer and a configurable bounded reader pool, with two
       readers only as a provisional correctness default.
-- [ ] Add a bounded command queue and exact request/span/body watermarks.
-- [ ] Add liveness, readiness, stats, and completion-aware flush endpoints.
-- [ ] Acquire an owner lease before SQLite, reject a second owner, and expose a
+- [x] Add a bounded command queue and exact request/span/body watermarks.
+- [x] Add liveness, readiness, stats, and completion-aware flush endpoints.
+- [x] Acquire an owner lease before SQLite, reject a second owner, and expose a
       clear capability/version mismatch before accepting traffic.
-- [ ] Handle `SIGINT`/`SIGTERM` through stop-admission, drain, flush,
+- [x] Handle `SIGINT`/`SIGTERM` through stop-admission, drain, flush,
       checkpoint, and child exit. Keep kill-9 semantics honest: flushed data is
       durable; the admitted unflushed tail may be lost but must never corrupt.
-- [ ] Pin oversized-body pre-admission rejection, queue saturation, shutdown,
+- [x] Pin oversized-body pre-admission rejection, queue saturation, shutdown,
       restart, and cold reopen with extension-backed tests.
 
-Exit criterion: the binary owns lifecycle and durability correctly before it
-implements OTLP or Jaeger routes. No benchmark-only storage exists.
+Exit criterion: satisfied. The traces-specific binary owns lifecycle and
+durability before OTLP or Jaeger implementation, and every test reaches the
+public extension rather than benchmark-only storage. Evidence is recorded in
+`bench/results/2026-08-02_traces_api_session2.md`.
 
 ## Session 3 — OTLP JSON/protobuf ingest through the public batch
 
