@@ -1,7 +1,7 @@
 # Rust traces API POC plan
 
 Date: 2026-08-02
-Status: Sessions 0–2 complete; Session 3 ready on `poc/rust-telemetry-data-plane`
+Status: Sessions 0–3 complete; Session 4 ready on `poc/rust-telemetry-data-plane`
 
 This POC tests the same process boundary that succeeded for logs and metrics:
 Rust owns the telemetry HTTP/data plane, while Elixir/Phoenix owns product
@@ -309,23 +309,25 @@ public extension rather than benchmark-only storage. Evidence is recorded in
 
 ## Session 3 — OTLP JSON/protobuf ingest through the public batch
 
-- [ ] Implement OTLP JSON, protobuf, and gzip parsing with the pinned Session 0
+- [x] Implement OTLP JSON, protobuf, and gzip parsing with the pinned Session 0
       validation and response behavior.
-- [ ] Enforce the 10 MiB limit before admission and a decompressed-size limit
+- [x] Enforce the 10 MiB limit before admission and a decompressed-size limit
       for gzip so compressed bodies cannot bypass memory bounds.
-- [ ] Parse one complete request, encode one rich columnar batch, and execute
+- [x] Parse one complete request, encode one rich columnar batch, and execute
       one hidden-column insert. Keep the extension's 8,192-span flush intact.
-- [ ] Return the current `ExportTraceServiceResponse` shape and exact accepted/
+- [x] Return the current `ExportTraceServiceResponse` shape and exact accepted/
       rejected accounting; never silently accept data the writer later loses.
-- [ ] Prove root/child IDs, all kinds/statuses, typed attributes, events,
+- [x] Prove root/child IDs, all kinds/statuses, typed attributes, events,
       resources, scope, status description, timestamps, and malformed bodies.
-- [ ] Run direct-extension, Rust HTTP, and Elixir control no-query comparisons,
+- [x] Run direct-extension, Rust HTTP, and Elixir control no-query comparisons,
       including parser/batch/SQLite phase attribution, queue drain, storage,
       and HWM.
 
-Exit criterion: both wire formats persist the exact rich fixture after flush
-and reopen, with bounded request memory, one statement/request, zero hidden
-per-span SQL, and honest completion.
+Exit criterion: satisfied. All three wire encodings persist the exact rich
+fixture after flush/reopen with bounded raw/decompressed bodies, one public
+batch statement per request, no per-span SQL, and a `200` that covers SQLite
+completion. Results are recorded in
+`bench/results/2026-08-02_traces_api_session3.md`.
 
 ## Session 4 — Jaeger discovery, trace lookup, and search parity
 
