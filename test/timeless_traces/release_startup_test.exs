@@ -8,7 +8,11 @@ defmodule TimelessTraces.ReleaseStartupTest do
     on_exit(fn -> File.rm_rf!(root) end)
 
     assert {:ok, %{state: :fresh}} = ReleaseStartup.detect(root, opts())
-    assert {:ok, %{state: :valid_libsql, ready: true}} = ReleaseStartup.prepare(root, opts())
+
+    assert {:ok, %{state: :valid_libsql, ready: true, target_path: target}} =
+             ReleaseStartup.prepare(root, opts())
+
+    assert_retention(target, 7 * 86_400 * 1_000_000_000)
     assert {:ok, %{state: :valid_libsql, ready: true}} = ReleaseStartup.prepare(root, opts())
 
     incompatible = LegacyReaderTest.temp_dir("traces_startup_incompatible_extension")
@@ -18,6 +22,21 @@ defmodule TimelessTraces.ReleaseStartupTest do
              ReleaseStartup.prepare(incompatible, extension_path: "/missing/timeless-ext.so")
 
     refute File.exists?(Path.join(incompatible, "traces.db"))
+  end
+
+  test "fresh startup persists the configured retention in the public virtual table" do
+    root = LegacyReaderTest.temp_dir("traces_startup_retention")
+    on_exit(fn -> File.rm_rf!(root) end)
+
+    assert {:ok, %{target_path: target}} =
+             ReleaseStartup.prepare(root, Keyword.put(opts(), :retention_seconds, 90))
+
+    assert_retention(target, 90 * 1_000_000_000)
+
+    assert {:ok, %{state: :incompatible_version, error: error}} =
+             ReleaseStartup.detect(root, opts())
+
+    assert error =~ "retention mismatch"
   end
 
   test "rich legacy spans resume, seal, rename, and retain an exact rollback source" do
@@ -251,7 +270,13 @@ defmodule TimelessTraces.ReleaseStartupTest do
   end
 
   defp create_target(path) do
-    {:ok, writer} = LibsqlCandidate.start_link(path: path, extension_path: extension_path())
+    {:ok, writer} =
+      LibsqlCandidate.start_link(
+        path: path,
+        extension_path: extension_path(),
+        retention_seconds: 7 * 86_400
+      )
+
     GenServer.stop(writer)
   end
 
@@ -294,13 +319,28 @@ defmodule TimelessTraces.ReleaseStartupTest do
     end
   end
 
+  defp assert_retention(path, expected) do
+    assert {:ok, conn, _} = LibsqlCandidate.open_readonly_connection(path, extension_path())
+
+    try do
+      assert {:ok, [[^expected]]} =
+               DB.execute(
+                 conn,
+                 "SELECT CAST(v AS INTEGER) FROM traces_meta WHERE k='retention'",
+                 []
+               )
+    after
+      Exqlite.Sqlite3.close(conn)
+    end
+  end
+
   defp load_extension(conn) do
     :ok = Exqlite.Sqlite3.enable_load_extension(conn, true)
     assert {:ok, _} = DB.execute(conn, "SELECT load_extension(?1)", [extension_path()])
     :ok = Exqlite.Sqlite3.enable_load_extension(conn, false)
   end
 
-  defp opts, do: [extension_path: extension_path()]
+  defp opts, do: [extension_path: extension_path(), retention_seconds: 7 * 86_400]
 
   defp extension_path do
     System.get_env("TIMELESS_EXT_PATH") ||
