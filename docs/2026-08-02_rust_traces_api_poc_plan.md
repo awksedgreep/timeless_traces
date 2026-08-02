@@ -1,7 +1,7 @@
 # Rust traces API POC plan
 
 Date: 2026-08-02
-Status: Sessions 0–6 complete; Session 7 ready on `poc/rust-telemetry-data-plane`
+Status: Sessions 0–7 complete on `poc/rust-telemetry-data-plane`; POC kept for artifact/release promotion
 
 This POC tests the same process boundary that succeeded for logs and metrics:
 Rust owns the telemetry HTTP/data plane, while Elixir/Phoenix owns product
@@ -418,29 +418,31 @@ at p95 and the OTP owner used 109,304 bytes. Results are recorded in
 
 ## Session 7 — Scheduling, maintenance, and final verdict
 
-- [ ] Sweep one/two/four/eight readers after functional/query fixes.
-- [ ] Run zero/one/two-query workloads, every included read shape,
+- [x] Sweep one/two/four/eight readers after functional/query fixes.
+- [x] Run zero/one/two-query workloads, every included read shape,
       maintenance under load, final drain, HWM, and fixed response parity.
-- [ ] Measure raw compression and compressed merging separately. Reuse the
+- [x] Measure raw compression and compressed merging separately. Reuse the
       logs size-tiered/budgeted optimize policy only if traces currently shows
       rewrite amplification; do not assume it does.
-- [ ] Exercise real expiration, SQLite page high-water/reuse, WAL checkpoint,
+- [x] Exercise real expiration, SQLite page high-water/reuse, WAL checkpoint,
       and explicit offline vacuum separately. Do not call logical optimize a
       physical shrink.
-- [ ] Add API admission fairness or host transaction grouping only if queue,
+- [x] Add API admission fairness or host transaction grouping only if queue,
       writer-wait, and completion evidence identifies a real problem.
-- [ ] Compare final Rust API/libSQL with the current Elixir API/block store and
+- [x] Compare final Rust API/libSQL with the current Elixir API/block store and
       direct extension on the same host. Preserve honest cases where the
       existing block engine or a plain index wins.
-- [ ] Run the full traces/dashboard suites, Rust workspace/Clippy, extension
+- [x] Run the full traces/dashboard suites, Rust workspace/Clippy, extension
       SQL/CLI/oracle/crash suite, rich-span contracts, HTTP fixtures,
       cancellation, owner lease, and child-restart gates.
-- [ ] Record keep/reject, measured reader default, declared API subset, and the
+- [x] Record keep/reject, measured reader default, declared API subset, and the
       exact next product/release boundary.
 
-Exit criterion: a process-boundary decision based on exact field and wire
-compatibility, durable completed work, bounded tails/memory, operational
-isolation, and honest physical storage behavior.
+Exit criterion: satisfied. The process boundary is kept based on exact field
+and wire compatibility, durable completed work, bounded tails/memory,
+operational isolation, and honest physical storage behavior. Measurements,
+keep/reject decisions, and the exact promotion boundary are recorded in
+`bench/results/2026-08-02_traces_api_session7.md`.
 
 ## Explicitly deferred from the POC
 
