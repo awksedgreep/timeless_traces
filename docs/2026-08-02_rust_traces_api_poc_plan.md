@@ -1,7 +1,7 @@
 # Rust traces API POC plan
 
 Date: 2026-08-02
-Status: Sessions 0–5 complete; Session 6 ready on `poc/rust-telemetry-data-plane`
+Status: Sessions 0–6 complete; Session 7 ready on `poc/rust-telemetry-data-plane`
 
 This POC tests the same process boundary that succeeded for logs and metrics:
 Rust owns the telemetry HTTP/data plane, while Elixir/Phoenix owns product
@@ -390,26 +390,31 @@ in `bench/results/2026-08-02_traces_api_session5.md`.
 
 ## Session 6 — Elixir control-plane seam and process isolation
 
-- [ ] Reuse the proven metrics OTP child lifecycle mechanics, but keep a
+- [x] Reuse the proven metrics OTP child lifecycle mechanics, but keep a
       traces-specific HTTP client/data source.
-- [ ] Decide after three signals whether the identical executable supervision
+- [x] Decide after three signals whether the identical executable supervision
       code should become a small shared `TelemetryDataPlane.Process`; do not
       merge signal-specific clients or route semantics.
-- [ ] Switch one real `TimelessTracesDashboard` historical search and one
+- [x] Switch one real `TimelessTracesDashboard` historical search and one
       trace-detail lookup behind an opt-in data-plane source. Keep dashboard
       session/state/rendering in Phoenix.
-- [ ] Make a complete response all-or-error; invalid JSON, truncated bodies,
+- [x] Make a complete response all-or-error; invalid JSON, truncated bodies,
       disconnects, and child restarts never become partial trace waterfalls.
-- [ ] Force `SIGKILL`, prove OTP restart without a BEAM/dashboard crash, and
+- [x] Force `SIGKILL`, prove OTP restart without a BEAM/dashboard crash, and
       recover the exact flushed trace. Prove normal OTP shutdown sends
       `SIGTERM`, drains, flushes, reaps the child, and leaves no orphan.
-- [ ] Keep live tail, alerts, backup UI, token policy, and cluster state out of
+- [x] Keep live tail, alerts, backup UI, token policy, and cluster state out of
       this POC seam unless a historical-query integration cannot be tested
       without them.
 
-Exit criterion: one real dashboard search/detail path crosses the boundary
-with exact results and negligible supervision overhead; both abnormal and
-normal lifecycle ownership are proven.
+Exit criterion: satisfied. The real LiveDashboard Page search and trace-detail
+callbacks cross an opt-in, lossless native HTTP surface while Phoenix retains
+state/rendering and all deferred concerns. Complete-response regressions reject
+invalid/truncated/disconnected data atomically. `SIGKILL` restarted in 20.089
+ms with the exact flushed trace; normal OTP stop flushed an admitted tail,
+reaped the OS child, and reopened exactly. The supervised endpoint added 12 us
+at p95 and the OTP owner used 109,304 bytes. Results are recorded in
+`bench/results/2026-08-02_traces_api_session6.md`.
 
 ## Session 7 — Scheduling, maintenance, and final verdict
 
