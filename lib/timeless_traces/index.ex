@@ -470,6 +470,7 @@ defmodule TimelessTraces.Index do
   def handle_call({:index_block, meta, terms, trace_rows}, _from, state) do
     state = flush_pending(state)
     do_index_block(state.db, state.storage, meta, terms, trace_rows)
+    TimelessTraces.DataPlaneStats.complete_spans(meta.entry_count)
     {:reply, :ok, state}
   end
 
@@ -1013,6 +1014,9 @@ defmodule TimelessTraces.Index do
       _ ->
         :ok
     end)
+
+    completed = Enum.reduce(resolved, 0, fn {meta, _, _, _}, acc -> acc + meta.entry_count end)
+    TimelessTraces.DataPlaneStats.complete_spans(completed)
 
     if state.flush_timer do
       Process.cancel_timer(state.flush_timer)

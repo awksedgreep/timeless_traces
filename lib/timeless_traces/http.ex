@@ -117,12 +117,15 @@ defmodule TimelessTraces.HTTP do
   # Health check (no auth required)
   get "/health" do
     {:ok, stats} = TimelessTraces.stats()
+    data_plane = TimelessTraces.DataPlaneStats.snapshot()
 
     json_resp(req, 200, %{
       status: "ok",
       blocks: stats.total_blocks,
       spans: stats.total_entries,
-      disk_size: stats.disk_size
+      disk_size: stats.disk_size,
+      index_size: stats.index_size,
+      data_plane: data_plane
     })
   end
 
@@ -262,7 +265,8 @@ defmodule TimelessTraces.HTTP do
 
       :ok ->
         TimelessTraces.flush()
-        json_resp(req, 200, %{status: "ok"})
+        TimelessTraces.DataPlaneStats.mark_requests_drained()
+        json_resp(req, 200, %{status: "ok", data_plane: TimelessTraces.DataPlaneStats.snapshot()})
     end
   end
 
@@ -644,13 +648,18 @@ defmodule TimelessTraces.HTTP do
             TimelessTraces.Buffer.ingest(spans)
           end
 
+          TimelessTraces.DataPlaneStats.admit_request(byte_size(body))
+
           Rocket.Response.send_resp(req, 200, ~s({"partialSuccess":{}}))
 
         _ ->
+          TimelessTraces.DataPlaneStats.reject_request()
           json_error(req, 400, "missing resourceSpans field")
       end
     rescue
-      _ -> json_error(req, 400, "invalid JSON")
+      _ ->
+        TimelessTraces.DataPlaneStats.reject_request()
+        json_error(req, 400, "invalid JSON")
     end
   end
 
@@ -670,10 +679,13 @@ defmodule TimelessTraces.HTTP do
         TimelessTraces.Buffer.ingest(spans)
       end
 
+      TimelessTraces.DataPlaneStats.admit_request(byte_size(req.body))
+
       Rocket.Response.send_resp(req, 200, ~s({"partialSuccess":{}}))
     rescue
       e ->
         Logger.warning("Protobuf decode error: #{inspect(e)}")
+        TimelessTraces.DataPlaneStats.reject_request()
         json_error(req, 400, "invalid protobuf")
     end
   end

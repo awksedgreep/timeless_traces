@@ -1,7 +1,7 @@
 # Rust traces API POC plan
 
 Date: 2026-08-02
-Status: Session 0 ready on `poc/rust-telemetry-data-plane`
+Status: Session 0 complete; Session 1 ready on `poc/rust-telemetry-data-plane`
 
 This POC tests the same process boundary that succeeded for logs and metrics:
 Rust owns the telemetry HTTP/data plane, while Elixir/Phoenix owns product
@@ -224,23 +224,23 @@ for the HTTP control.
 
 ## Session 0 — Pin the real control and compatibility contract
 
-- [ ] Add one black-box data-plane fixture for both the current Elixir HTTP
+- [x] Add one black-box data-plane fixture for both the current Elixir HTTP
       service and the future Rust server.
-- [ ] Pin rich OTLP JSON, protobuf, and gzip ingest, including the fields the
+- [x] Pin rich OTLP JSON, protobuf, and gzip ingest, including the fields the
       current extension cannot yet preserve.
-- [ ] Pin decoded Jaeger services, operations, trace lookup, and trace-search
+- [x] Pin decoded Jaeger services, operations, trace lookup, and trace-search
       responses; record intentional ordering normalization separately from
       semantic equality.
-- [ ] Inventory current OTLP fields and Jaeger parameters as preserved,
+- [x] Inventory current OTLP fields and Jaeger parameters as preserved,
       normalized, rejected, or ignored. Do not label the subset “compatible”
       without this table.
-- [ ] Make `container_http_workload.exs` deterministic and completion-aware.
+- [x] Make `container_http_workload.exs` deterministic and completion-aware.
       Stop reporting a successful HTTP response as durable span throughput.
-- [ ] Add additive control health/flush counters needed to observe admitted,
+- [x] Add additive control health/flush counters needed to observe admitted,
       completed, queued, in-flight, rejected, and drained work.
-- [ ] Capture current Elixir zero/one/two-query baselines with maintenance
+- [x] Capture current Elixir zero/one/two-query baselines with maintenance
       deferred, every query-shape p95/p99, storage size, and HWM.
-- [ ] Capture direct extension v0 batch ingest and the currently supported
+- [x] Capture direct extension v0 batch ingest and the currently supported
       ten-column query shapes on the same core-span subset.
 
 Artifacts:
@@ -250,8 +250,10 @@ Artifacts:
 - `bench/results/2026-08-02_traces_api_session0.md`; and
 - a checked compatibility inventory in that result.
 
-Exit criterion: the current API/storage result is executable and exact, and no
-subsequent Rust number can confuse admission, durability, or lost span fields.
+Exit criterion: satisfied. The current API/storage result is executable and
+exact, and no subsequent Rust number can confuse admission, durability, or
+lost span fields. Results are recorded in
+`bench/results/2026-08-02_traces_api_session0.md`.
 
 ## Session 1 — Close libSQL span-fidelity parity
 

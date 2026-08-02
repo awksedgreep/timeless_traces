@@ -30,6 +30,7 @@ defmodule TimelessTraces.Buffer do
     # Producer-side tail insert makes spans queryable the moment this
     # function returns, independent of shard mailbox latency.
     TimelessTraces.HotTail.insert_many(spans)
+    TimelessTraces.DataPlaneStats.admit_spans(length(spans))
 
     spans
     |> Enum.group_by(&TimelessTraces.BufferShard.shard_for/1)
@@ -74,6 +75,12 @@ defmodule TimelessTraces.Buffer do
 
   @spec flush() :: :ok
   def flush do
+    target = TimelessTraces.DataPlaneStats.snapshot().admitted_spans
+    deadline = System.monotonic_time(:millisecond) + TimelessTraces.Config.query_timeout()
+    drain_to(target, deadline)
+  end
+
+  defp drain_to(target, deadline) do
     for shard <- 0..(TimelessTraces.BufferShard.count() - 1) do
       GenServer.call(
         TimelessTraces.BufferShard.name(shard),
@@ -82,7 +89,26 @@ defmodule TimelessTraces.Buffer do
       )
     end
 
-    :ok
+    # Buffer tasks publish block metadata asynchronously. A flush is not a
+    # durability barrier until that index mailbox is committed as well.
+    TimelessTraces.Index.sync()
+
+    stats = TimelessTraces.DataPlaneStats.snapshot()
+
+    if stats.queued_spans == 0 and stats.in_flight_spans == 0 and
+         stats.completed_spans + stats.failed_spans >= target do
+      :ok
+    else
+      if System.monotonic_time(:millisecond) >= deadline do
+        raise "TimelessTraces flush timed out before durable drain: #{inspect(stats)}"
+      end
+
+      # Calls from this process can overtake casts sent by independent HTTP
+      # processes. Repeat after a short yield until the producer-side gauge
+      # and durable completion counter agree.
+      Process.sleep(5)
+      drain_to(target, deadline)
+    end
   end
 
   @impl true
@@ -199,10 +225,16 @@ defmodule TimelessTraces.Buffer do
     data_dir = state.data_dir
     shard = state.shard
     caller = self()
+    entry_count = length(entries)
+    TimelessTraces.DataPlaneStats.flush_started(entry_count)
 
     Task.Supervisor.start_child(TimelessTraces.FlushSupervisor, fn ->
-      do_flush_work(entries, data_dir, shard: shard)
-      send(caller, {:flush_done, make_ref()})
+      try do
+        do_flush_work(entries, data_dir, shard: shard)
+      after
+        TimelessTraces.DataPlaneStats.flush_finished(entry_count)
+        send(caller, {:flush_done, make_ref()})
+      end
     end)
 
     %{state | in_flight: state.in_flight + 1}
@@ -261,6 +293,7 @@ defmodule TimelessTraces.Buffer do
       {:error, reason} ->
         Logger.error("TimelessTraces: failed to write block: #{inspect(reason)}")
         credit_gauge_on_drop(opts, entries)
+        TimelessTraces.DataPlaneStats.fail_spans(length(entries))
 
         TimelessTraces.Telemetry.event(
           [:timeless_traces, :flush, :error],
@@ -275,6 +308,7 @@ defmodule TimelessTraces.Buffer do
       )
 
       credit_gauge_on_drop(opts, entries)
+      TimelessTraces.DataPlaneStats.fail_spans(length(entries))
 
       TimelessTraces.Telemetry.event(
         [:timeless_traces, :flush, :error],

@@ -14,6 +14,7 @@ defmodule TimelessTraces.Application do
     end
 
     TimelessTraces.IngestPressure.install(TimelessTraces.BufferShard.count())
+    TimelessTraces.DataPlaneStats.install()
 
     children =
       [

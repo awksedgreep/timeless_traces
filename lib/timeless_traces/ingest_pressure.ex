@@ -16,7 +16,9 @@ defmodule TimelessTraces.IngestPressure do
 
   @spec install(pos_integer()) :: :ok
   def install(shard_count) do
-    ref = :atomics.new(shard_count + 1, [])
+    # One queued-span counter and one oldest-enqueue timestamp per shard,
+    # followed by the compactor's raw-debt gauge.
+    ref = :atomics.new(shard_count * 2 + 1, [])
     :persistent_term.put(@key, {ref, shard_count})
     :ok
   end
@@ -28,20 +30,35 @@ defmodule TimelessTraces.IngestPressure do
   # queued in the mailbox, which is exactly where overload accumulates.
   @spec add(non_neg_integer(), pos_integer()) :: :ok
   def add(shard, n) do
-    {ref, _count} = :persistent_term.get(@key)
-    :atomics.add(ref, shard + 1, n)
+    {ref, count} = :persistent_term.get(@key)
+    new_value = :atomics.add_get(ref, shard + 1, n)
+
+    if new_value == n do
+      :atomics.put(ref, oldest_slot(count, shard), System.system_time(:millisecond))
+    end
+
+    :ok
   end
 
   @spec sub(non_neg_integer(), pos_integer()) :: :ok
   def sub(shard, n) do
-    {ref, _count} = :persistent_term.get(@key)
-    :atomics.sub(ref, shard + 1, n)
+    {ref, count} = :persistent_term.get(@key)
+    new_value = :atomics.sub_get(ref, shard + 1, n)
+
+    if new_value <= 0 do
+      :atomics.put(ref, shard + 1, 0)
+      :atomics.put(ref, oldest_slot(count, shard), 0)
+    end
+
+    :ok
   end
 
   @spec reset(non_neg_integer()) :: :ok
   def reset(shard) do
-    {ref, _count} = :persistent_term.get(@key)
+    {ref, count} = :persistent_term.get(@key)
     :atomics.put(ref, shard + 1, 0)
+    :atomics.put(ref, oldest_slot(count, shard), 0)
+    :ok
   end
 
   @spec queued(non_neg_integer()) :: non_neg_integer()
@@ -53,13 +70,14 @@ defmodule TimelessTraces.IngestPressure do
   @spec set_raw_debt(non_neg_integer()) :: :ok
   def set_raw_debt(bytes) do
     {ref, count} = :persistent_term.get(@key)
-    :atomics.put(ref, count + 1, bytes)
+    :atomics.put(ref, raw_debt_slot(count), bytes)
+    :ok
   end
 
   @spec raw_debt() :: non_neg_integer()
   def raw_debt do
     {ref, count} = :persistent_term.get(@key)
-    :atomics.get(ref, count + 1)
+    :atomics.get(ref, raw_debt_slot(count))
   end
 
   @spec overloaded?(non_neg_integer()) :: boolean()
@@ -73,4 +91,40 @@ defmodule TimelessTraces.IngestPressure do
     {_ref, count} = :persistent_term.get(@key)
     Enum.any?(0..(count - 1), &overloaded?/1)
   end
+
+  @spec snapshot() :: %{
+          queued_spans: non_neg_integer(),
+          oldest_queue_age_ms: non_neg_integer(),
+          raw_debt_bytes: non_neg_integer(),
+          overloaded: boolean()
+        }
+  def snapshot do
+    {ref, count} = :persistent_term.get(@key)
+    now_ms = System.system_time(:millisecond)
+
+    {queued_spans, oldest_ms} =
+      Enum.reduce(0..(count - 1), {0, nil}, fn shard, {queued_acc, oldest_acc} ->
+        queued = :atomics.get(ref, shard + 1)
+        enqueued_at = :atomics.get(ref, oldest_slot(count, shard))
+
+        oldest =
+          if queued > 0 and enqueued_at > 0 do
+            if oldest_acc == nil, do: enqueued_at, else: min(oldest_acc, enqueued_at)
+          else
+            oldest_acc
+          end
+
+        {queued_acc + queued, oldest}
+      end)
+
+    %{
+      queued_spans: queued_spans,
+      oldest_queue_age_ms: if(oldest_ms, do: max(now_ms - oldest_ms, 0), else: 0),
+      raw_debt_bytes: raw_debt(),
+      overloaded: any_overloaded?()
+    }
+  end
+
+  defp oldest_slot(count, shard), do: count + shard + 1
+  defp raw_debt_slot(count), do: count * 2 + 1
 end
