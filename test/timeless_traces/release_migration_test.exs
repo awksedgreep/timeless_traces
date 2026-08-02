@@ -1,15 +1,15 @@
 defmodule TimelessTraces.ReleaseMigrationTest do
   use ExUnit.Case, async: false
 
-  alias TimelessTraces.{DB, LegacyReaderTest, LibsqlCandidate}
+  alias TimelessTraces.{DB, LegacyReaderFixture, LibsqlCandidate}
 
   test "rich spans resume across every 8,192 checkpoint crash boundary with exact relationships" do
-    root = LegacyReaderTest.temp_dir("traces_release_migration")
+    root = LegacyReaderFixture.temp_dir("traces_release_migration")
     on_exit(fn -> File.rm_rf!(root) end)
     File.mkdir_p!(Path.join(root, "blocks"))
-    spans = LegacyReaderTest.fixtures(8_193)
-    block = LegacyReaderTest.write_block(root, spans, :raw)
-    LegacyReaderTest.create_sqlite_index(root, [block])
+    spans = LegacyReaderFixture.fixtures(8_193)
+    block = LegacyReaderFixture.write_block(root, spans, :raw)
+    LegacyReaderFixture.create_sqlite_index(root, [block])
     before = source_snapshot(root)
 
     assert {:error, disk_error} = TimelessTraces.ReleaseMigration.stage(root, available_bytes: 0)
@@ -116,12 +116,12 @@ defmodule TimelessTraces.ReleaseMigrationTest do
   end
 
   test "snapshot plus disk-log traces generation reaches the same cold oracle" do
-    root = LegacyReaderTest.temp_dir("traces_snapshot_migration")
+    root = LegacyReaderFixture.temp_dir("traces_snapshot_migration")
     on_exit(fn -> File.rm_rf!(root) end)
     File.mkdir_p!(Path.join(root, "blocks"))
-    [first, second, third | _] = LegacyReaderTest.fixtures(3)
-    old = LegacyReaderTest.write_block(root, [first], :raw)
-    replacement = LegacyReaderTest.write_block(root, [second, third], :zstd)
+    [first, second, third | _] = LegacyReaderFixture.fixtures(3)
+    old = LegacyReaderFixture.write_block(root, [first], :raw)
+    replacement = LegacyReaderFixture.write_block(root, [second, third], :zstd)
 
     File.write!(
       Path.join(root, "index.snapshot"),
@@ -129,7 +129,7 @@ defmodule TimelessTraces.ReleaseMigrationTest do
         %{
           version: 1,
           timestamp: 100,
-          blocks: [LegacyReaderTest.block_row(old)],
+          blocks: [LegacyReaderFixture.block_row(old)],
           term_index: [],
           trace_index: [],
           compression_stats: [],
@@ -154,7 +154,7 @@ defmodule TimelessTraces.ReleaseMigrationTest do
     :ok =
       :disk_log.log(
         name,
-        {:index_block, 102, LegacyReaderTest.block_map(replacement), [], []}
+        {:index_block, 102, LegacyReaderFixture.block_map(replacement), [], []}
       )
 
     :ok = :disk_log.sync(name)
@@ -173,13 +173,13 @@ defmodule TimelessTraces.ReleaseMigrationTest do
   end
 
   test "inconsistent rich span end-time fails closed instead of dropping fidelity" do
-    root = LegacyReaderTest.temp_dir("traces_invalid_rich_span")
+    root = LegacyReaderFixture.temp_dir("traces_invalid_rich_span")
     on_exit(fn -> File.rm_rf!(root) end)
     File.mkdir_p!(Path.join(root, "blocks"))
-    [span | _] = LegacyReaderTest.fixtures(1)
+    [span | _] = LegacyReaderFixture.fixtures(1)
     span = %{span | end_time: span.end_time + 1}
-    block = LegacyReaderTest.write_block(root, [span], :raw)
-    LegacyReaderTest.create_sqlite_index(root, [block])
+    block = LegacyReaderFixture.write_block(root, [span], :raw)
+    LegacyReaderFixture.create_sqlite_index(root, [block])
     before = source_snapshot(root)
 
     assert {:error, error} =
@@ -191,11 +191,11 @@ defmodule TimelessTraces.ReleaseMigrationTest do
   end
 
   test "fresh migration reports scan, public write, maintenance, storage, and HWM costs" do
-    root = LegacyReaderTest.temp_dir("traces_release_migration_benchmark")
+    root = LegacyReaderFixture.temp_dir("traces_release_migration_benchmark")
     on_exit(fn -> File.rm_rf!(root) end)
     File.mkdir_p!(Path.join(root, "blocks"))
-    block = LegacyReaderTest.write_block(root, LegacyReaderTest.fixtures(8_193), :raw)
-    LegacyReaderTest.create_sqlite_index(root, [block])
+    block = LegacyReaderFixture.write_block(root, LegacyReaderFixture.fixtures(8_193), :raw)
+    LegacyReaderFixture.create_sqlite_index(root, [block])
 
     assert {:ok, report} =
              TimelessTraces.ReleaseMigration.stage(root, extension_path: extension_path())
@@ -232,7 +232,7 @@ defmodule TimelessTraces.ReleaseMigrationTest do
 
   defp source_snapshot(root) do
     root
-    |> LegacyReaderTest.regular_files()
+    |> LegacyReaderFixture.regular_files()
     |> Enum.reject(&String.contains?(&1, "/.timeless-migration/"))
     |> Enum.sort()
     |> Enum.map(fn path ->
