@@ -1,7 +1,7 @@
 # Rust traces API POC plan
 
 Date: 2026-08-02
-Status: Session 0 complete; Session 1 ready on `poc/rust-telemetry-data-plane`
+Status: Sessions 0–1 complete; Session 2 ready on `poc/rust-telemetry-data-plane`
 
 This POC tests the same process boundary that succeeded for logs and metrics:
 Rust owns the telemetry HTTP/data plane, while Elixir/Phoenix owns product
@@ -257,28 +257,32 @@ lost span fields. Results are recorded in
 
 ## Session 1 — Close libSQL span-fidelity parity
 
-- [ ] Extend the public vtab schema additively for status description, events,
+- [x] Extend the public vtab schema additively for status description, events,
       resource attributes, and instrumentation scope. Preserve typed JSON
       values; do not hide them in a server-private blob.
-- [ ] Decide and document the current product behavior for OTLP links and other
+- [x] Decide and document the current product behavior for OTLP links and other
       presently ignored fields before changing it.
-- [ ] Add a versioned traces batch revision for the rich span shape while
+- [x] Add a versioned traces batch revision for the rich span shape while
       keeping batch v0 and existing block generations readable.
-- [ ] Evolve the span codec compatibly. Old blocks return documented defaults;
+- [x] Evolve the span codec compatibly. Old blocks return documented defaults;
       new blocks survive optimize and reopen without lossy conversion.
-- [ ] Derive/index `service.name` consistently from resource/span attributes
+- [x] Derive/index `service.name` consistently from resource/span attributes
       while retaining the explicit public `service` query column.
-- [ ] Preserve typed attribute/resource/event values through SQL JSON text,
+- [x] Preserve typed attribute/resource/event values through SQL JSON text,
       batch ingest, compression, and Jaeger tag/log encoding.
-- [ ] Add row-versus-batch, buffer-threshold, transaction/savepoint/rollback,
+- [x] Add row-versus-batch, buffer-threshold, transaction/savepoint/rollback,
       flush, optimize, prune, reopen, corruption, and crash regressions.
-- [ ] Extend the randomized plain-table oracle with rich spans and compare
+- [x] Extend the randomized plain-table oracle with rich spans and compare
       semantic JSON values, packed IDs, timestamps, and all query families.
-- [ ] Measure storage and direct ingest regressions against the existing v0
+- [x] Measure storage and direct ingest regressions against the existing v0
       core-span fixture. Record an honest size cost for fidelity.
 
-Exit criterion: 100% of the Session 0 rich fixture survives direct SQLite/
-libSQL ingest and cold reopen, with backward compatibility and no server code.
+Exit criterion: satisfied. One hundred percent of the Session 0 rich fixture
+survives direct SQLite/libSQL ingest and cold reopen, with backward
+compatibility and no server code, in `timeless-libsql` commits `368e204` and
+`2176321`. Results, including direct v0/v1 storage, ingest, query tails, HWM,
+compatibility, and crash evidence, are recorded in
+`bench/results/2026-08-02_traces_api_session1.md`.
 
 ## Session 2 — Build the descriptive Rust server shell
 
