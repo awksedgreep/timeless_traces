@@ -1,10 +1,10 @@
 defmodule TimelessTraces.ReleaseStartupTest do
   use ExUnit.Case, async: false
 
-  alias TimelessTraces.{DB, LegacyReader, LegacyReaderTest, LibsqlCandidate, ReleaseStartup}
+  alias TimelessTraces.{DB, LegacyReader, LegacyReaderFixture, LibsqlCandidate, ReleaseStartup}
 
   test "fresh target is valid and startup remains idempotent" do
-    root = LegacyReaderTest.temp_dir("traces_startup_fresh")
+    root = LegacyReaderFixture.temp_dir("traces_startup_fresh")
     on_exit(fn -> File.rm_rf!(root) end)
 
     assert {:ok, %{state: :fresh}} = ReleaseStartup.detect(root, opts())
@@ -15,7 +15,7 @@ defmodule TimelessTraces.ReleaseStartupTest do
     assert_retention(target, 7 * 86_400 * 1_000_000_000)
     assert {:ok, %{state: :valid_libsql, ready: true}} = ReleaseStartup.prepare(root, opts())
 
-    incompatible = LegacyReaderTest.temp_dir("traces_startup_incompatible_extension")
+    incompatible = LegacyReaderFixture.temp_dir("traces_startup_incompatible_extension")
     on_exit(fn -> File.rm_rf!(incompatible) end)
 
     assert {:error, %{state: :incompatible_version, ready: false}} =
@@ -25,7 +25,7 @@ defmodule TimelessTraces.ReleaseStartupTest do
   end
 
   test "fresh startup persists the configured retention in the public virtual table" do
-    root = LegacyReaderTest.temp_dir("traces_startup_retention")
+    root = LegacyReaderFixture.temp_dir("traces_startup_retention")
     on_exit(fn -> File.rm_rf!(root) end)
 
     assert {:ok, %{target_path: target}} =
@@ -40,11 +40,11 @@ defmodule TimelessTraces.ReleaseStartupTest do
   end
 
   test "rich legacy spans resume, seal, rename, and retain an exact rollback source" do
-    root = LegacyReaderTest.temp_dir("traces_startup_cutover")
+    root = LegacyReaderFixture.temp_dir("traces_startup_cutover")
     on_exit(fn -> File.rm_rf!(root) end)
     File.mkdir_p!(Path.join(root, "blocks"))
-    block = LegacyReaderTest.write_block(root, LegacyReaderTest.fixtures(19), :raw)
-    LegacyReaderTest.create_sqlite_index(root, [block])
+    block = LegacyReaderFixture.write_block(root, LegacyReaderFixture.fixtures(19), :raw)
+    LegacyReaderFixture.create_sqlite_index(root, [block])
     before = source_snapshot(root)
 
     assert {:ok, %{state: :legacy}} = ReleaseStartup.detect(root, opts())
@@ -131,7 +131,7 @@ defmodule TimelessTraces.ReleaseStartupTest do
     create_target(target)
     assert {:ok, %{state: :ambiguous_dual_store}} = ReleaseStartup.detect(dual, opts())
 
-    future = LegacyReaderTest.temp_dir("traces_startup_future")
+    future = LegacyReaderFixture.temp_dir("traces_startup_future")
     on_exit(fn -> File.rm_rf!(future) end)
     future_target = Path.join(future, "traces.db")
     create_target(future_target)
@@ -164,12 +164,12 @@ defmodule TimelessTraces.ReleaseStartupTest do
   end
 
   test "corrupt files, wrong signal tables, and mixed old generations fail closed" do
-    corrupt = LegacyReaderTest.temp_dir("traces_startup_corrupt")
+    corrupt = LegacyReaderFixture.temp_dir("traces_startup_corrupt")
     on_exit(fn -> File.rm_rf!(corrupt) end)
     File.write!(Path.join(corrupt, "traces.db"), "truncated")
     assert {:ok, %{state: :corruption}} = ReleaseStartup.detect(corrupt, opts())
 
-    wrong = LegacyReaderTest.temp_dir("traces_startup_wrong")
+    wrong = LegacyReaderFixture.temp_dir("traces_startup_wrong")
     on_exit(fn -> File.rm_rf!(wrong) end)
     path = Path.join(wrong, "traces.db")
     {:ok, conn} = Exqlite.Sqlite3.open(path)
@@ -236,7 +236,7 @@ defmodule TimelessTraces.ReleaseStartupTest do
   end
 
   test "the oldest trace snapshot-only generation converts automatically" do
-    root = LegacyReaderTest.temp_dir("traces_startup_snapshot_only")
+    root = LegacyReaderFixture.temp_dir("traces_startup_snapshot_only")
     on_exit(fn -> File.rm_rf!(root) end)
 
     File.write!(
@@ -262,10 +262,10 @@ defmodule TimelessTraces.ReleaseStartupTest do
   end
 
   defp legacy_root(prefix, count) do
-    root = LegacyReaderTest.temp_dir(prefix)
+    root = LegacyReaderFixture.temp_dir(prefix)
     File.mkdir_p!(Path.join(root, "blocks"))
-    block = LegacyReaderTest.write_block(root, LegacyReaderTest.fixtures(count), :raw)
-    LegacyReaderTest.create_sqlite_index(root, [block])
+    block = LegacyReaderFixture.write_block(root, LegacyReaderFixture.fixtures(count), :raw)
+    LegacyReaderFixture.create_sqlite_index(root, [block])
     root
   end
 
