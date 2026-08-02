@@ -1,7 +1,12 @@
 # Rust traces API POC plan
 
 Date: 2026-08-02
-Status: Sessions 0–7 complete on `poc/rust-telemetry-data-plane`; POC kept for artifact/release promotion
+Status: Sessions 0–7 complete on `poc/rust-telemetry-data-plane`; release promotion continues on `release/rust-telemetry-data-plane`
+
+The cross-signal default-replacement work, including automatic crash-safe
+legacy migration and every release-readiness item below, is now governed by
+`timeless-libsql/docs/2026-08-02_rust_telemetry_data_plane_release_plan.md`.
+This document remains the immutable traces POC contract and evidence record.
 
 This POC tests the same process boundary that succeeded for logs and metrics:
 Rust owns the telemetry HTTP/data plane, while Elixir/Phoenix owns product
