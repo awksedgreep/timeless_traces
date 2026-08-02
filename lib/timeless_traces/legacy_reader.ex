@@ -9,6 +9,7 @@ defmodule TimelessTraces.LegacyReader do
     :root,
     :generation,
     :conn,
+    :exclusive,
     :blocks,
     :block_data,
     :max_stored_bytes,
@@ -21,7 +22,8 @@ defmodule TimelessTraces.LegacyReader do
 
     limits = %{
       max_stored_bytes: Keyword.get(opts, :max_stored_bytes, @default_max_stored_bytes),
-      max_decoded_bytes: Keyword.get(opts, :max_decoded_bytes, @default_max_decoded_bytes)
+      max_decoded_bytes: Keyword.get(opts, :max_decoded_bytes, @default_max_decoded_bytes),
+      exclusive: Keyword.get(opts, :exclusive, false)
     }
 
     case generation do
@@ -32,7 +34,11 @@ defmodule TimelessTraces.LegacyReader do
   end
 
   def close(%__MODULE__{conn: nil}), do: :ok
-  def close(%__MODULE__{conn: conn}), do: Exqlite.Sqlite3.close(conn)
+
+  def close(%__MODULE__{conn: conn, exclusive: exclusive?}) do
+    if exclusive?, do: execute(conn, "ROLLBACK")
+    Exqlite.Sqlite3.close(conn)
+  end
 
   def inventory(%__MODULE__{generation: :sqlite, conn: conn}) do
     with {:ok, [[blocks, spans, bytes, ts_min, ts_max]]} <-
@@ -64,7 +70,7 @@ defmodule TimelessTraces.LegacyReader do
       Path.join(root, "traces_index.db-wal"),
       Path.join(root, "blocks")
     ]
-    |> Enum.filter(&File.exists?/1)
+    |> Enum.filter(&durable_manifest_path?/1)
   end
 
   def manifest_paths(%__MODULE__{root: root, generation: :snapshot_log}) do
@@ -75,6 +81,14 @@ defmodule TimelessTraces.LegacyReader do
       Path.join(root, "blocks")
     ]
     |> Enum.filter(&File.exists?/1)
+  end
+
+  defp durable_manifest_path?(path) do
+    case File.stat(path) do
+      {:ok, %{type: :regular, size: 0}} -> not String.ends_with?(path, ".db-wal")
+      {:ok, _} -> true
+      {:error, _} -> false
+    end
   end
 
   def page(reader, cursor \\ nil, limit \\ @page_limit)
@@ -91,26 +105,82 @@ defmodule TimelessTraces.LegacyReader do
     path = Path.join(root, "traces_index.db")
 
     with true <- File.regular?(path) || {:error, "missing traces SQLite index #{path}"},
-         {:ok, conn} <- Exqlite.Sqlite3.open(path, mode: :readonly),
-         {:ok, [["ok"]]} <- execute(conn, "PRAGMA integrity_check"),
-         :ok <- verify_sqlite_schema(conn) do
-      {:ok,
-       struct!(
-         __MODULE__,
-         Map.merge(limits, %{
-           root: root,
-           generation: :sqlite,
-           conn: conn,
-           blocks: nil,
-           block_data: nil
-         })
-       )}
+         {:ok, conn} <- open_sqlite_connection(path, limits.exclusive) do
+      case validate_sqlite_connection(conn) do
+        :ok ->
+          {:ok,
+           struct!(
+             __MODULE__,
+             Map.merge(limits, %{
+               root: root,
+               generation: :sqlite,
+               conn: conn,
+               blocks: nil,
+               block_data: nil
+             })
+           )}
+
+        {:error, _} = error ->
+          if limits.exclusive, do: execute(conn, "ROLLBACK")
+          Exqlite.Sqlite3.close(conn)
+          error
+      end
     else
       {:error, _} = error -> error
       other -> {:error, "invalid traces SQLite index: #{inspect(other)}"}
     end
   rescue
     error -> {:error, "cannot open traces SQLite index read-only: #{Exception.message(error)}"}
+  end
+
+  defp validate_sqlite_connection(conn) do
+    with {:ok, [["ok"]]} <- execute(conn, "PRAGMA integrity_check"),
+         :ok <- verify_sqlite_schema(conn) do
+      :ok
+    else
+      {:error, _} = error -> error
+      other -> {:error, "invalid traces SQLite index: #{inspect(other)}"}
+    end
+  end
+
+  defp open_sqlite_connection(path, false), do: Exqlite.Sqlite3.open(path, mode: :readonly)
+
+  defp open_sqlite_connection(path, true) do
+    case Exqlite.Sqlite3.open(path) do
+      {:ok, conn} ->
+        result =
+          with :ok <- execute_once(conn, "PRAGMA busy_timeout=0"),
+               :ok <- execute_once(conn, "BEGIN EXCLUSIVE") do
+            {:ok, conn}
+          end
+
+        case result do
+          {:ok, _} ->
+            result
+
+          {:error, reason} ->
+            Exqlite.Sqlite3.close(conn)
+            {:error, "cannot acquire exclusive legacy SQLite ownership: #{inspect(reason)}"}
+        end
+
+      {:error, reason} ->
+        {:error, "cannot acquire exclusive legacy SQLite ownership: #{inspect(reason)}"}
+    end
+  end
+
+  defp execute_once(conn, sql) do
+    with {:ok, statement} <- Exqlite.Sqlite3.prepare(conn, sql) do
+      try do
+        case Exqlite.Sqlite3.step(conn, statement) do
+          :done -> :ok
+          {:row, _} -> :ok
+          {:error, _} = error -> error
+          other -> {:error, other}
+        end
+      after
+        Exqlite.Sqlite3.release(conn, statement)
+      end
+    end
   end
 
   defp verify_sqlite_schema(conn) do
