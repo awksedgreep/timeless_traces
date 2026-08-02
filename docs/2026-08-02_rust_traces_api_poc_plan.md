@@ -1,7 +1,7 @@
 # Rust traces API POC plan
 
 Date: 2026-08-02
-Status: Sessions 0–3 complete; Session 4 ready on `poc/rust-telemetry-data-plane`
+Status: Sessions 0–4 complete; Session 5 ready on `poc/rust-telemetry-data-plane`
 
 This POC tests the same process boundary that succeeded for logs and metrics:
 Rust owns the telemetry HTTP/data plane, while Elixir/Phoenix owns product
@@ -331,25 +331,28 @@ completion. Results are recorded in
 
 ## Session 4 — Jaeger discovery, trace lookup, and search parity
 
-- [ ] Implement services, operations, trace-by-ID, and trace-search routes with
+- [x] Implement services, operations, trace-by-ID, and trace-search routes with
       the pinned Jaeger envelopes and time/duration unit conversions.
-- [ ] Assemble complete traces across block boundaries with deterministic span
+- [x] Assemble complete traces across block boundaries with deterministic span
       order and exact parent/resource/process/event/status rendering.
-- [ ] Define whether `limit` counts traces or spans. Match the established
+- [x] Define whether `limit` counts traces or spans. Match the established
       product contract first, then document any standards correction as an
       explicit compatibility change.
-- [ ] Use only public extension surfaces. Add a reusable discovery/trace query
+- [x] Use only public extension surfaces. Add a reusable discovery/trace query
       primitive first if raw vtab rows or shadow-table knowledge would leak
       into the API.
-- [ ] Add per-request cancellation with a scoped SQLite progress handler and
+- [x] Add per-request cancellation with a scoped SQLite progress handler and
       host-loop checks; prove the same reader is reusable after cancellation.
-- [ ] Differential-test every route against the Session 0 fixture before
+- [x] Differential-test every route against the Session 0 fixture before
       timing fixed exact, selective, fan-out, duration, discovery, and full
       trace shapes.
 
-Exit criterion: every declared Jaeger route is socket-to-response Rust and
-semantically matches the control; unsupported behavior is a visible error or
-documented omission, never a silent fallback.
+Exit criterion: satisfied. Every declared Jaeger route is socket-to-response
+Rust and matches the pinned Session 0 semantic oracle. The established span-
+limit-before-grouping behavior remains explicit, malformed duration/negative
+limit input is a visible 400, and dropped requests interrupt extension work
+and leave the same reader reusable. Results are recorded in
+`bench/results/2026-08-02_traces_api_session4.md`.
 
 ## Session 5 — Reusable read-path and memory acceleration
 
