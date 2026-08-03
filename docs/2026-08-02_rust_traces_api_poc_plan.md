@@ -288,6 +288,8 @@ compatibility and no server code, in `timeless-libsql` commits `368e204` and
 `2176321`. Results, including direct v0/v1 storage, ingest, query tails, HWM,
 compatibility, and crash evidence, are recorded in
 `bench/results/2026-08-02_traces_api_session1.md`.
+The exact supported and unsupported OTLP field inventory is in
+`docs/2026-08-02_trace_fidelity_contract.md`.
 
 ## Session 2 — Build the descriptive Rust server shell
 
