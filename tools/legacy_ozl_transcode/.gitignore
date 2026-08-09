@@ -1,0 +1,10 @@
+# The parent .gitignore anchors these to the repository root, so a nested
+# project needs its own. deps/ here contains the full vendored OpenZL
+# checkout, which must never be committed.
+/_build/
+/deps/
+/cover/
+/doc/
+erl_crash.dump
+*.ez
+*.beam
