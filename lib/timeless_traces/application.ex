@@ -21,6 +21,11 @@ defmodule TimelessTraces.Application do
     end
   end
 
+  def configured_children(owner) do
+    raise ArgumentError,
+          "invalid :timeless_traces :owner #{inspect(owner)}; expected :embedded or :external"
+  end
+
   defp elixir_children do
     TimelessTraces.StorageEngine.put_engine(:elixir)
     storage = TimelessTraces.Config.storage()
@@ -42,11 +47,6 @@ defmodule TimelessTraces.Application do
       {TimelessTraces.Compactor, data_dir: data_dir, storage: storage},
       {TimelessTraces.Retention, []}
     ] ++ hot_tail_child() ++ buffer_shards(data_dir) ++ http_child()
-  end
-
-  def configured_children(owner) do
-    raise ArgumentError,
-          "invalid :timeless_traces :owner #{inspect(owner)}; expected :embedded or :external"
   end
 
   # Opt-in libSQL engine: one in-process writer over the timeless-libsql
