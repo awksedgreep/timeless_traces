@@ -99,13 +99,47 @@ defmodule TimelessTraces.LibsqlEngineTest do
     assert {:ok, %TimelessTraces.Result{total: 5}} = TimelessTraces.LibsqlEngine.query([])
   end
 
-  test "refuses an unmigrated legacy block store", %{dir: dir} do
+  test "refuses an unmigrated legacy block store when auto_migrate is off", %{dir: dir} do
     File.mkdir_p!(dir)
     File.touch!(Path.join(dir, "traces_index.db"))
 
     assert {:error, _} =
              start_supervised(
-               {TimelessTraces.LibsqlEngine, data_dir: dir, extension_path: @extension}
+               {TimelessTraces.LibsqlEngine,
+                data_dir: dir, extension_path: @extension, auto_migrate: false}
              )
+  end
+
+  test "auto-converts a legacy block store at startup", %{dir: dir} do
+    # Build a real legacy store through the running app.
+    Application.stop(:timeless_traces)
+
+    previous = Application.get_env(:timeless_traces, :data_dir)
+    Application.put_env(:timeless_traces, :data_dir, dir)
+    {:ok, _} = Application.ensure_all_started(:timeless_traces)
+
+    :ok = TimelessTraces.StorageEngine.ingest([span(1), span(2, status: :error)])
+    :ok = TimelessTraces.flush()
+    Application.stop(:timeless_traces)
+
+    case previous do
+      nil -> Application.delete_env(:timeless_traces, :data_dir)
+      _ -> Application.put_env(:timeless_traces, :data_dir, previous)
+    end
+
+    on_exit(fn -> {:ok, _} = Application.ensure_all_started(:timeless_traces) end)
+
+    assert File.exists?(Path.join(dir, "traces_index.db"))
+
+    # Default startup on :libsql converts automatically, then serves it.
+    start_engine!(dir)
+
+    assert {:ok, %TimelessTraces.Result{total: 2}} = TimelessTraces.LibsqlEngine.query([])
+
+    assert {:ok, %TimelessTraces.Result{total: 1}} =
+             TimelessTraces.LibsqlEngine.query(status: :error)
+
+    # The source is retained for rollback.
+    assert File.exists?(Path.join(dir, "traces_index.db"))
   end
 end

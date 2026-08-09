@@ -3,6 +3,16 @@
 This changelog starts at 1.4.5; earlier releases are recorded by git
 tags and `bench/results/*.md` session documents.
 
+## 1.6.0 (2026-08-09)
+
+**Automatic legacy conversion.** Starting on `engine: :libsql` over an
+unmigrated legacy block store now runs the journaled, resumable,
+digest-verified `ReleaseStartup.prepare/2` conversion automatically at
+startup (exclusive owner lock; source retained for rollback), instead
+of refusing. Set `auto_migrate: false` to restore the strict refusal.
+The legacy Elixir block engine is deprecated for removal in roughly
+three months (~2026-11).
+
 ## 1.5.0 (2026-08-09)
 
 **Opt-in libSQL storage engine** (`config :timeless_traces, engine:

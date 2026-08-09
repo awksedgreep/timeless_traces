@@ -71,7 +71,7 @@ defmodule TimelessTraces.LibsqlEngine do
   def init(opts) do
     Process.flag(:trap_exit, true)
     data_dir = Keyword.get(opts, :data_dir, TimelessTraces.Config.data_dir())
-    reject_unmigrated_legacy_store!(data_dir)
+    maybe_auto_migrate_legacy_store!(data_dir, opts)
     File.mkdir_p!(data_dir)
     path = Path.join(data_dir, "traces.db")
 
@@ -391,19 +391,57 @@ defmodule TimelessTraces.LibsqlEngine do
 
   defp stat_int(_), do: nil
 
-  defp reject_unmigrated_legacy_store!(data_dir) do
+  # A data_dir carrying the legacy block-store layout is AUTO-CONVERTED
+  # at startup (the legacy engine is on a ~3-month deprecation clock):
+  # ReleaseStartup.prepare/2 runs the journaled, resumable, digest-
+  # verified conversion under an exclusive owner lock, retaining the
+  # source for rollback. Set auto_migrate: false to restore the strict
+  # refusal instead. Never silently ignore existing data.
+  defp maybe_auto_migrate_legacy_store!(data_dir, opts) do
     legacy? =
       File.exists?(Path.join(data_dir, "traces_index.db")) or
         File.dir?(Path.join(data_dir, "blocks"))
 
     migrated? = File.exists?(Path.join(data_dir, "traces.db"))
 
-    if legacy? and not migrated? do
-      raise "timeless_traces engine: :libsql refuses to start against the unmigrated " <>
-              "legacy block store in #{data_dir} — run the TimelessTraces.ReleaseMigration " <>
-              "conversion first, or configure engine: :elixir"
-    end
+    auto? =
+      Keyword.get(
+        opts,
+        :auto_migrate,
+        Application.get_env(:timeless_traces, :auto_migrate, true)
+      )
 
-    :ok
+    cond do
+      not legacy? or migrated? ->
+        :ok
+
+      not auto? ->
+        raise "timeless_traces engine: :libsql refuses to start against the unmigrated " <>
+                "legacy block store in #{data_dir} — run the TimelessTraces.ReleaseMigration " <>
+                "conversion, enable auto_migrate, or configure engine: :elixir"
+
+      true ->
+        Logger.warning(
+          "timeless_traces: auto-converting the legacy block store in #{data_dir} to the " <>
+            "libSQL engine (journaled, verified, source retained for rollback). " <>
+            "Set auto_migrate: false to disable."
+        )
+
+        case TimelessTraces.ReleaseStartup.prepare(data_dir,
+               extension_path: Keyword.get(opts, :extension_path)
+             ) do
+          {:ok, result} ->
+            Logger.info(
+              "timeless_traces: legacy conversion ready (state: #{inspect(result[:state])})"
+            )
+
+            :ok
+
+          {:error, result} ->
+            raise "timeless_traces: automatic legacy conversion failed: #{inspect(result)}. " <>
+                    "The journaled migration is resumable — restart to resume, or set " <>
+                    "engine: :elixir to keep the legacy engine."
+        end
+    end
   end
 end
