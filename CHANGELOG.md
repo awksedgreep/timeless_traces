@@ -3,6 +3,35 @@
 This changelog starts at 1.4.5; earlier releases are recorded by git
 tags and `bench/results/*.md` session documents.
 
+## 1.7.0 (2026-08-09)
+
+**A block written by an unreadable compression format is no longer reported
+as corruption.** `Writer.decompress_block/2` can now answer
+`{:error, :incompatible_format}`, and the legacy migration maps that to
+`state: :incompatible_version` instead of `state: :corruption`. The two imply
+opposite operator responses — corruption means restore from backup, an
+unreadable format means the bytes are intact and need a different decoder —
+so the old answer sent recovery in the wrong direction.
+
+Previously the decode failure was rescued, logged, and collapsed to a bare
+`:corrupt_block`, so nothing downstream could tell the cases apart even in
+principle. Classification now uses an allowlist of OpenZL graph/transform
+topology signatures, which is what a frame from an older OpenZL looks like to
+a newer decoder. Genuine damage announces itself differently, because OpenZL
+checksums its payload: overwritten bytes report a checksum mismatch and
+truncation reports a short source. Anything unrecognised keeps the historical
+`:corrupt_block` answer.
+
+Consumers matching exhaustively on `{:error, :corrupt_block}` should add the
+new value; this is why the release is a minor bump.
+
+Adds `tools/legacy_ozl_transcode`, a standalone one-shot utility that rewrites
+blocks written by `ex_openzl <= 0.4.6` into the version-independent `:raw`
+format. `ex_openzl 0.4.7` moved its vendored OpenZL to v0.2.0, whose decoder
+rejects 0.1.x frames, which blocks the legacy-to-libSQL migration for any
+store that is not actively rewriting its blocks. The tool is not part of the
+package.
+
 ## 1.6.0 (2026-08-09)
 
 **Automatic legacy conversion.** Starting on `engine: :libsql` over an
