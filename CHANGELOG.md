@@ -3,6 +3,30 @@
 This changelog starts at 1.4.5; earlier releases are recorded by git
 tags and `bench/results/*.md` session documents.
 
+## 1.5.0 (2026-08-09)
+
+**Opt-in libSQL storage engine** (`config :timeless_traces, engine:
+:libsql`) — the port of the runtime to the timeless-libsql v0.5.0
+traces virtual table, replacing the deprecated Elixir block engine for
+hosts that opt in. One `traces.db` holds everything; embedded and
+external (Rust `timeless-traces-api`) modes share one on-disk format,
+so a host graduates to the Rust owner by switching owners, not
+migrating data.
+
+- Full facade coverage: ingest (rich-span-v1 batches, OTel exporter and
+  HTTP OTLP routed through the engine seam), flush/optimize,
+  query (service/kind/status/trace_id/time/duration pushdown + the
+  shared Filter residuals — parity by construction), trace lookup by
+  raw or hex id, service/operation discovery, stats, VACUUM INTO
+  backup, subscriptions.
+- Startup refuses an unmigrated legacy block store loudly (run
+  `TimelessTraces.ReleaseMigration` first); cold-reopen durability via
+  a final flush on shutdown.
+- Default engine remains `:elixir`, completely unchanged; the flip
+  ships as its own release. Rich-span-v2 fields stay out per the
+  fidelity contract.
+- Port doc: `docs/2026-08-09_libsql_engine_port.md`.
+
 ## 1.4.5 (2026-08-08)
 
 Validated against the released **timeless-libsql v0.5.0** and re-pinned
