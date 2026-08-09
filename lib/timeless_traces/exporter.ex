@@ -25,7 +25,7 @@ defmodule TimelessTraces.Exporter do
       |> Enum.reject(&is_nil/1)
 
     if spans != [] do
-      TimelessTraces.Buffer.ingest(spans)
+      TimelessTraces.StorageEngine.ingest(spans)
     end
 
     {:ok, state}

@@ -56,7 +56,7 @@ defmodule TimelessTraces do
   """
   @spec query(keyword()) :: {:ok, TimelessTraces.Result.t()} | {:error, term()}
   def query(filters \\ []) do
-    TimelessTraces.Index.query(filters)
+    TimelessTraces.StorageEngine.query(filters)
   end
 
   @doc """
@@ -68,7 +68,7 @@ defmodule TimelessTraces do
   """
   @spec trace(String.t()) :: {:ok, [TimelessTraces.Span.t()]}
   def trace(trace_id) do
-    TimelessTraces.Index.trace(trace_id)
+    TimelessTraces.StorageEngine.trace(trace_id)
   end
 
   @doc """
@@ -81,7 +81,7 @@ defmodule TimelessTraces do
   """
   @spec services() :: {:ok, [String.t()]}
   def services do
-    TimelessTraces.Index.distinct_services()
+    TimelessTraces.StorageEngine.services()
   end
 
   @doc """
@@ -94,7 +94,7 @@ defmodule TimelessTraces do
   """
   @spec operations(String.t()) :: {:ok, [String.t()]}
   def operations(service) do
-    TimelessTraces.Index.distinct_operations(service)
+    TimelessTraces.StorageEngine.operations(service)
   end
 
   @doc """
@@ -102,7 +102,7 @@ defmodule TimelessTraces do
   """
   @spec flush() :: :ok
   def flush do
-    TimelessTraces.Buffer.flush()
+    TimelessTraces.StorageEngine.flush()
   end
 
   @doc """
@@ -116,7 +116,7 @@ defmodule TimelessTraces do
   """
   @spec stats() :: {:ok, TimelessTraces.Stats.t()}
   def stats do
-    TimelessTraces.Index.stats()
+    TimelessTraces.StorageEngine.stats()
   end
 
   @doc """
@@ -151,7 +151,7 @@ defmodule TimelessTraces do
   Returns `:ok` if blocks were merged, `:noop` if no merge was needed.
   """
   @spec merge_now() :: :ok | :noop
-  defdelegate merge_now(), to: TimelessTraces.Compactor
+  def merge_now, do: TimelessTraces.StorageEngine.merge_now()
 
   @doc """
   Create a consistent online backup of the span store.
@@ -173,6 +173,13 @@ defmodule TimelessTraces do
   """
   @spec backup(String.t()) :: {:ok, map()} | {:error, term()}
   def backup(target_dir) do
+    case TimelessTraces.StorageEngine.engine() do
+      :libsql -> TimelessTraces.LibsqlEngine.backup(target_dir)
+      _ -> legacy_backup(target_dir)
+    end
+  end
+
+  defp legacy_backup(target_dir) do
     flush()
 
     File.mkdir_p!(target_dir)

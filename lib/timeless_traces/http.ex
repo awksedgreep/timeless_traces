@@ -645,7 +645,7 @@ defmodule TimelessTraces.HTTP do
           spans = parse_otlp_resource_spans(resource_spans)
 
           if spans != [] do
-            TimelessTraces.Buffer.ingest(spans)
+            TimelessTraces.StorageEngine.ingest(spans)
           end
 
           TimelessTraces.DataPlaneStats.admit_request(byte_size(body))
@@ -676,7 +676,7 @@ defmodule TimelessTraces.HTTP do
       spans = parse_protobuf_resource_spans(resource_spans)
 
       if spans != [] do
-        TimelessTraces.Buffer.ingest(spans)
+        TimelessTraces.StorageEngine.ingest(spans)
       end
 
       TimelessTraces.DataPlaneStats.admit_request(byte_size(req.body))

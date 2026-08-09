@@ -15,6 +15,26 @@ defmodule TimelessTraces.Application do
   def configured_children(:external), do: []
 
   def configured_children(:embedded) do
+    case TimelessTraces.Config.engine() do
+      :libsql -> libsql_children()
+      _ -> elixir_children()
+    end
+  end
+
+  # Opt-in libSQL engine: one in-process writer over the timeless-libsql
+  # vtab. Subscriptions keep their Registry; the legacy buffer/index/
+  # compactor/hot-tail pipeline does not start.
+  defp libsql_children do
+    TimelessTraces.StorageEngine.put_engine(:libsql)
+
+    [
+      {Registry, keys: :duplicate, name: TimelessTraces.Registry},
+      {TimelessTraces.LibsqlEngine, []}
+    ]
+  end
+
+  defp elixir_children do
+    TimelessTraces.StorageEngine.put_engine(:elixir)
     storage = TimelessTraces.Config.storage()
     data_dir = TimelessTraces.Config.data_dir()
 
