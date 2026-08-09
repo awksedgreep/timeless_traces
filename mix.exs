@@ -4,7 +4,7 @@ defmodule TimelessTraces.MixProject do
   def project do
     [
       app: :timeless_traces,
-      version: "1.4.4",
+      version: "1.4.5",
       elixir: "~> 1.18",
       start_permanent: Mix.env() == :prod,
       deps: deps(),
@@ -43,7 +43,7 @@ defmodule TimelessTraces.MixProject do
       maintainers: ["Mark Cotner"],
       licenses: ["MIT"],
       links: %{"GitHub" => "https://github.com/awksedgreep/timeless_traces"},
-      files: ~w(lib .formatter.exs mix.exs README.md LICENSE)
+      files: ~w(lib .formatter.exs mix.exs README.md CHANGELOG.md LICENSE)
     ]
   end
 
