@@ -522,10 +522,22 @@ defmodule TimelessTraces.ReleaseStartup do
         {:error,
          "legacy traces index count #{expected} disagrees with decoded count #{count + length(rows)}"}
 
+      {:error, :incompatible_format} ->
+        {:error,
+         {:incompatible_format,
+          "legacy traces payload was written by a compression format version this build " <>
+            "cannot decode; the blocks are intact but unreadable by the current decoder"}}
+
       {:error, reason} ->
         {:error, "legacy traces payload validation failed: #{inspect(reason)}"}
     end
   end
+
+  # An unreadable format version is not corruption: the stored bytes are intact
+  # and the operator needs a different decoder, not a restore from backup.
+  # Reporting :corruption here sends recovery in the opposite direction.
+  defp classify_legacy_error({:incompatible_format, message}),
+    do: {:state, :incompatible_version, %{error: message}}
 
   defp classify_legacy_error(reason) do
     state =

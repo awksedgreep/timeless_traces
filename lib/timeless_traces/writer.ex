@@ -115,7 +115,7 @@ defmodule TimelessTraces.Writer do
   end
 
   @spec decompress_block(binary(), :raw | :zstd | :openzl) ::
-          {:ok, [map()]} | {:error, :corrupt_block}
+          {:ok, [map()]} | {:error, :corrupt_block | :incompatible_format}
   def decompress_block(data, format \\ :zstd)
 
   def decompress_block(data, :raw) do
@@ -146,9 +146,60 @@ defmodule TimelessTraces.Writer do
       {:ok, columnar_deserialize(outputs)}
     rescue
       e ->
-        Logger.warning("TimelessTraces: corrupt openzl block data: #{inspect(e)}")
-        {:error, :corrupt_block}
+        classify_openzl_failure(compressed, e)
     end
+  end
+
+  # OpenZL raises graph/transform topology errors when it can parse the frame
+  # container but cannot interpret the compression graph inside it. That is what
+  # a frame written by an older OpenZL looks like to a newer decoder: the bytes
+  # are intact, the decoder is wrong.
+  #
+  # Genuine damage surfaces differently, because OpenZL checksums the compressed
+  # payload — corruption reports a checksum mismatch and truncation reports a
+  # short source. Neither is a topology error.
+  #
+  # This is deliberately an allowlist. Only positively recognised topology
+  # signatures are reported as an unreadable format; every other failure keeps
+  # the historical :corrupt_block answer. Claiming "your data is fine, use a
+  # different decoder" about genuinely damaged bytes is the worse error, so
+  # unknown failures must fall through to corruption.
+  @openzl_format_signatures [
+    "DT_isNbRegensCompatible",
+    "streams to regenerate",
+    "Graph inconsistency"
+  ]
+
+  defp classify_openzl_failure(compressed, error) do
+    message = openzl_error_message(error)
+
+    format_mismatch? =
+      Enum.any?(@openzl_format_signatures, &String.contains?(message, &1)) and
+        match?({:ok, _}, safe_frame_info(compressed))
+
+    if format_mismatch? do
+      Logger.warning(
+        "TimelessTraces: openzl block was written by a format version this build " <>
+          "cannot decode; the block is intact but unreadable by the current " <>
+          "decoder: #{message}"
+      )
+
+      {:error, :incompatible_format}
+    else
+      Logger.warning("TimelessTraces: corrupt openzl block data: #{inspect(error)}")
+      {:error, :corrupt_block}
+    end
+  end
+
+  defp openzl_error_message(%MatchError{term: {:error, message}}) when is_binary(message),
+    do: message
+
+  defp openzl_error_message(error), do: inspect(error)
+
+  defp safe_frame_info(compressed) do
+    ExOpenzl.frame_info(compressed)
+  rescue
+    _ -> {:error, :frame_info_failed}
   end
 
   @spec read_block(String.t(), :raw | :zstd | :openzl) :: {:ok, [map()]} | {:error, term()}
