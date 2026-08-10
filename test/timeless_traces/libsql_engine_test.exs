@@ -47,7 +47,9 @@ defmodule TimelessTraces.LibsqlEngineTest do
     assert {:ok, %TimelessTraces.Result{entries: [newest | _], total: 10}} =
              TimelessTraces.LibsqlEngine.query([])
 
-    assert %TimelessTraces.Span{span_id: <<10::64>>} = newest
+    # The engine reports ids as lowercase hex, matching the Elixir engine.
+    span_10_hex = Base.encode16(<<10::64>>, case: :lower)
+    assert %TimelessTraces.Span{span_id: ^span_10_hex} = newest
 
     # Status pushdown + residual parity via the shared Filter.
     assert {:ok, %TimelessTraces.Result{total: 2}} =
@@ -65,13 +67,15 @@ defmodule TimelessTraces.LibsqlEngineTest do
              TimelessTraces.LibsqlEngine.query(min_duration: 600_000)
 
     # trace/1 accepts raw ids and returns ascending spans.
-    assert {:ok, [%TimelessTraces.Span{span_id: <<7::64>>}]} =
+    span_7_hex = Base.encode16(<<7::64>>, case: :lower)
+
+    assert {:ok, [%TimelessTraces.Span{span_id: ^span_7_hex}]} =
              TimelessTraces.LibsqlEngine.trace(<<7::128>>)
 
     # ...and 32-char hex ids.
     hex = Base.encode16(<<7::128>>, case: :lower)
 
-    assert {:ok, [%TimelessTraces.Span{span_id: <<7::64>>}]} =
+    assert {:ok, [%TimelessTraces.Span{span_id: ^span_7_hex}]} =
              TimelessTraces.LibsqlEngine.trace(hex)
 
     # Discovery.

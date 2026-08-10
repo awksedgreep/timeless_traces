@@ -76,7 +76,12 @@ defmodule TimelessTraces.LibsqlFacadeTest do
     assert {:ok, %TimelessTraces.Result{total: 1}} = TimelessTraces.query(status: :error)
     assert {:ok, %TimelessTraces.Result{total: 3}} = TimelessTraces.query(service: "api")
 
-    assert {:ok, [%TimelessTraces.Span{span_id: <<2::64>>}]} = TimelessTraces.trace(<<2::128>>)
+    # Ids come back as lowercase hex regardless of whether they went in as a
+    # blob or as hex text; the store keeps blobs, the public contract is hex.
+    span_2_hex = Base.encode16(<<2::64>>, case: :lower)
+
+    assert {:ok, [%TimelessTraces.Span{span_id: ^span_2_hex}]} =
+             TimelessTraces.trace(<<2::128>>)
 
     assert {:ok, ["api"]} = TimelessTraces.services()
     assert {:ok, ["GET /users"]} = TimelessTraces.operations("api")

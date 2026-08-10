@@ -326,9 +326,9 @@ defmodule TimelessTraces.LibsqlEngine do
     [attributes, description, events, resource, scope] = rest
 
     %{
-      trace_id: tid,
-      span_id: sid,
-      parent_span_id: parent,
+      trace_id: hex_id(tid, 16),
+      span_id: hex_id(sid, 8),
+      parent_span_id: hex_id(parent, 8),
       name: name,
       kind: Map.get(@kinds, kind, :internal),
       start_time: start,
@@ -342,6 +342,27 @@ defmodule TimelessTraces.LibsqlEngine do
       instrumentation_scope: decode_scope(scope)
     }
   end
+
+  # Ids are stored as BLOBs — 16 bytes for a trace, 8 for a span — but the
+  # public contract is lowercase hex, which is what the Elixir engine always
+  # returned and what Index.trace/1 decodes back with Base.decode16!/2.
+  # Handing the raw blob to callers renders as binary in the UI and makes any
+  # lookup by id miss.
+  #
+  # The vtab accepts either form on input, so a value already stored as hex
+  # text is passed through rather than double-encoded; the widths are fixed and
+  # distinct, so the two cases cannot be confused.
+  defp hex_id(nil, _raw_size), do: nil
+  defp hex_id("", _raw_size), do: nil
+
+  defp hex_id(value, raw_size) when is_binary(value) do
+    case byte_size(value) do
+      ^raw_size -> Base.encode16(value, case: :lower)
+      _ -> String.downcase(value)
+    end
+  end
+
+  defp hex_id(value, _raw_size), do: value
 
   defp decode_json_object(nil), do: %{}
   defp decode_json_object(""), do: %{}
