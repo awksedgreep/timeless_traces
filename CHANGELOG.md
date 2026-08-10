@@ -2,6 +2,22 @@
 
 This changelog starts at 1.4.5; earlier releases are recorded by git
 tags and `bench/results/*.md` session documents.
+## 1.8.0 (2026-08-09)
+
+**The libSQL engine reports trace and span ids as lowercase hex.** The store
+keeps them as BLOBs — 16 bytes for a trace, 8 for a span — and the read path
+handed the raw blob to callers. Dashboards rendered binary, and a lookup using
+an id the engine had just reported would miss. The Elixir engine always
+round-tripped hex, and `Index.trace/1` decodes with `Base.decode16!/2`, so hex
+is the contract both sides of this library already assumed.
+
+The vtab accepts a blob or hex text on input, so both forms now converge on hex
+output. Widths are fixed and distinct, so a value already stored as hex text is
+passed through rather than double-encoded.
+
+Minor rather than patch: code written against the raw blob will see a different
+value. Two of this library's own tests were in that position — they wrote binary
+ids and asserted binary back, encoding the defect.
 
 ## 1.7.0 (2026-08-09)
 
