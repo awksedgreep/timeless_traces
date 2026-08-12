@@ -94,6 +94,29 @@ defmodule TimelessTraces.LibsqlEngineTest do
     assert bytes > 0
   end
 
+  test "stats reports compressed blocks after optimize (dashboard tile contract)", %{dir: dir} do
+    start_engine!(dir)
+
+    assert :ok = TimelessTraces.LibsqlEngine.ingest(Enum.map(1..50, &span/1))
+    assert :ok = TimelessTraces.LibsqlEngine.flush()
+
+    assert {:ok, %TimelessTraces.Stats{} = raw_stats} = TimelessTraces.LibsqlEngine.stats()
+    assert raw_stats.raw_blocks > 0
+    assert raw_stats.compressed_blocks == 0
+
+    assert {:ok, _} = TimelessTraces.LibsqlEngine.optimize()
+
+    assert {:ok, %TimelessTraces.Stats{} = stats} = TimelessTraces.LibsqlEngine.stats()
+    # compressed_*, not zstd_*: the libSQL engine writes adaptive columnar
+    # blocks; the per-format zstd/openzl fields belong to the legacy engine.
+    assert stats.raw_blocks == 0
+    assert stats.compressed_blocks > 0
+    assert stats.compressed_bytes > 0
+    assert stats.zstd_blocks == 0
+    assert stats.compaction_count > 0
+    assert stats.total_blocks == stats.compressed_blocks
+  end
+
   test "cold reopen preserves spans ingested without an explicit flush", %{dir: dir} do
     start_engine!(dir)
     assert :ok = TimelessTraces.LibsqlEngine.ingest(for i <- 1..5, do: span(i))

@@ -171,6 +171,12 @@ defmodule TimelessTraces.LibsqlEngine do
            total_bytes: int.("bytes_on_disk") || 0,
            disk_size: int.("bytes_on_disk") || 0,
            raw_blocks: int.("raw_blocks") || 0,
+           raw_bytes: int.("raw_bytes") || 0,
+           compressed_blocks: int.("compressed_blocks") || 0,
+           compressed_bytes: int.("compressed_bytes") || 0,
+           compression_raw_bytes_in: int.("optimize_raw_input_bytes") || 0,
+           compression_compressed_bytes_out: int.("optimize_raw_output_bytes") || 0,
+           compaction_count: int.("optimize_count") || 0,
            oldest_timestamp: int.("ts_min"),
            newest_timestamp: int.("ts_max")
          }}

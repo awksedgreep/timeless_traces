@@ -12,6 +12,12 @@ defmodule TimelessTraces.Stats do
             index_size: 0,
             raw_blocks: 0,
             raw_bytes: 0,
+            # Authoritative compressed totals, format-agnostic. zstd_*/openzl_*
+            # below are the LEGACY engine's per-format breakdown and stay 0 on
+            # the libSQL engine (adaptive columnar blocks; zstd is only an
+            # internal per-column strategy there).
+            compressed_blocks: 0,
+            compressed_bytes: 0,
             raw_entries: 0,
             zstd_blocks: 0,
             zstd_bytes: 0,
@@ -33,6 +39,8 @@ defmodule TimelessTraces.Stats do
           index_size: non_neg_integer(),
           raw_blocks: non_neg_integer(),
           raw_bytes: non_neg_integer(),
+          compressed_blocks: non_neg_integer(),
+          compressed_bytes: non_neg_integer(),
           raw_entries: non_neg_integer(),
           zstd_blocks: non_neg_integer(),
           zstd_bytes: non_neg_integer(),
