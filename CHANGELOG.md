@@ -2,6 +2,24 @@
 
 This changelog starts at 1.4.5; earlier releases are recorded by git
 tags and `bench/results/*.md` session documents.
+
+## 1.10.0 (2026-08-11)
+
+**Compressed blocks are visible on the libSQL engine.** `%Stats{}` gains
+format-agnostic `compressed_blocks`/`compressed_bytes` as the authoritative
+totals, mapped from `timeless_stats('traces')` along with `raw_bytes`,
+compression ratio, and compaction count — keys the extension exports as of
+timeless-libsql v0.6.1. `zstd_*`/`openzl_*` remain the legacy engine's
+per-format breakdown and stay 0 on libSQL.
+
+Pairs with timeless-libsql v0.6.1, whose engines auto-optimize from the flush
+heartbeat: embedded stores now compress without any host scheduling. Before
+this pairing, a libSQL store embedded via this package accumulated raw blocks
+indefinitely. CI's extension pin also moves v0.5.0 → v0.6.1 (it was two
+release lines stale).
+
+Tests clean their `test/tmp` state in setup/on_exit and at suite start.
+
 ## 1.8.0 (2026-08-09)
 
 **The libSQL engine reports trace and span ids as lowercase hex.** The store
