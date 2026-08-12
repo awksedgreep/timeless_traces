@@ -3,6 +3,17 @@
 This changelog starts at 1.4.5; earlier releases are recorded by git
 tags and `bench/results/*.md` session documents.
 
+## 1.11.0 (2026-08-11)
+
+**The compression ratio survives restarts.** `compression_raw_bytes_in`/`out`
+come from the totals extension 0.6.2 persists in the store's `_meta`, not
+process-local profile counters — the dashboard ratio tile showed "pending"
+over a fully compressed store after every restart.
+
+**`%Stats{}` gains `storage_mode`** (`:libsql` from the libSQL engine, the
+configured `:disk`/`:memory` from the legacy engine), and the libSQL mapping
+fills `index_size` from `index_bytes`, previously left at 0.
+
 ## 1.10.0 (2026-08-11)
 
 **Compressed blocks are visible on the libSQL engine.** `%Stats{}` gains
