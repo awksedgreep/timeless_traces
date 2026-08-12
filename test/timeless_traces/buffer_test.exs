@@ -2,6 +2,8 @@ defmodule TimelessTraces.BufferTest do
   use ExUnit.Case, async: false
 
   setup do
+    File.rm_rf!("test/tmp/buffer_should_not_exist")
+
     Application.stop(:timeless_traces)
     Application.put_env(:timeless_traces, :storage, :memory)
     Application.put_env(:timeless_traces, :data_dir, "test/tmp/buffer_should_not_exist")
@@ -14,6 +16,7 @@ defmodule TimelessTraces.BufferTest do
     on_exit(fn ->
       Application.stop(:timeless_traces)
       Application.put_env(:timeless_traces, :storage, :disk)
+      File.rm_rf!("test/tmp/buffer_should_not_exist")
     end)
 
     :ok

@@ -12,6 +12,8 @@ defmodule TimelessTraces.VTracesCompatTest do
   @port 31_029
 
   setup do
+    File.rm_rf!("test/tmp/vtraces_compat")
+
     Application.stop(:timeless_traces)
     Application.put_env(:timeless_traces, :storage, :memory)
     Application.put_env(:timeless_traces, :data_dir, "test/tmp/vtraces_compat")
@@ -26,6 +28,7 @@ defmodule TimelessTraces.VTracesCompatTest do
     on_exit(fn ->
       Application.stop(:timeless_traces)
       Application.put_env(:timeless_traces, :storage, :disk)
+      File.rm_rf!("test/tmp/vtraces_compat")
     end)
 
     :ok
