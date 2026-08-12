@@ -113,8 +113,19 @@ defmodule TimelessTraces.LibsqlEngineTest do
     assert stats.compressed_blocks > 0
     assert stats.compressed_bytes > 0
     assert stats.zstd_blocks == 0
+    assert stats.storage_mode == :libsql
+    assert stats.index_size > 0
     assert stats.compaction_count > 0
     assert stats.total_blocks == stats.compressed_blocks
+    assert stats.compression_raw_bytes_in > 0
+    assert stats.compression_compressed_bytes_out > 0
+
+    # Persisted in the store, not the process — must survive a restart.
+    stop_supervised!(TimelessTraces.LibsqlEngine)
+    start_engine!(dir)
+    assert {:ok, %TimelessTraces.Stats{} = reopened} = TimelessTraces.LibsqlEngine.stats()
+    assert reopened.compression_raw_bytes_in == stats.compression_raw_bytes_in
+    assert reopened.compression_compressed_bytes_out == stats.compression_compressed_bytes_out
   end
 
   test "cold reopen preserves spans ingested without an explicit flush", %{dir: dir} do

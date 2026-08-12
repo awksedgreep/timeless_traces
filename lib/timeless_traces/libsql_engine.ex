@@ -166,16 +166,20 @@ defmodule TimelessTraces.LibsqlEngine do
 
         {:ok,
          %TimelessTraces.Stats{
+           storage_mode: :libsql,
            total_blocks: int.("blocks") || 0,
            total_entries: int.("total_spans") || 0,
            total_bytes: int.("bytes_on_disk") || 0,
            disk_size: int.("bytes_on_disk") || 0,
+           index_size: int.("index_bytes") || 0,
            raw_blocks: int.("raw_blocks") || 0,
            raw_bytes: int.("raw_bytes") || 0,
            compressed_blocks: int.("compressed_blocks") || 0,
            compressed_bytes: int.("compressed_bytes") || 0,
-           compression_raw_bytes_in: int.("optimize_raw_input_bytes") || 0,
-           compression_compressed_bytes_out: int.("optimize_raw_output_bytes") || 0,
+           # Persisted totals (extension 0.6.2), not the process-local
+           # optimize_raw_* profile counters — see the logs twin.
+           compression_raw_bytes_in: int.("compression_input_bytes_total") || 0,
+           compression_compressed_bytes_out: int.("compression_output_bytes_total") || 0,
            compaction_count: int.("optimize_count") || 0,
            oldest_timestamp: int.("ts_min"),
            newest_timestamp: int.("ts_max")

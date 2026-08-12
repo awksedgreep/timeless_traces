@@ -186,6 +186,7 @@ defmodule TimelessTraces.Index do
 
     {:ok,
      %TimelessTraces.Stats{
+       storage_mode: TimelessTraces.Config.storage(),
        total_blocks: total_blocks,
        total_entries: total_entries,
        total_bytes: total_bytes,
