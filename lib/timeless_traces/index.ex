@@ -44,20 +44,64 @@ defmodule TimelessTraces.Index do
     storage = :persistent_term.get({__MODULE__, :storage})
 
     {search_filters, pagination} = split_pagination(filters)
-    {term_filters, time_filters} = split_filters(search_filters)
 
-    # Partition at the hot-tail boundary: memory serves start_time >=
-    # boundary, disk serves older — exact union, no dedup.
-    boundary = TimelessTraces.HotTail.boundary()
+    case Keyword.fetch(search_filters, :trace_id) do
+      {:ok, trace_id} ->
+        query_trace_id(trace_id, Keyword.delete(search_filters, :trace_id), pagination)
 
-    {tail_entries, tail_total, disk_time_filters} =
-      tail_partition(search_filters, time_filters, boundary, pagination)
+      :error ->
+        {term_filters, time_filters} = split_filters(search_filters)
 
-    do_query_parallel(db, storage, term_filters, disk_time_filters, pagination, search_filters,
-      tail_entries: tail_entries,
-      tail_total: tail_total,
-      boundary: boundary
+        # Partition at the hot-tail boundary: memory serves start_time >=
+        # boundary, disk serves older — exact union, no dedup.
+        boundary = TimelessTraces.HotTail.boundary()
+
+        {tail_entries, tail_total, disk_time_filters} =
+          tail_partition(search_filters, time_filters, boundary, pagination)
+
+        do_query_parallel(
+          db,
+          storage,
+          term_filters,
+          disk_time_filters,
+          pagination,
+          search_filters,
+          tail_entries: tail_entries,
+          tail_total: tail_total,
+          boundary: boundary
+        )
+    end
+  end
+
+  defp query_trace_id(trace_id, residual_filters, pagination) do
+    started_at = System.monotonic_time()
+    {:ok, spans, blocks_read} = trace_with_block_count(trace_id)
+    order = Keyword.get(pagination, :order, :desc)
+    limit = Keyword.get(pagination, :limit, @default_limit)
+    offset = Keyword.get(pagination, :offset, @default_offset)
+
+    matched =
+      spans
+      |> TimelessTraces.Filter.filter(residual_filters)
+      |> sort_spans(order)
+
+    entries = matched |> Enum.drop(offset) |> Enum.take(limit)
+    total = length(matched)
+
+    TimelessTraces.Telemetry.event(
+      [:timeless_traces, :query, :stop],
+      %{duration: System.monotonic_time() - started_at, total: total, blocks_read: blocks_read},
+      %{filters: [{:trace_id, trace_id} | residual_filters], count_total: true}
     )
+
+    {:ok,
+     %TimelessTraces.Result{
+       entries: entries,
+       total: total,
+       limit: limit,
+       offset: offset,
+       has_more: offset + length(entries) < total
+     }}
   end
 
   # Page entries always come from a bounded walk (never a full-tail
@@ -110,6 +154,10 @@ defmodule TimelessTraces.Index do
 
   @spec trace(String.t()) :: {:ok, [TimelessTraces.Span.t()]}
   def trace(trace_id) do
+    with {:ok, spans, _blocks_read} <- trace_with_block_count(trace_id), do: {:ok, spans}
+  end
+
+  defp trace_with_block_count(trace_id) do
     db = :persistent_term.get({__MODULE__, :db})
     storage = :persistent_term.get({__MODULE__, :storage})
     trace_keys = trace_lookup_keys(trace_id)
@@ -145,7 +193,7 @@ defmodule TimelessTraces.Index do
         |> TimelessTraces.HotTail.trace_spans()
         |> Enum.map(&TimelessTraces.Span.from_map/1)
 
-      {:ok, Enum.uniq_by(disk_spans ++ tail_spans, & &1.span_id)}
+      {:ok, Enum.uniq_by(disk_spans ++ tail_spans, & &1.span_id), length(block_info)}
     end
   end
 
@@ -220,9 +268,9 @@ defmodule TimelessTraces.Index do
   def matching_block_ids(filters) do
     db = :persistent_term.get({__MODULE__, :db})
     {search_filters, pagination} = split_pagination(filters)
-    {term_filters, time_filters} = split_filters(search_filters)
+    {term_filters, block_filters} = split_filters(search_filters)
     order = Keyword.get(pagination, :order, :asc)
-    find_matching_blocks(db, term_filters, time_filters, order)
+    find_matching_blocks(db, term_filters, block_filters, order)
   end
 
   @spec raw_block_stats() :: %{
@@ -722,7 +770,7 @@ defmodule TimelessTraces.Index do
 
     TimelessTraces.DB.execute(
       conn,
-      "INSERT OR REPLACE INTO blocks (block_id, file_path, byte_size, entry_count, ts_min, ts_max, format, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+      "INSERT OR REPLACE INTO blocks (block_id, file_path, byte_size, entry_count, ts_min, ts_max, duration_min, duration_max, format, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
       [
         meta.block_id,
         meta[:file_path],
@@ -730,6 +778,8 @@ defmodule TimelessTraces.Index do
         meta.entry_count,
         meta.ts_min,
         meta.ts_max,
+        meta[:duration_min],
+        meta[:duration_max],
         format,
         created_at
       ]
@@ -940,7 +990,7 @@ defmodule TimelessTraces.Index do
 
   # --- SQL read helpers ---
 
-  defp find_matching_blocks(db, term_filters, time_filters, order) do
+  defp find_matching_blocks(db, term_filters, block_filters, order) do
     terms = build_query_terms(term_filters)
 
     # Order by the bound that limits what a block can still contribute:
@@ -949,7 +999,7 @@ defmodule TimelessTraces.Index do
     # waterline early-exit correct even when block time ranges overlap.
     order_sql = if order == :asc, do: "ts_min ASC", else: "ts_max DESC"
 
-    {conditions, params} = build_block_conditions(terms, time_filters)
+    {conditions, params} = build_block_conditions(terms, block_filters)
     where = if conditions == [], do: "", else: " WHERE " <> Enum.join(conditions, " AND ")
 
     sql =
@@ -962,7 +1012,7 @@ defmodule TimelessTraces.Index do
     end)
   end
 
-  defp build_block_conditions(terms, time_filters) do
+  defp build_block_conditions(terms, block_filters) do
     {conditions, params, idx} =
       case terms do
         [] ->
@@ -979,9 +1029,18 @@ defmodule TimelessTraces.Index do
       end
 
     {time_conds, time_params, _} =
-      Enum.reduce(time_filters, {[], [], idx}, fn
-        {:since, ts}, {c, p, i} -> {c ++ ["ts_max >= ?#{i}"], p ++ [to_nanos(ts)], i + 1}
-        {:until, ts}, {c, p, i} -> {c ++ ["ts_min <= ?#{i}"], p ++ [to_nanos(ts)], i + 1}
+      Enum.reduce(block_filters, {[], [], idx}, fn
+        {:since, ts}, {c, p, i} ->
+          {c ++ ["ts_max >= ?#{i}"], p ++ [to_nanos(ts)], i + 1}
+
+        {:until, ts}, {c, p, i} ->
+          {c ++ ["ts_min <= ?#{i}"], p ++ [to_nanos(ts)], i + 1}
+
+        {:min_duration, duration}, {c, p, i} ->
+          {c ++ ["(duration_max IS NULL OR duration_max >= ?#{i})"], p ++ [duration], i + 1}
+
+        {:max_duration, duration}, {c, p, i} ->
+          {c ++ ["(duration_min IS NULL OR duration_min <= ?#{i})"], p ++ [duration], i + 1}
       end)
 
     {conditions ++ time_conds, params ++ time_params}
@@ -1029,6 +1088,8 @@ defmodule TimelessTraces.Index do
           meta.entry_count,
           meta.ts_min,
           meta.ts_max,
+          meta[:duration_min],
+          meta[:duration_max],
           format,
           created_at
         ]
@@ -1054,7 +1115,7 @@ defmodule TimelessTraces.Index do
       TimelessTraces.DB.write_transaction(state.db, fn conn ->
         TimelessTraces.DB.execute_batch(
           conn,
-          "INSERT OR REPLACE INTO blocks (block_id, file_path, byte_size, entry_count, ts_min, ts_max, format, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+          "INSERT OR REPLACE INTO blocks (block_id, file_path, byte_size, entry_count, ts_min, ts_max, duration_min, duration_max, format, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
           Enum.reverse(block_params_list)
         )
 
@@ -1533,24 +1594,49 @@ defmodule TimelessTraces.Index do
   defp split_filters(filters) do
     term_filters =
       Enum.filter(filters, fn {k, _v} ->
-        k in [:name, :kind, :status, :service, :attributes]
+        k in [:kind, :status, :service, :attributes]
       end)
 
-    time_filters =
-      Enum.filter(filters, fn {k, _v} -> k in [:since, :until] end)
+    block_filters =
+      Enum.filter(filters, fn {k, _v} -> k in [:since, :until, :min_duration, :max_duration] end)
 
-    {term_filters, time_filters}
+    {term_filters, block_filters}
   end
 
   defp build_query_terms(term_filters) do
     Enum.flat_map(term_filters, fn
-      {:name, name} -> ["name:#{name}"]
-      {:kind, kind} -> ["kind:#{kind}"]
-      {:status, status} -> ["status:#{status}"]
-      {:service, svc} -> ["service.name:#{svc}"]
-      {:attributes, map} -> Enum.map(map, fn {k, v} -> "#{k}:#{v}" end)
-      _ -> []
+      {:kind, kind} ->
+        ["kind:#{kind}"]
+
+      {:status, status} ->
+        ["status:#{status}"]
+
+      {:service, svc} ->
+        ["service.name:#{svc}"]
+
+      {:attributes, map} ->
+        Enum.flat_map(map, fn {k, v} ->
+          key = to_string(k)
+          if indexable_attribute?(key), do: ["#{key}:#{v}"], else: []
+        end)
+
+      _ ->
+        []
     end)
+  end
+
+  defp indexable_attribute?(key) do
+    key in [
+      "host",
+      "host.name",
+      "service.name",
+      "http.method",
+      "http.status_code",
+      "http.route",
+      "db.system",
+      "rpc.system",
+      "messaging.system"
+    ]
   end
 
   # --- Migration from old ETS snapshot ---

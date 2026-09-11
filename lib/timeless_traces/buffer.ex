@@ -23,8 +23,6 @@ defmodule TimelessTraces.Buffer do
     GenServer.start_link(__MODULE__, opts, name: name)
   end
 
-  @backpressure_poll_ms 20
-
   @spec ingest([map()]) :: :ok
   def ingest(spans) when is_list(spans) do
     # Producer-side tail insert makes spans queryable the moment this
@@ -32,8 +30,10 @@ defmodule TimelessTraces.Buffer do
     TimelessTraces.HotTail.insert_many(spans)
     TimelessTraces.DataPlaneStats.admit_spans(length(spans))
 
+    shard_count = TimelessTraces.BufferShard.count()
+
     spans
-    |> Enum.group_by(&TimelessTraces.BufferShard.shard_for/1)
+    |> Enum.group_by(&TimelessTraces.BufferShard.shard_for(&1, shard_count))
     |> Enum.each(fn {shard, shard_spans} ->
       if TimelessTraces.IngestPressure.overloaded?(shard) do
         # Above the watermark the producer blocks here until the drain
@@ -51,25 +51,23 @@ defmodule TimelessTraces.Buffer do
       GenServer.cast(TimelessTraces.BufferShard.name(shard), {:ingest, shard_spans})
     end)
 
+    TimelessTraces.Subscriber.broadcast(spans)
     :ok
   end
 
-  defp wait_for_capacity(shard, timeout_left) when timeout_left <= 0 do
-    # Drain has stalled outright (e.g. dead disk). Accept anyway — losing
-    # spans during normal operation is not acceptable — but say so loudly.
-    Logger.error(
-      "TimelessTraces: ingest backpressure wait timed out on shard #{shard}; accepting anyway"
-    )
+  defp wait_for_capacity(shard, timeout) do
+    case TimelessTraces.IngestPressure.await_capacity(shard, timeout) do
+      :ok ->
+        :ok
 
-    :ok
-  end
+      :timeout ->
+        # Drain has stalled outright (e.g. dead disk). Accept anyway — losing
+        # spans during normal operation is not acceptable — but say so loudly.
+        Logger.error(
+          "TimelessTraces: ingest backpressure wait timed out on shard #{shard}; accepting anyway"
+        )
 
-  defp wait_for_capacity(shard, timeout_left) do
-    if TimelessTraces.IngestPressure.overloaded?(shard) do
-      Process.sleep(@backpressure_poll_ms)
-      wait_for_capacity(shard, timeout_left - @backpressure_poll_ms)
-    else
-      :ok
+        :ok
     end
   end
 
@@ -81,13 +79,20 @@ defmodule TimelessTraces.Buffer do
   end
 
   defp drain_to(target, deadline) do
-    for shard <- 0..(TimelessTraces.BufferShard.count() - 1) do
-      GenServer.call(
-        TimelessTraces.BufferShard.name(shard),
-        :flush,
-        TimelessTraces.Config.query_timeout()
-      )
-    end
+    timeout = TimelessTraces.Config.query_timeout()
+
+    0..(TimelessTraces.BufferShard.count() - 1)
+    |> Task.async_stream(
+      fn shard -> GenServer.call(TimelessTraces.BufferShard.name(shard), :flush, timeout) end,
+      ordered: false,
+      max_concurrency: TimelessTraces.BufferShard.count(),
+      timeout: timeout
+    )
+    |> Enum.each(fn
+      {:ok, :ok} -> :ok
+      {:ok, other} -> raise "TimelessTraces shard flush failed: #{inspect(other)}"
+      {:exit, reason} -> exit(reason)
+    end)
 
     # Buffer tasks publish block metadata asynchronously. A flush is not a
     # durability barrier until that index mailbox is committed as well.
@@ -137,7 +142,6 @@ defmodule TimelessTraces.Buffer do
 
   @impl true
   def handle_cast({:ingest, spans}, state) do
-    broadcast_to_subscribers(spans)
     buffer = spans ++ state.buffer
     size = state.buffer_size + length(spans)
 
@@ -328,34 +332,5 @@ defmodule TimelessTraces.Buffer do
 
   defp schedule_flush(interval) do
     Process.send_after(self(), :flush_timer, interval)
-  end
-
-  defp broadcast_to_subscribers(spans) do
-    case Registry.count_match(TimelessTraces.Registry, :spans, :_) do
-      0 ->
-        :ok
-
-      _n ->
-        span_structs =
-          Enum.map(spans, fn span ->
-            {span, TimelessTraces.Span.from_map(span)}
-          end)
-
-        Registry.dispatch(TimelessTraces.Registry, :spans, fn subscribers ->
-          for {pid, opts} <- subscribers do
-            for {span, span_struct} <- span_structs do
-              if matches_subscription?(span, opts) do
-                send(pid, {:timeless_traces, :span, span_struct})
-              end
-            end
-          end
-        end)
-    end
-  end
-
-  defp matches_subscription?(_span, []), do: true
-
-  defp matches_subscription?(span, opts) do
-    TimelessTraces.Filter.matches?(span, opts)
   end
 end

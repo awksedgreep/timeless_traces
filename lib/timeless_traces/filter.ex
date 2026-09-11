@@ -3,15 +3,29 @@ defmodule TimelessTraces.Filter do
 
   @spec filter([map()], keyword()) :: [map()]
   def filter(entries, filters) do
-    Enum.filter(entries, &matches?(&1, filters))
+    prepared = prepare(filters)
+    Enum.filter(entries, &matches_prepared?(&1, prepared))
   end
 
   @spec matches?(map(), keyword()) :: boolean()
   def matches?(span, filters) do
-    Enum.all?(filters, fn
-      {:name, pattern} ->
-        downcased = String.downcase(pattern)
+    matches_prepared?(span, prepare(filters))
+  end
 
+  @doc false
+  @spec prepare(keyword()) :: keyword()
+  def prepare(filters) do
+    Enum.map(filters, fn
+      {:name, pattern} -> {:name_downcase, String.downcase(pattern)}
+      filter -> filter
+    end)
+  end
+
+  @doc false
+  @spec matches_prepared?(map(), keyword()) :: boolean()
+  def matches_prepared?(span, filters) do
+    Enum.all?(filters, fn
+      {:name_downcase, downcased} ->
         String.contains?(String.downcase(to_string(span.name)), downcased) or
           Enum.any?(Map.get(span, :attributes, %{}) || %{}, fn {_k, v} ->
             is_binary(v) and String.contains?(String.downcase(v), downcased)

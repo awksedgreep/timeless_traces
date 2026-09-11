@@ -125,7 +125,23 @@ defmodule TimelessTraces.DB.Migrations do
     run_from(conn, 2)
   end
 
-  defp run_from(_conn, 2), do: :ok
+  defp run_from(conn, 2) do
+    execute(conn, "BEGIN")
+    execute(conn, "ALTER TABLE blocks ADD COLUMN duration_min INTEGER")
+    execute(conn, "ALTER TABLE blocks ADD COLUMN duration_max INTEGER")
+
+    execute(
+      conn,
+      "CREATE INDEX IF NOT EXISTS idx_blocks_duration ON blocks(duration_min, duration_max)"
+    )
+
+    set_version(conn, 3)
+    execute(conn, "COMMIT")
+
+    run_from(conn, 3)
+  end
+
+  defp run_from(_conn, 3), do: :ok
 
   defp execute(conn, sql, params \\ []) do
     execute_with_retry(conn, sql, params, @max_retries)

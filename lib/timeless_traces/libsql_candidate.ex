@@ -337,7 +337,11 @@ defmodule TimelessTraces.LibsqlCandidate do
       "PRAGMA page_size = 16384",
       "PRAGMA journal_mode = WAL",
       "PRAGMA synchronous = NORMAL",
+      "PRAGMA cache_size = #{TimelessTraces.Config.sqlite_cache_size()}",
       "PRAGMA auto_vacuum = INCREMENTAL",
+      "PRAGMA mmap_size = #{TimelessTraces.Config.sqlite_mmap_size()}",
+      "PRAGMA wal_autocheckpoint = #{TimelessTraces.Config.sqlite_wal_autocheckpoint()}",
+      "PRAGMA temp_store = MEMORY",
       "PRAGMA busy_timeout = 5000",
       traces_create(retention_seconds),
       """

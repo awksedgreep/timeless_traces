@@ -199,4 +199,25 @@ defmodule TimelessTraces.Config do
   def ingest_shard_count do
     Application.get_env(:timeless_traces, :ingest_shard_count, 4)
   end
+
+  @doc false
+  def sqlite_cache_size, do: Application.get_env(:timeless_traces, :sqlite_cache_size, -128_000)
+
+  @doc false
+  def sqlite_reader_cache_size,
+    do: Application.get_env(:timeless_traces, :sqlite_reader_cache_size, -8_000)
+
+  @doc false
+  def sqlite_mmap_size do
+    default = if System.get_env("CI"), do: 0, else: 2_147_483_648
+    Application.get_env(:timeless_traces, :sqlite_mmap_size, default)
+  end
+
+  @doc false
+  def sqlite_wal_autocheckpoint,
+    do: Application.get_env(:timeless_traces, :sqlite_wal_autocheckpoint, 1_000)
+
+  @doc false
+  def libsql_reader_pool_size,
+    do: Application.get_env(:timeless_traces, :libsql_reader_pool_size, 4)
 end

@@ -127,9 +127,11 @@ defmodule TimelessTraces.HotTail do
       {table, _floor} ->
         safe(
           fn ->
+            filters = TimelessTraces.Filter.prepare(search_filters)
+
             table
             |> :ets.select(range_spec(since_us, until_us), 5_000)
-            |> count_chunks(search_filters, 0)
+            |> count_chunks(filters, 0)
           end,
           0
         )
@@ -139,7 +141,7 @@ defmodule TimelessTraces.HotTail do
   defp count_chunks(:"$end_of_table", _filters, acc), do: acc
 
   defp count_chunks({chunk, cont}, filters, acc) do
-    n = Enum.count(chunk, &TimelessTraces.Filter.matches?(&1, filters))
+    n = Enum.count(chunk, &TimelessTraces.Filter.matches_prepared?(&1, filters))
     count_chunks(:ets.select(cont), filters, acc + n)
   end
 
@@ -159,56 +161,38 @@ defmodule TimelessTraces.HotTail do
       {table, _floor} ->
         safe(
           fn ->
-            start_key =
-              case order do
-                # :infinity compares greater than any integer uniq, so
-                # prev/next land on the edge key inside the range.
-                :desc ->
-                  case until_us do
-                    nil -> :ets.last(table)
-                    ts -> :ets.prev(table, {ts, :infinity})
-                  end
+            filters = TimelessTraces.Filter.prepare(search_filters)
+            spec = range_spec(since_us, until_us)
+            chunk_size = min(max(max * 2, 100), 5_000)
 
-                :asc ->
-                  case since_us do
-                    nil -> :ets.first(table)
-                    ts -> :ets.next(table, {ts - 1, :infinity})
-                  end
+            selection =
+              case order do
+                :asc -> :ets.select(table, spec, chunk_size)
+                :desc -> :ets.select_reverse(table, spec, chunk_size)
               end
 
-            walk(table, start_key, since_us, until_us, order, search_filters, max, [])
+            take_chunks(selection, filters, max, [])
           end,
           []
         )
     end
   end
 
-  defp walk(_table, :"$end_of_table", _since, _until, _order, _filters, _max, acc),
-    do: Enum.reverse(acc)
+  defp take_chunks(:"$end_of_table", _filters, _max, acc), do: Enum.reverse(acc)
 
-  defp walk(_table, _key, _since, _until, _order, _filters, 0, acc), do: Enum.reverse(acc)
+  defp take_chunks({chunk, continuation}, filters, max, acc) do
+    selected =
+      chunk
+      |> Enum.filter(&TimelessTraces.Filter.matches_prepared?(&1, filters))
+      |> Enum.take(max)
 
-  defp walk(table, {ts, _uniq} = key, since_us, until_us, order, filters, max, acc) do
-    out_of_range =
-      (order == :desc and since_us != nil and ts < since_us) or
-        (order == :asc and until_us != nil and ts > until_us)
+    acc = Enum.reverse(selected, acc)
+    remaining = max - length(selected)
 
-    if out_of_range do
+    if remaining == 0 do
       Enum.reverse(acc)
     else
-      {acc, max} =
-        case :ets.lookup(table, key) do
-          [{^key, entry}] ->
-            if TimelessTraces.Filter.matches?(entry, filters),
-              do: {[entry | acc], max - 1},
-              else: {acc, max}
-
-          _ ->
-            {acc, max}
-        end
-
-      next_key = if order == :desc, do: :ets.prev(table, key), else: :ets.next(table, key)
-      walk(table, next_key, since_us, until_us, order, filters, max, acc)
+      take_chunks(:ets.select(continuation), filters, remaining, acc)
     end
   end
 
@@ -302,6 +286,11 @@ defmodule TimelessTraces.HotTail do
         :ok
 
       key ->
+        case :ets.lookup(table, key) do
+          [{^key, span}] -> :ets.delete_object(@trace_table, {span.trace_id, key})
+          _ -> :ok
+        end
+
         :ets.delete(table, key)
         delete_oldest(table, n - 1)
     end

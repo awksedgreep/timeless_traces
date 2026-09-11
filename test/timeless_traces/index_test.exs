@@ -127,6 +127,27 @@ defmodule TimelessTraces.IndexTest do
       assert hd(entries).name == "HTTP GET"
     end
 
+    test "name substring and unindexed attribute filters do not cause false-negative pruning" do
+      spans = [
+        make_span(%{name: "HTTP GET /users", attributes: %{"custom.tenant" => "acme"}}),
+        make_span(%{name: "DB Query", attributes: %{"custom.tenant" => "other"}})
+      ]
+
+      {:ok, meta} = TimelessTraces.Writer.write_block(spans, :memory, :raw)
+      {terms, trace_rows} = TimelessTraces.Index.precompute(spans)
+      :ok = TimelessTraces.Index.index_block(meta, terms, trace_rows)
+
+      assert {:ok, %TimelessTraces.Result{entries: [by_name], total: 1}} =
+               TimelessTraces.Index.query(name: "users")
+
+      assert by_name.name == "HTTP GET /users"
+
+      assert {:ok, %TimelessTraces.Result{entries: [by_attribute], total: 1}} =
+               TimelessTraces.Index.query(attributes: %{"custom.tenant" => "acme"})
+
+      assert by_attribute.name == "HTTP GET /users"
+    end
+
     test "queries by status term" do
       spans = [
         make_span(%{status: :ok}),
@@ -146,6 +167,22 @@ defmodule TimelessTraces.IndexTest do
 
       assert length(entries) == 1
       assert hd(entries).status == :error
+    end
+
+    test "duration bounds prune blocks before decompression" do
+      fast_spans = [make_span(%{duration_ns: 10, end_time: 1_000_000_010})]
+      slow_spans = [make_span(%{duration_ns: 1_000, end_time: 1_000_001_000})]
+
+      {:ok, fast_meta} = TimelessTraces.Writer.write_block(fast_spans, :memory, :raw)
+      {:ok, slow_meta} = TimelessTraces.Writer.write_block(slow_spans, :memory, :raw)
+
+      for {meta, spans} <- [{fast_meta, fast_spans}, {slow_meta, slow_spans}] do
+        {terms, trace_rows} = TimelessTraces.Index.precompute(spans)
+        :ok = TimelessTraces.Index.index_block(meta, terms, trace_rows)
+      end
+
+      matching = TimelessTraces.Index.matching_block_ids(min_duration: 500)
+      assert Enum.map(matching, &elem(&1, 0)) == [slow_meta.block_id]
     end
 
     test "queries by kind" do
@@ -200,6 +237,23 @@ defmodule TimelessTraces.IndexTest do
       {:ok, trace_spans} = TimelessTraces.Index.trace("trace-abc")
       assert length(trace_spans) == 3
       assert Enum.all?(trace_spans, &(&1.trace_id == "trace-abc"))
+    end
+
+    test "query routes trace_id through the trace index and still applies residual filters" do
+      spans = [
+        make_span(%{trace_id: "trace-query", status: :ok, name: "first"}),
+        make_span(%{trace_id: "trace-query", status: :error, name: "second"}),
+        make_span(%{trace_id: "other-trace", status: :error, name: "other"})
+      ]
+
+      {:ok, meta} = TimelessTraces.Writer.write_block(spans, :memory, :raw)
+      {terms, trace_rows} = TimelessTraces.Index.precompute(spans)
+      :ok = TimelessTraces.Index.index_block(meta, terms, trace_rows)
+
+      assert {:ok, %TimelessTraces.Result{entries: [entry], total: 1}} =
+               TimelessTraces.query(trace_id: "trace-query", status: :error)
+
+      assert entry.name == "second"
     end
 
     test "retrieves traces stored with packed hex trace ids" do

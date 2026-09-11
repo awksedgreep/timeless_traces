@@ -11,6 +11,11 @@ All configuration is set under the `:timeless_traces` application key in `config
 | `flush_interval` | integer (ms) | `1_000` | Buffer auto-flush interval |
 | `max_buffer_size` | integer | `1_000` | Max spans before forced flush |
 | `query_timeout` | integer (ms) | `30_000` | Query timeout |
+| `libsql_reader_pool_size` | positive integer | `4` | Concurrent read connections for the libSQL engine |
+| `sqlite_cache_size` | integer (pages/KiB) | `-128_000` | SQLite writer page-cache setting |
+| `sqlite_reader_cache_size` | integer (pages/KiB) | `-8_000` | SQLite per-reader page-cache setting |
+| `sqlite_mmap_size` | integer (bytes) | `2_147_483_648` (`0` in CI) | SQLite memory-map target |
+| `sqlite_wal_autocheckpoint` | integer (pages) | `1_000` | WAL auto-checkpoint threshold (~16 MiB at the default page size) |
 | `compaction_threshold` | integer | `500` | Min raw entries to trigger compaction |
 | `compaction_interval` | integer (ms) | `30_000` | Compaction check interval |
 | `compaction_max_raw_age` | integer (s) | `60` | Force compact raw blocks older than this |
@@ -20,8 +25,8 @@ All configuration is set under the `:timeless_traces` application key in `config
 | `compression_level` | integer | `6` | Compression level (1-22) |
 | `index_publish_interval` | integer (ms) | `2_000` | Index batch write interval |
 | `retention_max_age` | integer (s) or nil | `604_800` (7 days) | Max span age (`nil` = keep forever) |
-| `retention_max_size` | integer (bytes) or nil | `536_870_912` (512 MB) | Max storage size (`nil` = unlimited) |
-| `retention_check_interval` | integer (ms) | `300_000` (5 min) | Retention check interval |
+| `retention_max_size` | integer (bytes) or nil | `nil` | Max storage size (`nil` = unlimited) |
+| `retention_check_interval` | integer (ms) | `120_000` (2 min) | Retention check interval |
 | `http` | boolean or keyword | `false` | Enable HTTP API |
 
 ## HTTP options
@@ -63,8 +68,8 @@ config :timeless_traces,
 
   # Retention
   retention_max_age: 7 * 86_400,
-  retention_max_size: 512 * 1_048_576,
-  retention_check_interval: 300_000,
+  retention_max_size: nil,
+  retention_check_interval: 120_000,
 
   # HTTP API
   http: [port: 10428, bearer_token: "my-secret-token"]
@@ -126,7 +131,7 @@ The `compression_level` setting applies to both formats (1-22, higher = smaller 
 
 ### Retention
 
-Both age-based and size-based retention are enabled by default. Set either to `nil` to disable:
+Age-based retention is enabled by default. Size-based retention is opt-in; set either policy to `nil` to disable it:
 
 ```elixir
 config :timeless_traces,

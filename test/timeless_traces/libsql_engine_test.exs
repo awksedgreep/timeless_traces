@@ -39,6 +39,16 @@ defmodule TimelessTraces.LibsqlEngineTest do
   test "write, query, trace, discovery, stats, backup round-trip", %{dir: dir} do
     start_engine!(dir)
 
+    {readers, _cursor} =
+      :persistent_term.get({TimelessTraces.LibsqlEngine, :reader_pool})
+
+    assert tuple_size(readers) == TimelessTraces.Config.libsql_reader_pool_size()
+    assert readers |> Tuple.to_list() |> Enum.all?(&Process.alive?/1)
+
+    assert {:ok, [[-128_000]]} = TimelessTraces.LibsqlEngine.sql("PRAGMA cache_size")
+    assert {:ok, [[1_000]]} = TimelessTraces.LibsqlEngine.sql("PRAGMA wal_autocheckpoint")
+    assert {:ok, [[2]]} = TimelessTraces.LibsqlEngine.sql("PRAGMA temp_store")
+
     spans = for i <- 1..10, do: span(i, status: if(rem(i, 5) == 0, do: :error, else: :ok))
     assert :ok = TimelessTraces.LibsqlEngine.ingest(spans)
     assert :ok = TimelessTraces.LibsqlEngine.flush()
@@ -54,6 +64,25 @@ defmodule TimelessTraces.LibsqlEngineTest do
     # Status pushdown + residual parity via the shared Filter.
     assert {:ok, %TimelessTraces.Result{total: 2}} =
              TimelessTraces.LibsqlEngine.query(status: :error)
+
+    assert {:ok,
+            %TimelessTraces.Result{
+              entries: paged,
+              total: 8,
+              limit: 2,
+              offset: 1,
+              has_more: true
+            }} = TimelessTraces.LibsqlEngine.query(status: :ok, limit: 2, offset: 1)
+
+    assert length(paged) == 2
+
+    assert {:ok, %TimelessTraces.Result{total: 4, has_more: true}} =
+             TimelessTraces.LibsqlEngine.query(
+               status: :ok,
+               limit: 2,
+               offset: 1,
+               count_total: false
+             )
 
     # Service filter matches service.name attribute.
     assert {:ok, %TimelessTraces.Result{total: 5}} =
@@ -114,7 +143,10 @@ defmodule TimelessTraces.LibsqlEngineTest do
     assert stats.compressed_bytes > 0
     assert stats.zstd_blocks == 0
     assert stats.storage_mode == :libsql
-    assert stats.index_size > 0
+    # Extension 0.8.x deliberately reports NULL here: exact dbstat accounting
+    # would turn every routine stats read into a full index walk. The facade
+    # preserves its integer compatibility field as zero.
+    assert stats.index_size == 0
     assert stats.compaction_count > 0
     assert stats.total_blocks == stats.compressed_blocks
     assert stats.compression_raw_bytes_in > 0

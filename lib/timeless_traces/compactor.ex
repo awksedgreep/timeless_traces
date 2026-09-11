@@ -57,7 +57,7 @@ defmodule TimelessTraces.Compactor do
     cond do
       compact_result == :more ->
         # Raw debt remains — keep compacting continuously, no idle wait.
-        schedule(0)
+        schedule(1)
         {:noreply, %{state | idle_cycles: 0}}
 
       compact_result == :noop and merge_result == :noop ->
@@ -112,7 +112,7 @@ defmodule TimelessTraces.Compactor do
 
   defp do_compact(state, stats) do
     start_time = System.monotonic_time()
-    concurrency = System.schedulers_online()
+    concurrency = TimelessTraces.Config.query_concurrency()
     output_target = TimelessTraces.Config.merge_compaction_target_size()
 
     # Bounded pass: one output block per core. Reading the entire raw
@@ -123,19 +123,7 @@ defmodule TimelessTraces.Compactor do
     {raw_blocks, leftover} =
       take_by_entry_budget(TimelessTraces.Index.raw_block_ids(), entry_budget)
 
-    all_entries =
-      Enum.flat_map(raw_blocks, fn {block_id, file_path, _bs, _ec} ->
-        read_result =
-          case state.storage do
-            :disk -> TimelessTraces.Writer.read_block(file_path, :raw)
-            :memory -> TimelessTraces.Index.read_block_data(block_id)
-          end
-
-        case read_result do
-          {:ok, entries} -> entries
-          {:error, _} -> []
-        end
-      end)
+    all_entries = read_blocks(raw_blocks, state, :raw, concurrency)
 
     if all_entries == [] do
       :noop
@@ -210,16 +198,17 @@ defmodule TimelessTraces.Compactor do
   end
 
   defp take_by_entry_budget(blocks, budget) do
-    {taken_rev, _spent, leftover} =
-      Enum.reduce(blocks, {[], 0, false}, fn
-        {_bid, _fp, _bs, ec} = block, {taken, spent, false} when spent < budget ->
-          {[block | taken], spent + ec, false}
+    take_by_entry_budget(blocks, budget, 0, [])
+  end
 
-        _block, {taken, spent, _} ->
-          {taken, spent, true}
-      end)
+  defp take_by_entry_budget([], _budget, _spent, taken), do: {Enum.reverse(taken), false}
 
-    {Enum.reverse(taken_rev), leftover}
+  defp take_by_entry_budget(_blocks, budget, spent, taken) when spent >= budget,
+    do: {Enum.reverse(taken), true}
+
+  defp take_by_entry_budget([block | rest], budget, spent, taken) do
+    {_bid, _fp, _bs, entries} = block
+    take_by_entry_budget(rest, budget, spent + entries, [block | taken])
   end
 
   # Under heavy raw debt, trade compression ratio for throughput so the
@@ -278,36 +267,38 @@ defmodule TimelessTraces.Compactor do
   end
 
   defp group_into_batches(blocks, target_size) do
-    {batches, current} =
-      Enum.reduce(blocks, {[], []}, fn {_bid, _fp, _bs, ec} = block, {batches, current} ->
-        current_count = Enum.reduce(current, 0, fn {_, _, _, e}, a -> a + e end)
+    group_into_batches(blocks, target_size, [], [], 0, 0)
+  end
 
-        if current_count + ec > target_size and current != [] do
-          {[current | batches], [block]}
-        else
-          {batches, current ++ [block]}
-        end
-      end)
+  defp group_into_batches([], _target, batches, current, _entries, current_length) do
+    batches = if current_length >= 2, do: [Enum.reverse(current) | batches], else: batches
+    Enum.reverse(batches)
+  end
 
-    # Only include the last batch if it has >= 2 blocks
-    all = if length(current) >= 2, do: [current | batches], else: batches
-    Enum.reverse(all)
+  defp group_into_batches(
+         [{_bid, _fp, _bs, entries} = block | rest],
+         target,
+         batches,
+         current,
+         current_entries,
+         current_length
+       ) do
+    if current != [] and current_entries + entries > target do
+      group_into_batches(rest, target, [Enum.reverse(current) | batches], [block], entries, 1)
+    else
+      group_into_batches(
+        rest,
+        target,
+        batches,
+        [block | current],
+        current_entries + entries,
+        current_length + 1
+      )
+    end
   end
 
   defp merge_batch(state, batch) do
-    all_entries =
-      Enum.flat_map(batch, fn {block_id, file_path, _bs, _ec} ->
-        read_result =
-          case state.storage do
-            :disk -> TimelessTraces.Writer.read_block(file_path, format_from_path(file_path))
-            :memory -> TimelessTraces.Index.read_block_data(block_id)
-          end
-
-        case read_result do
-          {:ok, entries} -> entries
-          {:error, _} -> []
-        end
-      end)
+    all_entries = read_blocks(batch, state, :from_path, TimelessTraces.Config.query_concurrency())
 
     if all_entries == [] do
       :noop
@@ -358,5 +349,36 @@ defmodule TimelessTraces.Compactor do
       ".raw" -> :raw
       _ -> :raw
     end
+  end
+
+  defp read_blocks(blocks, state, format, concurrency) do
+    blocks
+    |> Task.async_stream(
+      fn {block_id, file_path, _bytes, _entries} ->
+        read_result =
+          case state.storage do
+            :disk ->
+              block_format =
+                if format == :from_path, do: format_from_path(file_path), else: format
+
+              TimelessTraces.Writer.read_block(file_path, block_format)
+
+            :memory ->
+              TimelessTraces.Index.read_block_data(block_id)
+          end
+
+        case read_result do
+          {:ok, entries} -> entries
+          {:error, _} -> []
+        end
+      end,
+      ordered: false,
+      max_concurrency: max(concurrency, 1),
+      timeout: 120_000
+    )
+    |> Enum.flat_map(fn
+      {:ok, entries} -> entries
+      {:exit, _reason} -> []
+    end)
   end
 end

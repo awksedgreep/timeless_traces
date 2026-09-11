@@ -83,4 +83,20 @@ defmodule TimelessTraces.HotTailTest do
     assert length(spans) == 5
     assert spans |> Enum.map(& &1.span_id) |> Enum.uniq() |> length() == 5
   end
+
+  test "cap eviction removes companion trace-index rows" do
+    Application.put_env(:timeless_traces, :hot_tail_max_entries, 2)
+    on_exit(fn -> Application.delete_env(:timeless_traces, :hot_tail_max_entries) end)
+    now = System.os_time(:nanosecond)
+    spans = for i <- 1..5, do: span("cap-#{i}", "op.cap", now + i)
+
+    TimelessTraces.HotTail.insert_many(spans)
+    send(TimelessTraces.HotTail, :sweep)
+    _ = :sys.get_state(TimelessTraces.HotTail)
+
+    assert :ets.info(TimelessTraces.HotTail, :size) == 2
+    assert :ets.info(TimelessTraces.HotTail.ByTrace, :size) == 2
+    assert TimelessTraces.HotTail.trace_spans("cap-1") == []
+    assert length(TimelessTraces.HotTail.trace_spans("cap-5")) == 1
+  end
 end

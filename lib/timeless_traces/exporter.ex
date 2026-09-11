@@ -20,12 +20,19 @@ defmodule TimelessTraces.Exporter do
     resource_map = normalize_resource(resource)
 
     spans =
-      :ets.tab2list(tab)
-      |> Enum.map(fn record -> span_from_record(record, resource_map) end)
-      |> Enum.reject(&is_nil/1)
+      :ets.foldl(
+        fn record, acc ->
+          case span_from_record(record, resource_map) do
+            nil -> acc
+            span -> [span | acc]
+          end
+        end,
+        [],
+        tab
+      )
 
     if spans != [] do
-      TimelessTraces.StorageEngine.ingest(spans)
+      spans |> Enum.reverse() |> TimelessTraces.StorageEngine.ingest()
     end
 
     {:ok, state}

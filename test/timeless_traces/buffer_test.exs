@@ -65,6 +65,18 @@ defmodule TimelessTraces.BufferTest do
     test "empty flush is safe" do
       assert :ok = TimelessTraces.Buffer.flush()
     end
+
+    test "capacity waiters wake when a shard drains" do
+      Application.put_env(:timeless_traces, :ingest_soft_watermark, 1)
+      on_exit(fn -> Application.delete_env(:timeless_traces, :ingest_soft_watermark) end)
+      TimelessTraces.IngestPressure.add(0, 1)
+
+      waiter = Task.async(fn -> TimelessTraces.IngestPressure.await_capacity(0, 1_000) end)
+      assert Task.yield(waiter, 20) == nil
+
+      TimelessTraces.IngestPressure.sub(0, 1)
+      assert Task.await(waiter) == :ok
+    end
   end
 
   describe "auto-flush on buffer size" do

@@ -18,6 +18,7 @@ defmodule TimelessTraces.LibsqlEngine do
   alias TimelessTraces.LibsqlCandidate
 
   @table "traces"
+  @reader_pool_key {__MODULE__, :reader_pool}
   @columns "trace_id,span_id,parent_span_id,name,service,kind,status,start_ts,duration_ns," <>
              "attributes,status_description,events,resource,instrumentation_scope"
 
@@ -25,7 +26,7 @@ defmodule TimelessTraces.LibsqlEngine do
 
   @doc "Ingest spans (maps or `%TimelessTraces.Span{}`)."
   def ingest([]), do: :ok
-  def ingest(spans), do: GenServer.call(__MODULE__, {:ingest, spans}, :infinity)
+  def ingest(spans), do: GenServer.call(__MODULE__, {:ingest, spans}, call_timeout())
 
   @doc "Persist buffered spans into blocks now."
   def flush do
@@ -39,25 +40,88 @@ defmodule TimelessTraces.LibsqlEngine do
   def optimize, do: command("optimize")
 
   @doc false
-  def sql(sql, params \\ []), do: GenServer.call(__MODULE__, {:sql, sql, params}, :infinity)
+  def sql(sql, params \\ []), do: GenServer.call(__MODULE__, {:sql, sql, params}, call_timeout())
 
   @doc "Query spans with the facade's filter vocabulary."
-  def query(filters), do: GenServer.call(__MODULE__, {:query, filters}, :infinity)
+  def query(filters), do: run_query(filters)
 
   @doc "All spans of one trace, ascending by start time."
-  def trace(trace_id), do: GenServer.call(__MODULE__, {:trace, trace_id}, :infinity)
+  def trace(trace_id) do
+    {clause, params} = trace_id_clause(trace_id, 1)
+
+    with {:ok, rows} <-
+           read(
+             "SELECT #{@columns} FROM #{@table} WHERE #{clause} ORDER BY start_ts ASC",
+             params
+           ) do
+      {:ok, rows |> Enum.map(&decode_row/1) |> Enum.map(&TimelessTraces.Span.from_map/1)}
+    end
+  end
 
   @doc "Distinct service names."
-  def services, do: GenServer.call(__MODULE__, :services, :infinity)
+  def services do
+    with {:ok, rows} <-
+           read("SELECT DISTINCT service FROM #{@table} WHERE service != '' ORDER BY service") do
+      {:ok, Enum.map(rows, fn [service] -> service end)}
+    end
+  end
 
   @doc "Distinct operation names for a service."
-  def operations(service), do: GenServer.call(__MODULE__, {:operations, service}, :infinity)
+  def operations(service) do
+    with {:ok, rows} <-
+           read(
+             "SELECT DISTINCT name FROM #{@table} WHERE service = ?1 ORDER BY name",
+             [service]
+           ) do
+      {:ok, Enum.map(rows, fn [name] -> name end)}
+    end
+  end
 
   @doc "Aggregate statistics from timeless_stats('traces')."
-  def stats, do: GenServer.call(__MODULE__, :stats, :infinity)
+  def stats do
+    with {:ok, rows} <- read("SELECT * FROM timeless_stats('traces')") do
+      kv = Map.new(rows, fn [key, value] -> {key, value} end)
+      int = fn key -> stat_int(Map.get(kv, key)) end
+
+      {:ok,
+       %TimelessTraces.Stats{
+         storage_mode: :libsql,
+         total_blocks: int.("blocks") || 0,
+         total_entries: int.("total_spans") || 0,
+         total_bytes: int.("bytes_on_disk") || 0,
+         disk_size: int.("bytes_on_disk") || 0,
+         index_size: int.("index_bytes") || 0,
+         raw_blocks: int.("raw_blocks") || 0,
+         raw_bytes: int.("raw_bytes") || 0,
+         compressed_blocks: int.("compressed_blocks") || 0,
+         compressed_bytes: int.("compressed_bytes") || 0,
+         compression_raw_bytes_in: int.("compression_input_bytes_total") || 0,
+         compression_compressed_bytes_out: int.("compression_output_bytes_total") || 0,
+         compaction_count: int.("optimize_count") || 0,
+         oldest_timestamp: int.("ts_min"),
+         newest_timestamp: int.("ts_max")
+       }}
+    end
+  end
 
   @doc "Single-snapshot backup: flush, then VACUUM INTO <target>/traces.db."
-  def backup(target_dir), do: GenServer.call(__MODULE__, {:backup, target_dir}, :infinity)
+  def backup(target_dir) do
+    with :ok <- flush(),
+         {path, extension_path} <- GenServer.call(__MODULE__, :connection_info, call_timeout()),
+         :ok <- File.mkdir_p(target_dir),
+         target = Path.join(target_dir, "traces.db"),
+         {:ok, conn, _capabilities} <-
+           LibsqlCandidate.open_readonly_connection(path, extension_path) do
+      try do
+        with {:ok, _} <- LibsqlCandidate.execute(conn, "VACUUM INTO ?1", [target]),
+             {:ok, %{size: size}} <- File.stat(target) do
+          {:ok, %{path: target_dir, files: ["traces.db"], total_bytes: size}}
+        end
+      after
+        Exqlite.Sqlite3.close(conn)
+      end
+    end
+  end
 
   defp command(cmd),
     do:
@@ -74,19 +138,30 @@ defmodule TimelessTraces.LibsqlEngine do
     maybe_auto_migrate_legacy_store!(data_dir, opts)
     File.mkdir_p!(data_dir)
     path = Path.join(data_dir, "traces.db")
+    extension_path = Keyword.get(opts, :extension_path)
 
     retention_seconds =
       Keyword.get(opts, :retention_seconds, TimelessTraces.Config.retention_max_age())
 
     with {:ok, conn, capabilities} <-
-           LibsqlCandidate.open_connection(path, Keyword.get(opts, :extension_path)),
-         :ok <- LibsqlCandidate.initialize_database(conn, capabilities, retention_seconds) do
+           LibsqlCandidate.open_connection(path, extension_path),
+         :ok <- LibsqlCandidate.initialize_database(conn, capabilities, retention_seconds),
+         {:ok, readers} <- start_readers(path, extension_path, opts) do
       Logger.info(
         "timeless_traces libSQL engine: extension #{capabilities["extension_version"]} " <>
           "(data ABI #{capabilities["data_abi"]}) on #{path}"
       )
 
-      {:ok, %{conn: conn, path: path, flush_timer: schedule_flush()}}
+      install_reader_pool(readers)
+
+      {:ok,
+       %{
+         conn: conn,
+         path: path,
+         extension_path: extension_path,
+         readers: readers,
+         flush_timer: schedule_flush()
+       }}
     else
       {:error, reason} -> {:stop, reason}
     end
@@ -111,100 +186,8 @@ defmodule TimelessTraces.LibsqlEngine do
   def handle_call({:sql, sql, params}, _from, state),
     do: {:reply, LibsqlCandidate.execute(state.conn, sql, params), state}
 
-  def handle_call({:query, filters}, _from, state),
-    do: {:reply, run_query(state.conn, filters), state}
-
-  def handle_call({:trace, trace_id}, _from, state) do
-    {clause, params} = trace_id_clause(trace_id, 1)
-
-    result =
-      with {:ok, rows} <-
-             LibsqlCandidate.execute(
-               state.conn,
-               "SELECT #{@columns} FROM #{@table} WHERE #{clause} ORDER BY start_ts ASC",
-               params
-             ) do
-        {:ok, rows |> Enum.map(&decode_row/1) |> Enum.map(&TimelessTraces.Span.from_map/1)}
-      end
-
-    {:reply, result, state}
-  end
-
-  def handle_call(:services, _from, state) do
-    result =
-      with {:ok, rows} <-
-             LibsqlCandidate.execute(
-               state.conn,
-               "SELECT DISTINCT service FROM #{@table} WHERE service != '' ORDER BY service"
-             ) do
-        {:ok, Enum.map(rows, fn [s] -> s end)}
-      end
-
-    {:reply, result, state}
-  end
-
-  def handle_call({:operations, service}, _from, state) do
-    result =
-      with {:ok, rows} <-
-             LibsqlCandidate.execute(
-               state.conn,
-               "SELECT DISTINCT name FROM #{@table} WHERE service = ?1 ORDER BY name",
-               [service]
-             ) do
-        {:ok, Enum.map(rows, fn [n] -> n end)}
-      end
-
-    {:reply, result, state}
-  end
-
-  def handle_call(:stats, _from, state) do
-    result =
-      with {:ok, rows} <-
-             LibsqlCandidate.execute(state.conn, "SELECT * FROM timeless_stats('traces')") do
-        kv = Map.new(rows, fn [k, v] -> {k, v} end)
-        int = fn key -> stat_int(Map.get(kv, key)) end
-
-        {:ok,
-         %TimelessTraces.Stats{
-           storage_mode: :libsql,
-           total_blocks: int.("blocks") || 0,
-           total_entries: int.("total_spans") || 0,
-           total_bytes: int.("bytes_on_disk") || 0,
-           disk_size: int.("bytes_on_disk") || 0,
-           index_size: int.("index_bytes") || 0,
-           raw_blocks: int.("raw_blocks") || 0,
-           raw_bytes: int.("raw_bytes") || 0,
-           compressed_blocks: int.("compressed_blocks") || 0,
-           compressed_bytes: int.("compressed_bytes") || 0,
-           # Persisted totals (extension 0.6.2), not the process-local
-           # optimize_raw_* profile counters — see the logs twin.
-           compression_raw_bytes_in: int.("compression_input_bytes_total") || 0,
-           compression_compressed_bytes_out: int.("compression_output_bytes_total") || 0,
-           compaction_count: int.("optimize_count") || 0,
-           oldest_timestamp: int.("ts_min"),
-           newest_timestamp: int.("ts_max")
-         }}
-      end
-
-    {:reply, result, state}
-  end
-
-  def handle_call({:backup, target_dir}, _from, state) do
-    result =
-      with {:ok, _} <-
-             LibsqlCandidate.execute(
-               state.conn,
-               "INSERT INTO #{@table}(#{@table}) VALUES ('flush')"
-             ),
-           :ok <- File.mkdir_p(target_dir),
-           target = Path.join(target_dir, "traces.db"),
-           {:ok, _} <- LibsqlCandidate.execute(state.conn, "VACUUM INTO ?1", [target]),
-           {:ok, %{size: size}} <- File.stat(target) do
-        {:ok, %{path: target_dir, files: ["traces.db"], total_bytes: size}}
-      end
-
-    {:reply, result, state}
-  end
+  def handle_call(:connection_info, _from, state),
+    do: {:reply, {state.path, state.extension_path}, state}
 
   @impl true
   def handle_info(:flush, state) do
@@ -212,10 +195,28 @@ defmodule TimelessTraces.LibsqlEngine do
     {:noreply, %{state | flush_timer: schedule_flush()}}
   end
 
+  def handle_info({:EXIT, reader, _reason}, %{readers: readers} = state) do
+    if reader in readers do
+      case start_reader(state.path, state.extension_path) do
+        {:ok, replacement} ->
+          readers = Enum.map(readers, &if(&1 == reader, do: replacement, else: &1))
+          install_reader_pool(readers)
+          {:noreply, %{state | readers: readers}}
+
+        {:error, reason} ->
+          {:stop, {:reader_restart_failed, reason}, state}
+      end
+    else
+      {:noreply, state}
+    end
+  end
+
   def handle_info(_msg, state), do: {:noreply, state}
 
   @impl true
   def terminate(_reason, state) do
+    :persistent_term.erase(@reader_pool_key)
+    Enum.each(Map.get(state, :readers, []), &GenServer.stop(&1, :normal))
     _ = LibsqlCandidate.execute(state.conn, "INSERT INTO #{@table}(#{@table}) VALUES ('flush')")
     Exqlite.Sqlite3.close(state.conn)
   end
@@ -224,6 +225,52 @@ defmodule TimelessTraces.LibsqlEngine do
     Process.send_after(self(), :flush, TimelessTraces.Config.flush_interval())
   end
 
+  defp start_readers(path, extension_path, opts) do
+    count = Keyword.get(opts, :reader_pool_size, TimelessTraces.Config.libsql_reader_pool_size())
+
+    if is_integer(count) and count > 0 do
+      Enum.reduce_while(1..count, {:ok, []}, fn _index, {:ok, readers} ->
+        case start_reader(path, extension_path) do
+          {:ok, reader} -> {:cont, {:ok, [reader | readers]}}
+          {:error, reason} -> {:halt, {:error, {:reader_start_failed, reason}}}
+        end
+      end)
+      |> case do
+        {:ok, readers} -> {:ok, Enum.reverse(readers)}
+        error -> error
+      end
+    else
+      {:error, {:invalid_reader_pool_size, count}}
+    end
+  end
+
+  defp start_reader(path, extension_path) do
+    TimelessTraces.LibsqlReader.start_link(path: path, extension_path: extension_path)
+  end
+
+  defp install_reader_pool(readers) do
+    :persistent_term.put(@reader_pool_key, {List.to_tuple(readers), :atomics.new(1, [])})
+  end
+
+  defp read(sql, params \\ []) do
+    reader = checkout_reader()
+    TimelessTraces.LibsqlReader.execute(reader, sql, params, call_timeout())
+  end
+
+  defp read_transaction(statements) do
+    reader = checkout_reader()
+    TimelessTraces.LibsqlReader.transaction(reader, statements, call_timeout())
+  end
+
+  defp checkout_reader do
+    {readers, cursor} = :persistent_term.get(@reader_pool_key)
+    size = tuple_size(readers)
+    index = rem(:atomics.add_get(cursor, 1, 1) - 1, size)
+    elem(readers, index)
+  end
+
+  defp call_timeout, do: TimelessTraces.Config.query_timeout()
+
   # -- Query path -----------------------------------------------------------
 
   @pagination_keys [:limit, :offset, :order, :count_total]
@@ -231,20 +278,62 @@ defmodule TimelessTraces.LibsqlEngine do
   @kinds Map.new(~w(internal server client producer consumer), &{&1, String.to_atom(&1)})
   @statuses Map.new(~w(unset ok error), &{&1, String.to_atom(&1)})
 
-  defp run_query(conn, filters) do
+  defp run_query(filters) do
     {pagination, search} = Enum.split_with(filters, fn {k, _} -> k in @pagination_keys end)
-    # Traces default to newest-first, unlike logs.
     order = Keyword.get(pagination, :order, :desc)
+    limit = Keyword.get(pagination, :limit, 100)
+    offset = Keyword.get(pagination, :offset, 0)
+    count_total = Keyword.get(pagination, :count_total, true)
+    {where_sql, params, residual} = sql_filters(search)
 
-    with {:ok, rows} <- select_spans(conn, search, order) do
-      matched =
-        rows
-        |> Enum.map(&decode_row/1)
-        |> TimelessTraces.Filter.filter(search)
+    if residual == [] do
+      run_pushed_query(where_sql, params, order, limit, offset, count_total)
+    else
+      run_residual_query(where_sql, params, search, order, limit, offset)
+    end
+  end
 
+  defp run_pushed_query(where_sql, params, order, limit, offset, true) do
+    statements = [
+      {"SELECT COUNT(*) FROM #{@table}#{where_sql}", params},
+      {select_spans_sql(where_sql, order, limit, offset), params}
+    ]
+
+    with {:ok, [[[total]], rows]} <- read_transaction(statements) do
+      entries = decode_spans(rows)
+
+      {:ok,
+       %TimelessTraces.Result{
+         entries: entries,
+         total: total,
+         limit: limit,
+         offset: offset,
+         has_more: offset + length(entries) < total
+       }}
+    end
+  end
+
+  defp run_pushed_query(where_sql, params, order, limit, offset, false) do
+    with {:ok, rows} <- select_spans(where_sql, params, order, limit + 1, offset) do
+      has_more = length(rows) > limit
+      entries = rows |> Enum.take(limit) |> decode_spans()
+      total = offset + length(entries) + if(has_more, do: 1, else: 0)
+
+      {:ok,
+       %TimelessTraces.Result{
+         entries: entries,
+         total: total,
+         limit: limit,
+         offset: offset,
+         has_more: has_more
+       }}
+    end
+  end
+
+  defp run_residual_query(where_sql, params, search, order, limit, offset) do
+    with {:ok, rows} <- select_spans(where_sql, params, order) do
+      matched = rows |> Enum.map(&decode_row/1) |> TimelessTraces.Filter.filter(search)
       total = length(matched)
-      limit = Keyword.get(pagination, :limit, 100)
-      offset = Keyword.get(pagination, :offset, 0)
 
       entries =
         matched
@@ -258,55 +347,65 @@ defmodule TimelessTraces.LibsqlEngine do
          total: total,
          limit: limit,
          offset: offset,
-         has_more: offset + limit < total
+         has_more: offset + length(entries) < total
        }}
     end
   end
 
-  # service/kind/status/trace_id equality, the start_ts range, and the
-  # duration range push into the vtab scan (block extrema + term/duration
-  # pruning); the shared Filter re-checks everything, so pushdown is
-  # purely an optimization.
-  defp select_spans(conn, search, order) do
-    {where, params} =
-      Enum.reduce(search, {[], []}, fn
-        {:since, ts}, {w, p} ->
-          {["start_ts >= ?#{length(p) + 1}" | w], p ++ [to_nanos(ts)]}
+  defp sql_filters(search) do
+    {where, params, residual} =
+      Enum.reduce(search, {[], [], []}, fn
+        {:since, ts}, {where, params, residual} ->
+          {["start_ts >= ?#{length(params) + 1}" | where], params ++ [to_nanos(ts)], residual}
 
-        {:until, ts}, {w, p} ->
-          {["start_ts <= ?#{length(p) + 1}" | w], p ++ [to_nanos(ts)]}
+        {:until, ts}, {where, params, residual} ->
+          {["start_ts <= ?#{length(params) + 1}" | where], params ++ [to_nanos(ts)], residual}
 
-        {:min_duration, ns}, {w, p} when is_integer(ns) ->
-          {["duration_ns >= ?#{length(p) + 1}" | w], p ++ [ns]}
+        {:min_duration, ns}, {where, params, residual} when is_integer(ns) ->
+          {["duration_ns >= ?#{length(params) + 1}" | where], params ++ [ns], residual}
 
-        {:max_duration, ns}, {w, p} when is_integer(ns) ->
-          {["duration_ns <= ?#{length(p) + 1}" | w], p ++ [ns]}
+        {:max_duration, ns}, {where, params, residual} when is_integer(ns) ->
+          {["duration_ns <= ?#{length(params) + 1}" | where], params ++ [ns], residual}
 
-        {:service, service}, {w, p} when is_binary(service) ->
-          {["service = ?#{length(p) + 1}" | w], p ++ [service]}
+        {:service, service}, {where, params, residual} when is_binary(service) ->
+          {["service = ?#{length(params) + 1}" | where], params ++ [service], residual}
 
-        {:kind, kind}, {w, p} when is_atom(kind) ->
-          {["kind = ?#{length(p) + 1}" | w], p ++ [Atom.to_string(kind)]}
+        {:kind, kind}, {where, params, residual} when is_atom(kind) ->
+          {["kind = ?#{length(params) + 1}" | where], params ++ [Atom.to_string(kind)], residual}
 
-        {:status, status}, {w, p} when is_atom(status) ->
-          {["status = ?#{length(p) + 1}" | w], p ++ [Atom.to_string(status)]}
+        {:status, status}, {where, params, residual} when is_atom(status) ->
+          {["status = ?#{length(params) + 1}" | where], params ++ [Atom.to_string(status)],
+           residual}
 
-        {:trace_id, trace_id}, {w, p} ->
-          {clause, extra} = trace_id_clause(trace_id, length(p) + 1)
-          {[clause | w], p ++ extra}
+        {:trace_id, trace_id}, {where, params, residual} ->
+          {clause, extra} = trace_id_clause(trace_id, length(params) + 1)
+          {[clause | where], params ++ extra, residual}
 
-        _other, acc ->
-          acc
+        filter, {where, params, residual} ->
+          {where, params, [filter | residual]}
       end)
 
-    where_sql = if where == [], do: "", else: " WHERE " <> Enum.join(Enum.reverse(where), " AND ")
+    where_sql =
+      if where == [], do: "", else: " WHERE " <> Enum.join(Enum.reverse(where), " AND ")
+
+    {where_sql, params, Enum.reverse(residual)}
+  end
+
+  defp select_spans(where_sql, params, order, limit \\ nil, offset \\ 0) do
+    read(select_spans_sql(where_sql, order, limit, offset), params)
+  end
+
+  defp select_spans_sql(where_sql, order, limit, offset) do
     order_sql = if order == :asc, do: " ORDER BY start_ts ASC", else: " ORDER BY start_ts DESC"
 
-    LibsqlCandidate.execute(
-      conn,
-      "SELECT #{@columns} FROM #{@table}#{where_sql}#{order_sql}",
-      params
-    )
+    page_sql =
+      if is_integer(limit), do: " LIMIT #{max(limit, 0)} OFFSET #{max(offset, 0)}", else: ""
+
+    "SELECT #{@columns} FROM #{@table}#{where_sql}#{order_sql}#{page_sql}"
+  end
+
+  defp decode_spans(rows) do
+    rows |> Enum.map(&decode_row/1) |> Enum.map(&TimelessTraces.Span.from_map/1)
   end
 
   # Callers hold trace ids either as the raw 16 bytes (what the engine

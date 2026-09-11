@@ -107,7 +107,7 @@ Delete oldest blocks until total size is under the limit:
 
 ```elixir
 config :timeless_traces,
-  retention_max_size: 512 * 1024 * 1024  # 512 MB (default)
+  retention_max_size: 512 * 1024 * 1024  # opt-in 512 MB limit
 ```
 
 ### Disable retention
@@ -128,7 +128,7 @@ TimelessTraces.Retention.run_now()
 
 ```elixir
 config :timeless_traces,
-  retention_check_interval: 300_000  # 5 minutes (default)
+  retention_check_interval: 120_000  # 2 minutes (default)
 ```
 
 ## Telemetry events

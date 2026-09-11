@@ -147,10 +147,10 @@ defmodule TimelessTraces.DB do
       "PRAGMA page_size = 16384",
       "PRAGMA journal_mode = WAL",
       "PRAGMA synchronous = NORMAL",
-      "PRAGMA cache_size = -128000",
+      "PRAGMA cache_size = #{TimelessTraces.Config.sqlite_cache_size()}",
       "PRAGMA auto_vacuum = INCREMENTAL",
-      "PRAGMA mmap_size = #{mmap_size()}",
-      "PRAGMA wal_autocheckpoint = 10000",
+      "PRAGMA mmap_size = #{TimelessTraces.Config.sqlite_mmap_size()}",
+      "PRAGMA wal_autocheckpoint = #{TimelessTraces.Config.sqlite_wal_autocheckpoint()}",
       "PRAGMA temp_store = MEMORY",
       "PRAGMA busy_timeout = 5000"
     ]
@@ -179,21 +179,13 @@ defmodule TimelessTraces.DB do
 
   defp configure_reader(conn) do
     pragmas = [
-      "PRAGMA mmap_size = #{mmap_size()}",
-      "PRAGMA cache_size = -8000",
+      "PRAGMA mmap_size = #{TimelessTraces.Config.sqlite_mmap_size()}",
+      "PRAGMA cache_size = #{TimelessTraces.Config.sqlite_reader_cache_size()}",
       "PRAGMA temp_store = MEMORY",
       "PRAGMA busy_timeout = 5000"
     ]
 
     Enum.each(pragmas, &execute(conn, &1, []))
-  end
-
-  # 2GB mmap on real systems, disabled on CI/overlay filesystems
-  defp mmap_size do
-    case System.get_env("CI") do
-      nil -> 2_147_483_648
-      _ -> 0
-    end
   end
 
   defp run_migrations(conn) do
@@ -240,9 +232,13 @@ defmodule TimelessTraces.DB do
         Exqlite.Sqlite3.release(conn, stmt)
         {:ok, rows}
 
-      {:error, _reason} when retries > 0 ->
-        Process.sleep(retry_backoff(@max_retries - retries))
-        execute_with_retry(conn, sql, params, retries - 1)
+      {:error, reason} when retries > 0 ->
+        if retryable_sqlite_error?(reason) do
+          Process.sleep(retry_backoff(@max_retries - retries))
+          execute_with_retry(conn, sql, params, retries - 1)
+        else
+          raise "SQLite execute failed: #{inspect(reason)} (sql: #{sql})"
+        end
 
       {:error, reason} ->
         raise "SQLite execute failed after retries: #{inspect(reason)} (sql: #{sql})"
@@ -259,4 +255,9 @@ defmodule TimelessTraces.DB do
 
   # Exponential backoff: 100, 200, 400, 800, 1600, 3200, 6400, 12800ms
   defp retry_backoff(attempt), do: 100 * Integer.pow(2, attempt)
+
+  defp retryable_sqlite_error?(reason) do
+    message = reason |> inspect() |> String.downcase()
+    String.contains?(message, "busy") or String.contains?(message, "locked")
+  end
 end

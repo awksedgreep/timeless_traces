@@ -256,7 +256,7 @@ defmodule TimelessTraces.LegacyReader do
              conn,
              "SELECT CAST(value AS INTEGER) FROM _metadata WHERE key='schema_version'"
            ),
-         true <- version in 1..2,
+         true <- version in 1..3,
          {:ok, [[8]]} <-
            execute(
              conn,

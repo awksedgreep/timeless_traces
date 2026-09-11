@@ -43,6 +43,8 @@ defmodule TimelessTraces.Application do
 
     [
       {Registry, keys: :duplicate, name: TimelessTraces.Registry},
+      {Registry, keys: :unique, name: TimelessTraces.ProcessRegistry},
+      {TimelessTraces.Subscriber, []},
       {TimelessTraces.DB, name: TimelessTraces.DB, data_dir: data_dir, clean: storage == :memory},
       {TimelessTraces.Index, data_dir: data_dir, storage: storage, db: TimelessTraces.DB},
       {Task.Supervisor, name: TimelessTraces.FlushSupervisor},
@@ -59,6 +61,8 @@ defmodule TimelessTraces.Application do
 
     [
       {Registry, keys: :duplicate, name: TimelessTraces.Registry},
+      {Registry, keys: :unique, name: TimelessTraces.ProcessRegistry},
+      {TimelessTraces.Subscriber, []},
       {TimelessTraces.LibsqlEngine, []}
     ]
   end

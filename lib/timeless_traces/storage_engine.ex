@@ -16,29 +16,13 @@ defmodule TimelessTraces.StorageEngine do
     case engine() do
       :libsql ->
         with :ok <- TimelessTraces.LibsqlEngine.ingest(spans) do
-          broadcast_to_subscribers(spans)
+          TimelessTraces.Subscriber.broadcast(spans)
           :ok
         end
 
       _ ->
         TimelessTraces.Buffer.ingest(spans)
     end
-  end
-
-  # The Elixir engine broadcasts from inside Buffer; the libSQL path
-  # publishes here so subscribers see one stream either way.
-  defp broadcast_to_subscribers(spans) do
-    span_structs = Enum.map(spans, fn span -> {span, TimelessTraces.Span.from_map(span)} end)
-
-    Registry.dispatch(TimelessTraces.Registry, :spans, fn subscribers ->
-      for {pid, opts} <- subscribers do
-        for {span, span_struct} <- span_structs do
-          if opts == [] or TimelessTraces.Filter.matches?(span, opts) do
-            send(pid, {:timeless_traces, :span, span_struct})
-          end
-        end
-      end
-    end)
   end
 
   def flush do

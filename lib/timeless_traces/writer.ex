@@ -10,6 +10,8 @@ defmodule TimelessTraces.Writer do
           entry_count: non_neg_integer(),
           ts_min: integer(),
           ts_max: integer(),
+          duration_min: non_neg_integer(),
+          duration_max: non_neg_integer(),
           format: :raw | :zstd | :openzl
         }
 
@@ -41,7 +43,7 @@ defmodule TimelessTraces.Writer do
       end
 
     block_id = System.unique_integer([:positive, :monotonic])
-    {ts_min, ts_max, count} = ts_min_max_count(entries)
+    {ts_min, ts_max, duration_min, duration_max, count} = bounds_and_count(entries)
 
     meta = %{
       block_id: block_id,
@@ -50,6 +52,8 @@ defmodule TimelessTraces.Writer do
       entry_count: count,
       ts_min: ts_min,
       ts_max: ts_max,
+      duration_min: duration_min,
+      duration_max: duration_max,
       data: data,
       format: format
     }
@@ -86,7 +90,7 @@ defmodule TimelessTraces.Writer do
 
     case File.write(file_path, data) do
       :ok ->
-        {ts_min, ts_max, count} = ts_min_max_count(entries)
+        {ts_min, ts_max, duration_min, duration_max, count} = bounds_and_count(entries)
 
         meta = %{
           block_id: block_id,
@@ -95,6 +99,8 @@ defmodule TimelessTraces.Writer do
           entry_count: count,
           ts_min: ts_min,
           ts_max: ts_max,
+          duration_min: duration_min,
+          duration_max: duration_max,
           format: format
         }
 
@@ -105,12 +111,14 @@ defmodule TimelessTraces.Writer do
     end
   end
 
-  defp ts_min_max_count([first | rest]) do
+  defp bounds_and_count([first | rest]) do
     ts = first.start_time
+    duration = Map.get(first, :duration_ns) || 0
 
-    Enum.reduce(rest, {ts, ts, 1}, fn entry, {mn, mx, c} ->
+    Enum.reduce(rest, {ts, ts, duration, duration, 1}, fn entry, {mn, mx, dmn, dmx, c} ->
       t = entry.start_time
-      {min(t, mn), max(t, mx), c + 1}
+      d = Map.get(entry, :duration_ns) || 0
+      {min(t, mn), max(t, mx), min(d, dmn), max(d, dmx), c + 1}
     end)
   end
 

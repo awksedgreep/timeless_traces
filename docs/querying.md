@@ -69,6 +69,7 @@ Each span in `entries` is a `TimelessTraces.Span`:
 | `:limit` | integer | Max results (default 100) |
 | `:offset` | integer | Skip N results (default 0) |
 | `:order` | atom | `:desc` (newest first, default) or `:asc` (oldest first) |
+| `:count_total` | boolean | Return an exact total (default `true`); use `false` for the fastest bounded page |
 
 ## Examples
 
@@ -109,11 +110,12 @@ TimelessTraces.query(attributes: %{"http.method" => "POST", "http.status_code" =
 ### Pagination
 
 ```elixir
-# Page 1
-{:ok, page1} = TimelessTraces.query(status: :error, limit: 50)
+# Page 1 without an all-results count
+{:ok, page1} = TimelessTraces.query(status: :error, limit: 50, count_total: false)
 
 # Page 2
-{:ok, page2} = TimelessTraces.query(status: :error, limit: 50, offset: 50)
+{:ok, page2} =
+  TimelessTraces.query(status: :error, limit: 50, offset: 50, count_total: false)
 ```
 
 ### Combined filters
@@ -160,21 +162,20 @@ On disk, `trace_index` stores packed binary trace IDs for 32-character hex value
 
 The following filters leverage the inverted term index, narrowing the set of blocks to read:
 
-- `:service` -- matches `service:<name>` terms
+- `:service` -- matches `service.name:<name>` terms
 - `:kind` -- matches `kind:<kind>` terms
 - `:status` -- matches `status:<status>` terms
-- `:name` -- matches `name:<name>` terms
 - `:trace_id` -- uses the trace index directly
 
 Time range filters (`:since`, `:until`) narrow blocks by timestamp metadata.
 
 ### Avoid full scans
 
-Queries with no filters scan all blocks. On large datasets, always include at least one filter to leverage the index.
+Queries with no filters and an exact total scan all matching blocks. Use `count_total: false` when only a bounded page and `has_more` are needed.
 
 ### Duration and attribute filters
 
-`:min_duration`, `:max_duration`, and `:attributes` are applied as in-memory filters after block decompression. They don't reduce the number of blocks read. Combine them with indexed filters for best performance.
+`:min_duration` and `:max_duration` use per-block bounds before their exact in-memory check. Attribute filters use the block index for `host`, `host.name`, `service.name`, `http.method`, `http.status_code`, `http.route`, `db.system`, `rpc.system`, and `messaging.system`; arbitrary keys remain exact in-memory filters. Case-insensitive `:name` substring search also remains an in-memory filter so it cannot incorrectly treat a substring as an exact indexed name.
 
 ### Performance benchmarks
 

@@ -28,18 +28,24 @@ defmodule TimelessTraces.Telemetry do
   @doc false
   @spec span([atom()], map(), (-> {map(), map()})) :: {map(), map()}
   def span(event_prefix, meta, fun) do
-    start_time = System.monotonic_time()
-    result = fun.()
-    duration = System.monotonic_time() - start_time
-    {measurements, extra_meta} = result
+    event = event_prefix ++ [:stop]
 
-    :telemetry.execute(
-      event_prefix ++ [:stop],
-      Map.put(measurements, :duration, duration),
-      Map.merge(meta, extra_meta)
-    )
+    if :telemetry.list_handlers(event) == [] do
+      fun.()
+    else
+      start_time = System.monotonic_time()
+      result = fun.()
+      duration = System.monotonic_time() - start_time
+      {measurements, extra_meta} = result
 
-    result
+      :telemetry.execute(
+        event,
+        Map.put(measurements, :duration, duration),
+        Map.merge(meta, extra_meta)
+      )
+
+      result
+    end
   end
 
   @doc false

@@ -50,6 +50,8 @@ defmodule TimelessTraces.IngestPressure do
       :atomics.put(ref, oldest_slot(count, shard), 0)
     end
 
+    if new_value < TimelessTraces.Config.ingest_soft_watermark(), do: notify_capacity(shard)
+
     :ok
   end
 
@@ -71,6 +73,11 @@ defmodule TimelessTraces.IngestPressure do
   def set_raw_debt(bytes) do
     {ref, count} = :persistent_term.get(@key)
     :atomics.put(ref, raw_debt_slot(count), bytes)
+
+    if bytes < TimelessTraces.Config.ingest_raw_debt_limit() do
+      Enum.each(0..(count - 1), &notify_capacity/1)
+    end
+
     :ok
   end
 
@@ -90,6 +97,29 @@ defmodule TimelessTraces.IngestPressure do
   def any_overloaded? do
     {_ref, count} = :persistent_term.get(@key)
     Enum.any?(0..(count - 1), &overloaded?/1)
+  end
+
+  @spec await_capacity(non_neg_integer(), non_neg_integer()) :: :ok | :timeout
+  def await_capacity(shard, timeout) do
+    if overloaded?(shard) do
+      key = {:ingest_capacity, shard}
+
+      case Registry.register(TimelessTraces.Registry, key, nil) do
+        {:ok, _owner} ->
+          deadline = System.monotonic_time(:millisecond) + timeout
+
+          try do
+            await_capacity_message(shard, deadline)
+          after
+            Registry.unregister(TimelessTraces.Registry, key)
+          end
+
+        {:error, _reason} ->
+          :timeout
+      end
+    else
+      :ok
+    end
   end
 
   @spec snapshot() :: %{
@@ -127,4 +157,35 @@ defmodule TimelessTraces.IngestPressure do
 
   defp oldest_slot(count, shard), do: count + shard + 1
   defp raw_debt_slot(count), do: count * 2 + 1
+
+  defp await_capacity_message(shard, deadline) do
+    if overloaded?(shard) do
+      remaining = deadline - System.monotonic_time(:millisecond)
+
+      if remaining <= 0 do
+        :timeout
+      else
+        receive do
+          {:timeless_traces, :capacity_available, ^shard} ->
+            await_capacity_message(shard, deadline)
+        after
+          remaining -> :timeout
+        end
+      end
+    else
+      :ok
+    end
+  end
+
+  defp notify_capacity(shard) do
+    if Process.whereis(TimelessTraces.Registry) do
+      Registry.dispatch(TimelessTraces.Registry, {:ingest_capacity, shard}, fn waiters ->
+        Enum.each(waiters, fn {pid, _value} ->
+          send(pid, {:timeless_traces, :capacity_available, shard})
+        end)
+      end)
+    end
+
+    :ok
+  end
 end
