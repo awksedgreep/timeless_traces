@@ -3,6 +3,23 @@
 This changelog starts at 1.4.5; earlier releases are recorded by git
 tags and `bench/results/*.md` session documents.
 
+## 1.11.1 (2026-09-11)
+
+**The storage hot path now stays bounded under concurrency.** libSQL reads use
+a dedicated reader pool, eligible pagination is pushed into SQL, duration
+metadata is indexed, compaction reads in parallel with configured limits, and
+SQLite retries only contention errors instead of masking permanent failures.
+
+**Ingest pressure and subscriptions no longer stall storage workers.**
+Backpressure uses event-driven waiters, shard names no longer create atoms at
+runtime, hot-tail eviction is incremental, flushes run concurrently, and a
+dedicated subscriber process isolates slow or failing consumers. Exporter
+traversal and telemetry metadata validation are likewise bounded.
+
+The dependency baseline moves to ex_openzl 0.4.18 and exqlite 0.40.0, including
+the current OpenTelemetry transport chain. CI and release validation now build
+against timeless-libsql v0.8.3.
+
 ## 1.11.0 (2026-08-11)
 
 **The compression ratio survives restarts.** `compression_raw_bytes_in`/`out`
