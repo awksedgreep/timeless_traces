@@ -143,10 +143,9 @@ defmodule TimelessTraces.LibsqlEngineTest do
     assert stats.compressed_bytes > 0
     assert stats.zstd_blocks == 0
     assert stats.storage_mode == :libsql
-    # Extension 0.8.x deliberately reports NULL here: exact dbstat accounting
-    # would turn every routine stats read into a full index walk. The facade
-    # preserves its integer compatibility field as zero.
-    assert stats.index_size == 0
+    # Extension 0.6.x reports exact bytes; 0.8.x deliberately returns NULL to
+    # avoid a full dbstat walk and the facade maps that compatibility value to 0.
+    assert stats.index_size >= 0
     assert stats.compaction_count > 0
     assert stats.total_blocks == stats.compressed_blocks
     assert stats.compression_raw_bytes_in > 0
